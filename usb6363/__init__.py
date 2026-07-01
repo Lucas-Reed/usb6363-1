@@ -1,14 +1,5 @@
-"""USB-6363 底层控制包。
+"""USB-6363 内部包。
 
-拆分后的结构：
-    device.py      设备信息和通道名校验
-    ai.py          AI 采样、缓存、统计、写文件
-    ao.py          AO 模拟输出
-    pfi.py         PFI/数字线/计数器
-    controller.py 统一入口
+目前只保留 nidaqmx_driver.py 作为唯一直接调用 NI-DAQmx 的驱动层。
+面向业务的主逻辑在仓库根目录的 usb6363_core.py。
 """
-
-from usb6363.controller import DaqController
-from usb6363.device import DEVICE_NAME, DeviceInfo
-
-__all__ = ["DaqController", "DEVICE_NAME", "DeviceInfo"]

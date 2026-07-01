@@ -27,28 +27,10 @@ http://127.0.0.1:8765
 
 ```text
 usb6363_core.py
-    兼容入口，很薄。旧代码继续从这里 import DaqController。
-
-usb6363/device.py
-    设备信息、端子列表、通道名校验。
+    主逻辑。包含设备信息、通道校验、AI 采样管理、AO、PFI、文件记录。
 
 usb6363/nidaqmx_driver.py
     唯一直接 import / 调用 NI-DAQmx 的内部驱动层。
-
-usb6363/ai.py
-    AI 采样、动态采样率、后台缓存、统计、写 .npy 文件。
-    不直接 import nidaqmx，只调用 nidaqmx_driver.py。
-
-usb6363/ao.py
-    AO 模拟输出。
-    不直接 import nidaqmx，只调用 nidaqmx_driver.py。
-
-usb6363/pfi.py
-    PFI/数字线读写、PFI 边沿计数。
-    不直接 import nidaqmx，只调用 nidaqmx_driver.py。
-
-usb6363/controller.py
-    把 device/ai/ao/pfi 组合成统一 DaqController。
 
 usb6363_server.py
     HTTP API 服务。
