@@ -116,6 +116,9 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/record_to_file":
                     # 把当前后台 AI 采样流接下来的一段数据保存成 .npy 文件。
                     self._send_json(controller.record_ai_to_file(**_ai_record_body(body)))
+                elif parsed.path == "/api/ai/capture_frame":
+                    # 同步读取多路 AI 的一帧数据，例如双峰锁定里的 ai0/ai1。
+                    self._send_json(controller.capture_ai_frame(**_ai_capture_frame_body(body)))
                 elif parsed.path == "/api/pfi/write":
                     # 写 PFI 或数字线电平。请求体例如 {"line": "PFI0", "value": true}。
                     self._send_json(controller.write_digital_line(**_digital_write_args(body)))
@@ -240,6 +243,24 @@ def _ai_record_body(body: dict[str, Any]) -> dict[str, Any]:
             if body.get("timeout") is None
             else float(body.get("timeout"))
         ),
+    }
+
+
+def _ai_capture_frame_body(body: dict[str, Any]) -> dict[str, Any]:
+    """把 POST JSON 转换成 capture_ai_frame 需要的参数。"""
+
+    channels = body.get("channels", ["ai0", "ai1"])
+    if not isinstance(channels, list):
+        raise ValueError("channels must be a list")
+
+    return {
+        "channels": [str(channel) for channel in channels],
+        "samples": int(body.get("samples", 5000)),
+        "rate": float(body.get("rate", 50_000.0)),
+        "terminal_config": str(body.get("terminal_config", "DIFF")),
+        "min_val": float(body.get("min_val", -5.0)),
+        "max_val": float(body.get("max_val", 5.0)),
+        "timeout": float(body.get("timeout", 10.0)),
     }
 
 

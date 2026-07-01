@@ -204,6 +204,37 @@ class Usb6363Client:
             },
         )
 
+    def capture_ai_frame(
+        self,
+        channels: list[str] | None = None,
+        samples: int = 5000,
+        rate: float = 50_000.0,
+        terminal_config: str = "DIFF",
+        min_val: float = -5.0,
+        max_val: float = 5.0,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """同步读取多路 AI 的一帧数据。
+
+        这个方法适合双峰锁定这种“每次要拿到 ai0/ai1 同一帧波形”的场景。
+        返回值里的 values 是二维列表：
+            values[0] 对应 channels[0]
+            values[1] 对应 channels[1]
+        """
+
+        return self._post(
+            "/api/ai/capture_frame",
+            {
+                "channels": ["ai0", "ai1"] if channels is None else channels,
+                "samples": samples,
+                "rate": rate,
+                "terminal_config": terminal_config,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+            },
+        )
+
     def write_ao(
         self,
         channel: str = "ao0",

@@ -37,6 +37,12 @@ usb6363_server.py
 
 usb6363_client.py
     给其他 Python 子程序调用的客户端。
+
+two_peak/
+    双峰锁定的新实现。这里不直接调用 NI-DAQmx，只处理参数、信号和 PI 算法。
+
+legacy/
+    旧版双峰锁定程序参考快照。只作为需求和算法参考，不建议继续直接修改。
 ```
 
 ## 3. 其他 Python 程序这样调用
@@ -60,6 +66,19 @@ print(daq.get_ai_stats("ai0"))
 # 返回值只包含文件路径和元数据，不会把大数组塞进 JSON。
 capture = daq.record_ai_to_file(seconds=0.1)
 print(capture["npy_file"])
+
+# 同步读取 ai0/ai1 的一帧数据，适合双峰锁定这类“同一帧波形”场景。
+# 注意：这个接口会把波形放进 JSON，只适合一帧，不适合长时间高速记录。
+frame = daq.capture_ai_frame(
+    channels=["ai0", "ai1"],
+    samples=5000,
+    rate=50000,
+    terminal_config="DIFF",
+    min_val=-5.0,
+    max_val=5.0,
+)
+ai0 = frame["values"][0]
+ai1 = frame["values"][1]
 
 # 连续采样：采 ai0 和 ai1，此时每个通道 500 kHz。
 daq.set_ai_channels(["ai0", "ai1"])
@@ -99,6 +118,7 @@ POST /api/ai/unsubscribe
 POST /api/ai/set_channels
 POST /api/ai/clear
 POST /api/ai/record_to_file
+POST /api/ai/capture_frame
 POST /api/ao/write
 POST /api/pfi/write
 ```
@@ -127,6 +147,10 @@ N 个通道：每通道 1,000,000 / N samples/s
 
 完整高速原始波形：
     走文件，例如 record_ai_to_file，保存为 .npy。
+
+同步多通道短波形：
+    走 capture_ai_frame，例如一次读取 ai0/ai1 各 5000 点。
+    如果需要更长时间或更高数据量，仍然应该走 record_ai_to_file。
 ```
 
 记录当前 AI 采样流到文件的 JSON 例子：
@@ -150,6 +174,22 @@ N 个通道：每通道 1,000,000 / N samples/s
 ```text
 shape = (1, 2000000)
 ```
+
+同步读取一帧 AI 的 JSON 例子：
+
+```json
+{
+  "channels": ["ai0", "ai1"],
+  "samples": 5000,
+  "rate": 50000,
+  "terminal_config": "DIFF",
+  "min_val": -5.0,
+  "max_val": 5.0
+}
+```
+
+注意：调用 `capture_ai_frame` 前，后台连续采样必须是停止状态。
+如果已经调用过 `set_ai_channels`，请先调用 `clear_ai_channels`。
 
 AO 输出 JSON 例子：
 

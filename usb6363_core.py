@@ -46,6 +46,10 @@ AI_READ_CHUNK_SECONDS = 0.01
 # 高速采样写文件时的默认目录。
 AI_CAPTURE_OUTPUT_DIR = "data"
 
+# capture_ai_frame 会把原始数组放进 JSON 返回，不能拿它做长时间高速采集。
+# 超过这个点数时应该使用 record_ai_to_file，避免 Web/API 被巨大 JSON 拖垮。
+AI_FRAME_MAX_JSON_SAMPLES = 200_000
+
 
 _AI_RE = re.compile(r"^(?:(?P<device>Dev\d+)/)?ai(?P<index>\d+)$")
 _AO_RE = re.compile(r"^(?:(?P<device>Dev\d+)/)?ao(?P<index>\d+)$")
@@ -426,6 +430,88 @@ class DaqController:
             "channel": physical_channel,
             "samples": samples,
             "rate": rate,
+            "values": values,
+        }
+
+    def capture_ai_frame(
+        self,
+        channels: list[str],
+        samples: int = 5000,
+        rate: float = 50_000.0,
+        terminal_config: str = "DIFF",
+        min_val: float = -5.0,
+        max_val: float = 5.0,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """同步采集多路 AI 的一帧数据。
+
+        这个接口是给“双峰锁定”这类程序准备的：
+        - channels 例如 ["ai0", "ai1"]。
+        - samples 是每个通道读多少个点。
+        - rate 是每个通道的采样率。
+
+        注意：它会把数据直接放进 JSON 返回，所以只适合“一帧波形”。
+        长时间高速记录请用 record_ai_to_file。
+        """
+
+        if not channels:
+            raise ValueError("channels must not be empty")
+        if samples < 1:
+            raise ValueError("samples must be >= 1")
+        if rate <= 0:
+            raise ValueError("rate must be > 0")
+        if min_val >= max_val:
+            raise ValueError("min_val must be smaller than max_val")
+
+        physical_channels: list[str] = []
+        for channel in channels:
+            physical_channel = self._normalize_ai_channel(channel)
+            if physical_channel not in physical_channels:
+                physical_channels.append(physical_channel)
+
+        total_json_samples = len(physical_channels) * samples
+        if total_json_samples > AI_FRAME_MAX_JSON_SAMPLES:
+            raise ValueError(
+                f"capture_ai_frame would return {total_json_samples} samples as JSON. "
+                "Use record_ai_to_file for large or high-speed captures."
+            )
+
+        started_at = time.time()
+        t0 = time.perf_counter()
+        with self._ai_lock:
+            if self._ai_active_channels:
+                raise RuntimeError(
+                    "Background AI sampling is running. Call clear_ai_channels before "
+                    "capture_ai_frame so the synchronous frame task can own the AI hardware."
+                )
+
+            # 持有 _ai_lock 可以防止另一个请求在本次同步采帧期间启动后台 AI。
+            with self._hardware_lock:
+                values = nidaqmx_driver.capture_ai_frame(
+                    device_name=self.device_name,
+                    physical_channels=physical_channels,
+                    samples=samples,
+                    rate=rate,
+                    terminal_config_name=terminal_config,
+                    min_val=min_val,
+                    max_val=max_val,
+                    timeout=timeout,
+                )
+        duration_seconds = time.perf_counter() - t0
+
+        return {
+            "device": self.device_name,
+            "channels": physical_channels,
+            "channel_count": len(physical_channels),
+            "samples_per_channel": samples,
+            "rate_per_channel": rate,
+            "aggregate_rate": rate * len(physical_channels),
+            "terminal_config": terminal_config,
+            "min_val": min_val,
+            "max_val": max_val,
+            "duration_seconds": duration_seconds,
+            "started_at": started_at,
+            "finished_at": time.time(),
             "values": values,
         }
 

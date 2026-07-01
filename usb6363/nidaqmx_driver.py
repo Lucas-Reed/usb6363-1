@@ -95,6 +95,50 @@ def read_ai_voltage(
         return [float(value) for value in raw_values]
 
 
+def capture_ai_frame(
+    device_name: str,
+    physical_channels: list[str],
+    samples: int,
+    rate: float,
+    terminal_config_name: str,
+    min_val: float,
+    max_val: float,
+    timeout: float,
+) -> list[list[float]]:
+    """同步读取多路 AI 的一帧数据。
+
+    这里的“一帧”指：在同一个 NI-DAQmx Task 里，同时添加多个 AI 通道，
+    然后用同一个采样时钟读取 samples 个点。这样 ai0/ai1 的时间轴是一致的，
+    适合后面的双峰锁定程序读取 FP 透射信号和 PZT 监视信号。
+    """
+
+    _get_device(device_name)
+    if not physical_channels:
+        raise ValueError("physical_channels must not be empty")
+
+    config = _terminal_config(terminal_config_name)
+
+    with nidaqmx.Task() as task:
+        for physical_channel in physical_channels:
+            task.ai_channels.add_ai_voltage_chan(
+                physical_channel,
+                terminal_config=config,
+                min_val=min_val,
+                max_val=max_val,
+            )
+
+        task.timing.cfg_samp_clk_timing(
+            rate=rate,
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=samples,
+        )
+        raw_values = task.read(
+            number_of_samples_per_channel=samples,
+            timeout=timeout,
+        )
+        return split_ai_read_values(raw_values, len(physical_channels))
+
+
 def read_continuous_ai_chunk(
     task: Any,
     samples_per_read: int,
