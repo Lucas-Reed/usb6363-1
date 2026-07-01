@@ -1,0 +1,339 @@
+"""USB-6363 API 的客户端工具。
+
+其他 Python 子程序应该 import 这个文件里的 Usb6363Client，
+不要直接 import nidaqmx，也不要直接 import usb6363_core。
+
+调用关系应该是：
+    子程序 -> Usb6363Client -> HTTP API -> usb6363_server -> usb6363_core -> USB-6363
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+
+# 默认连接本机的 USB-6363 API 服务。
+DEFAULT_BASE_URL = "http://127.0.0.1:8765"
+
+
+class Usb6363Client:
+    """给其他 Python 程序使用的简单客户端。
+
+    你未来写子程序时，大多数情况下只需要：
+
+        from usb6363_client import Usb6363Client
+        daq = Usb6363Client()
+        value = daq.read_ai("ai0")
+    """
+
+    def __init__(self, base_url: str = DEFAULT_BASE_URL, timeout: float = 10.0) -> None:
+        # base_url 是 server 地址，默认就是本机 8765 端口。
+        self.base_url = base_url.rstrip("/")
+
+        # timeout 是网络请求最长等待时间，不是采集卡采样时间。
+        self.timeout = timeout
+
+    def health(self) -> dict[str, Any]:
+        """检查服务是否正在运行。"""
+
+        return self._get("/health")
+
+    def list_devices(self) -> dict[str, Any]:
+        """列出 server 那边 NI-DAQmx 能看到的设备。"""
+
+        return self._get("/api/devices")
+
+    def get_device(self) -> dict[str, Any]:
+        """获取当前目标设备 Dev2 的信息。"""
+
+        return self._get("/api/device")
+
+    def list_terminals(self) -> dict[str, Any]:
+        """列出 PFI、数字线、计数器等端子。
+
+        刚开始接线调试时，可以先调用这个函数看看设备暴露了哪些名字。
+        """
+
+        return self._get("/api/terminals")
+
+    def read_ai(
+        self,
+        channel: str = "ai0",
+        samples: int = 1,
+        rate: float = 1000.0,
+        terminal_config: str = "RSE",
+        min_val: float = -10.0,
+        max_val: float = 10.0,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """读取模拟输入 AI。
+
+        常用写法：
+            daq.read_ai("ai0")
+            daq.read_ai("ai1", samples=100, rate=1000)
+        """
+
+        return self._get(
+            "/api/ai/read",
+            {
+                "channel": channel,
+                "samples": samples,
+                "rate": rate,
+                "terminal_config": terminal_config,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+            },
+        )
+
+    def subscribe_ai(self, channel: str = "ai0") -> dict[str, Any]:
+        """订阅一个 AI 通道，启动或重建后台连续采样。
+
+        采样率由 server 自动管理：
+            1 个通道 -> 2 MHz
+            多个通道 -> 1 MHz / 通道数
+        """
+
+        return self._post(
+            "/api/ai/subscribe",
+            {
+                "channel": channel,
+            },
+        )
+
+    def unsubscribe_ai(self, channel: str = "ai0") -> dict[str, Any]:
+        """取消订阅一个 AI 通道。"""
+
+        return self._post(
+            "/api/ai/unsubscribe",
+            {
+                "channel": channel,
+            },
+        )
+
+    def set_ai_channels(self, channels: list[str]) -> dict[str, Any]:
+        """一次性设置后台连续采样的 AI 通道列表。
+
+        这适合“暂停其他通道，只采某几个通道”的场景。
+        """
+
+        return self._post(
+            "/api/ai/set_channels",
+            {
+                "channels": channels,
+            },
+        )
+
+    def clear_ai_channels(self) -> dict[str, Any]:
+        """停止所有 AI 后台连续采样。"""
+
+        return self._post("/api/ai/clear", {})
+
+    def get_ai_status(self) -> dict[str, Any]:
+        """查询后台 AI 连续采样状态。"""
+
+        return self._get("/api/ai/status")
+
+    def get_ai_latest(self, channel: str = "ai0") -> dict[str, Any]:
+        """读取已订阅通道的最近一个采样值。"""
+
+        return self._get(
+            "/api/ai/latest",
+            {
+                "channel": channel,
+            },
+        )
+
+    def get_ai_buffer(
+        self,
+        channel: str = "ai0",
+        max_samples: int = 1000,
+    ) -> dict[str, Any]:
+        """读取已订阅通道最近的一段缓存数据。"""
+
+        return self._get(
+            "/api/ai/buffer",
+            {
+                "channel": channel,
+                "max_samples": max_samples,
+            },
+        )
+
+    def get_ai_stats(
+        self,
+        channel: str = "ai0",
+        max_samples: int = 10000,
+    ) -> dict[str, Any]:
+        """读取已订阅通道最近缓存数据的统计量。
+
+        适合实时反馈：返回均值、最大值、最小值、RMS 等小 JSON。
+        """
+
+        return self._get(
+            "/api/ai/stats",
+            {
+                "channel": channel,
+                "max_samples": max_samples,
+            },
+        )
+
+    def record_ai_to_file(
+        self,
+        seconds: float,
+        output_dir: str = "data",
+        prefix: str = "ai_capture",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """把当前后台 AI 采样流接下来的一段完整数据保存成 .npy 文件。
+
+        调用前需要先 set_ai_channels 或 subscribe_ai。
+        返回的 JSON 只包含文件路径和元数据，不包含巨大原始数组。
+        """
+
+        return self._post(
+            "/api/ai/record_to_file",
+            {
+                "seconds": seconds,
+                "output_dir": output_dir,
+                "prefix": prefix,
+                "timeout": timeout,
+            },
+        )
+
+    def write_ao(
+        self,
+        channel: str = "ao0",
+        value: float = 0.0,
+        min_val: float = -10.0,
+        max_val: float = 10.0,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """写模拟输出 AO。
+
+        这会真实改变输出电压，例如：
+            daq.write_ao("ao0", 1.23)
+        """
+
+        return self._post(
+            "/api/ao/write",
+            {
+                "channel": channel,
+                "value": value,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+            },
+        )
+
+    def read_pfi(self, line: str = "PFI0", timeout: float = 10.0) -> dict[str, Any]:
+        """读取 PFI 或数字线的高低电平。
+
+        返回 value=True 表示高电平，value=False 表示低电平。
+        """
+
+        return self._get(
+            "/api/pfi/read",
+            {
+                "line": line,
+                "timeout": timeout,
+            },
+        )
+
+    def write_pfi(
+        self,
+        line: str = "PFI0",
+        value: bool = False,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """写 PFI 或数字线的高低电平。
+
+        注意：这会真实改变端子电平。外部设备已连接时要先确认安全。
+        """
+
+        return self._post(
+            "/api/pfi/write",
+            {
+                "line": line,
+                "value": value,
+                "timeout": timeout,
+            },
+        )
+
+    def count_pfi_edges(
+        self,
+        line: str = "PFI0",
+        counter: str = "ctr0",
+        seconds: float = 1.0,
+        edge: str = "RISING",
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """统计 PFI 在一段时间内的边沿数量。
+
+        例子：
+            daq.count_pfi_edges("PFI0", seconds=1.0)
+
+        这会返回 1 秒内 PFI0 出现了多少个上升沿。
+        """
+
+        return self._get(
+            "/api/pfi/count",
+            {
+                "line": line,
+                "counter": counter,
+                "seconds": seconds,
+                "edge": edge,
+                "timeout": timeout,
+            },
+        )
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """发送 GET 请求。普通使用者通常不需要直接调用这个函数。"""
+
+        url = f"{self.base_url}{path}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        try:
+            with urlopen(url, timeout=self.timeout) as response:
+                return self._decode_response(response.read())
+        except HTTPError as exc:
+            raise RuntimeError(self._error_message(exc)) from exc
+
+    def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        """发送 POST 请求。普通使用者通常不需要直接调用这个函数。"""
+
+        payload = json.dumps(data).encode("utf-8")
+        request = Request(
+            f"{self.base_url}{path}",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return self._decode_response(response.read())
+        except HTTPError as exc:
+            raise RuntimeError(self._error_message(exc)) from exc
+
+    @staticmethod
+    def _decode_response(raw: bytes) -> dict[str, Any]:
+        """把 server 返回的 JSON 字节数据转换成 Python dict。"""
+
+        data = json.loads(raw.decode("utf-8"))
+        if data.get("ok") is False:
+            raise RuntimeError(data.get("error", "USB-6363 API request failed"))
+        return data
+
+    @staticmethod
+    def _error_message(exc: HTTPError) -> str:
+        """尽量从 HTTP 错误响应里提取 server 返回的具体错误原因。"""
+
+        try:
+            raw = exc.read()
+            data = json.loads(raw.decode("utf-8"))
+            return data.get("error", str(exc))
+        except Exception:
+            return str(exc)

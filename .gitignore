@@ -1,0 +1,17 @@
+# Python 运行缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# NI-DAQmx 高速采样生成的数据文件
+data/*.npy
+data/*.json
+
+# 编辑器和系统临时文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
