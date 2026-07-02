@@ -563,11 +563,14 @@ class DaqController:
         trigger_enabled: bool = False,
         trigger_source: str = "PFI0",
         trigger_edge: str = "RISING",
+        resync_every_frames: int = 0,
     ) -> dict[str, Any]:
         """启动固定点数分帧的连续 AI 采集。
 
         旧版程序的核心方式就是：连续采样 task 不停，每次读取固定点数作为一帧。
         trigger_enabled=True 时，PFI 只作为“启动触发”，不是每帧触发。
+        resync_every_frames>0 时，会每隔指定帧数重建一次 AI task，
+        重新等待 PFI 边沿，以修正长时间运行时的帧边界慢漂。
         """
 
         if not channels:
@@ -578,6 +581,10 @@ class DaqController:
             raise ValueError("rate must be > 0")
         if min_val >= max_val:
             raise ValueError("min_val must be smaller than max_val")
+        if resync_every_frames < 0:
+            raise ValueError("resync_every_frames must be >= 0")
+        if resync_every_frames > 0 and not trigger_enabled:
+            raise ValueError("resync_every_frames requires trigger_enabled=True")
 
         physical_channels: list[str] = []
         for channel in channels:
@@ -621,7 +628,8 @@ class DaqController:
                 "trigger_enabled": trigger_enabled,
                 "trigger_source": physical_trigger_source,
                 "trigger_edge": trigger_edge,
-                "trigger_mode": "start_only" if trigger_enabled else "off",
+                "trigger_mode": "periodic_start" if resync_every_frames > 0 else ("start_only" if trigger_enabled else "off"),
+                "resync_every_frames": int(resync_every_frames),
                 "frame_duration_seconds": frame_duration_seconds,
                 "frame_duration_ms": frame_duration_ms,
                 "frame_rate_hz": frame_rate_hz,
@@ -872,55 +880,69 @@ class DaqController:
 
         channels = list(settings["channels"])
         samples_per_frame = int(settings["samples_per_frame"])
+        resync_every_frames = int(settings.get("resync_every_frames", 0))
+        segment_id = 0
         try:
-            task = nidaqmx_driver.create_continuous_ai_task(
-                channels=channels,
-                rate=float(settings["rate_per_channel"]),
-                samples_per_read=samples_per_frame,
-                terminal_config_name=str(settings["terminal_config"]),
-                min_val=float(settings["min_val"]),
-                max_val=float(settings["max_val"]),
-                start_trigger_source=settings["trigger_source"],
-                start_trigger_edge_name=str(settings["trigger_edge"]),
-            )
-            try:
-                while not stop_event.is_set():
-                    channel_values = nidaqmx_driver.read_continuous_ai_chunk(
-                        task=task,
-                        samples_per_read=samples_per_frame,
-                        channel_count=len(channels),
-                        timeout=float(settings["timeout"]),
-                    )
-                    now = time.time()
-                    with self._ai_lock:
-                        if stop_event.is_set():
+            while not stop_event.is_set():
+                segment_id += 1
+                segment_frame_id = 0
+                task = nidaqmx_driver.create_continuous_ai_task(
+                    channels=channels,
+                    rate=float(settings["rate_per_channel"]),
+                    samples_per_read=samples_per_frame,
+                    terminal_config_name=str(settings["terminal_config"]),
+                    min_val=float(settings["min_val"]),
+                    max_val=float(settings["max_val"]),
+                    start_trigger_source=settings["trigger_source"],
+                    start_trigger_edge_name=str(settings["trigger_edge"]),
+                )
+                try:
+                    while not stop_event.is_set():
+                        channel_values = nidaqmx_driver.read_continuous_ai_chunk(
+                            task=task,
+                            samples_per_read=samples_per_frame,
+                            channel_count=len(channels),
+                            timeout=float(settings["timeout"]),
+                        )
+                        now = time.time()
+                        segment_frame_id += 1
+                        with self._ai_lock:
+                            if stop_event.is_set():
+                                break
+                            self._frame_stream_frame_id += 1
+                            self._frame_stream_latest = {
+                                "device": self.device_name,
+                                "channels": channels,
+                                "channel_count": len(channels),
+                                "samples_per_channel": samples_per_frame,
+                                "rate_per_channel": float(settings["rate_per_channel"]),
+                                "aggregate_rate": float(settings["aggregate_rate"]),
+                                "terminal_config": str(settings["terminal_config"]),
+                                "min_val": float(settings["min_val"]),
+                                "max_val": float(settings["max_val"]),
+                                "trigger_enabled": bool(settings["trigger_enabled"]),
+                                "trigger_source": settings["trigger_source"],
+                                "trigger_edge": str(settings["trigger_edge"]),
+                                "trigger_mode": str(settings["trigger_mode"]),
+                                "resync_every_frames": resync_every_frames,
+                                "segment_id": segment_id,
+                                "segment_frame_id": segment_frame_id,
+                                "frame_duration_seconds": float(settings["frame_duration_seconds"]),
+                                "frame_duration_ms": float(settings["frame_duration_ms"]),
+                                "frame_rate_hz": float(settings["frame_rate_hz"]),
+                                "frame_id": self._frame_stream_frame_id,
+                                "started_at": now,
+                                "finished_at": now,
+                                "values": channel_values,
+                            }
+                            self._frame_stream_error = None
+
+                        # 如果启用了 PFI 周期重对齐，读满 N 帧就退出内层循环。
+                        # finally 会关闭当前 task，外层 while 会立刻新建 task 并重新等待 PFI 边沿。
+                        if resync_every_frames > 0 and segment_frame_id >= resync_every_frames:
                             break
-                        self._frame_stream_frame_id += 1
-                        self._frame_stream_latest = {
-                            "device": self.device_name,
-                            "channels": channels,
-                            "channel_count": len(channels),
-                            "samples_per_channel": samples_per_frame,
-                            "rate_per_channel": float(settings["rate_per_channel"]),
-                            "aggregate_rate": float(settings["aggregate_rate"]),
-                            "terminal_config": str(settings["terminal_config"]),
-                            "min_val": float(settings["min_val"]),
-                            "max_val": float(settings["max_val"]),
-                            "trigger_enabled": bool(settings["trigger_enabled"]),
-                            "trigger_source": settings["trigger_source"],
-                            "trigger_edge": str(settings["trigger_edge"]),
-                            "trigger_mode": str(settings["trigger_mode"]),
-                            "frame_duration_seconds": float(settings["frame_duration_seconds"]),
-                            "frame_duration_ms": float(settings["frame_duration_ms"]),
-                            "frame_rate_hz": float(settings["frame_rate_hz"]),
-                            "frame_id": self._frame_stream_frame_id,
-                            "started_at": now,
-                            "finished_at": now,
-                            "values": channel_values,
-                        }
-                        self._frame_stream_error = None
-            finally:
-                task.close()
+                finally:
+                    task.close()
         except Exception as exc:
             with self._ai_lock:
                 self._frame_stream_error = str(exc)

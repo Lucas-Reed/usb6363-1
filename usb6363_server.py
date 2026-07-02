@@ -297,6 +297,7 @@ def _ai_frame_stream_body(body: dict[str, Any]) -> dict[str, Any]:
         "trigger_enabled": _bool_value(body.get("trigger_enabled", False)),
         "trigger_source": str(body.get("trigger_source", "PFI0")),
         "trigger_edge": str(body.get("trigger_edge", "RISING")),
+        "resync_every_frames": int(body.get("resync_every_frames", 0)),
     }
 
 

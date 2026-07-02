@@ -99,6 +99,7 @@ def start_frame_stream(state: ViewerState, body: dict[str, Any]) -> dict[str, An
         trigger_enabled=bool_value(body.get("trigger_enabled", False)),
         trigger_source=str(body.get("trigger_source", "PFI0")),
         trigger_edge=str(body.get("trigger_edge", "RISING")),
+        resync_every_frames=int(body.get("resync_every_frames", 0)),
     )
 
 
@@ -315,6 +316,9 @@ def frame_summary(frame: dict[str, Any] | None) -> dict[str, Any] | None:
         "trigger_source": frame.get("trigger_source"),
         "trigger_edge": frame.get("trigger_edge"),
         "trigger_mode": frame.get("trigger_mode"),
+        "resync_every_frames": frame.get("resync_every_frames"),
+        "segment_id": frame.get("segment_id"),
+        "segment_frame_id": frame.get("segment_frame_id"),
         "frame_duration_seconds": frame.get("frame_duration_seconds"),
         "frame_duration_ms": frame.get("frame_duration_ms"),
         "frame_rate_hz": frame.get("frame_rate_hz"),

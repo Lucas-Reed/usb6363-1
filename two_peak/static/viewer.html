@@ -227,6 +227,8 @@
       </select>
     </div>
   </div>
+  <label>PFI 重新对齐间隔 / 帧，0 表示关闭</label>
+  <input id="resync_every_frames" type="number" value="0" min="0" step="1">
 
   <div class="actions">
     <button id="captureBtn" onclick="captureFrame()">采集一帧</button>
@@ -391,6 +393,7 @@ function getCaptureParams() {
     trigger_enabled: document.getElementById('trigger_enabled').checked,
     trigger_source: document.getElementById('trigger_source').value,
     trigger_edge: document.getElementById('trigger_edge').value,
+    resync_every_frames: Number(document.getElementById('resync_every_frames').value),
   };
 }
 
@@ -446,6 +449,7 @@ function applyDefaultsToUi(defaults) {
   setInputValue('trigger_enabled', defaults.trigger_enabled);
   setInputValue('trigger_source', defaults.trigger_source);
   setInputValue('trigger_edge', defaults.trigger_edge);
+  setInputValue('resync_every_frames', defaults.resync_every_frames);
   if (defaults.peak_indices) {
     setInputValue('peak0', defaults.peak_indices[0]);
     setInputValue('peak1', defaults.peak_indices[1]);
@@ -1062,8 +1066,11 @@ function updateFrameInfo() {
   const frameHz = latestFrame.frame_rate_hz !== undefined
     ? `  fps=${formatNumber(latestFrame.frame_rate_hz, 3)} Hz`
     : '';
+  const resync = latestFrame.resync_every_frames
+    ? `  resync=${latestFrame.resync_every_frames} frames seg=${latestFrame.segment_id || 0}:${latestFrame.segment_frame_id || 0}`
+    : '';
   document.getElementById('frameInfo').textContent =
-    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${frameMs}${frameHz}${trig}`;
+    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${frameMs}${frameHz}${trig}${resync}`;
 }
 
 window.addEventListener('resize', resizeAndDraw);

@@ -255,6 +255,7 @@ class Usb6363Client:
         trigger_enabled: bool = False,
         trigger_source: str = "PFI0",
         trigger_edge: str = "RISING",
+        resync_every_frames: int = 0,
     ) -> dict[str, Any]:
         """启动固定点数分帧连续采集。
 
@@ -274,6 +275,7 @@ class Usb6363Client:
                 "trigger_enabled": trigger_enabled,
                 "trigger_source": trigger_source,
                 "trigger_edge": trigger_edge,
+                "resync_every_frames": resync_every_frames,
             },
         )
 
