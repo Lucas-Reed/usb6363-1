@@ -226,6 +226,20 @@
     <button id="captureBtn" onclick="captureFrame()">采集一帧</button>
     <button class="green" id="saveBtn" onclick="saveFrame()" disabled>保存样本</button>
   </div>
+  <div class="grid2">
+    <div>
+      <label>连续采集间隔 / ms</label>
+      <input id="continuous_interval_ms" type="number" value="200" step="50">
+    </div>
+    <div>
+      <label>连续状态</label>
+      <input id="continuous_status" value="停止" readonly>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="green" id="continuousStartBtn" onclick="startContinuousCapture()">开始连续</button>
+    <button class="secondary" id="continuousStopBtn" onclick="stopContinuousCapture()" disabled>停止连续</button>
+  </div>
 
   <h2>手动选峰</h2>
   <label>点击波形时设置</label>
@@ -298,6 +312,10 @@
 let latestFrame = null;
 let latestMeasurement = null;
 let plotCanvases = [];
+let continuousRunning = false;
+let continuousBusy = false;
+let continuousTimer = null;
+let continuousFrameCount = 0;
 
 function getCaptureParams() {
   return {
@@ -347,25 +365,82 @@ async function postJson(path, body) {
   return data;
 }
 
-async function captureFrame() {
+async function captureFrame(options = {}) {
+  const fromContinuous = options.fromContinuous === true;
+  if (fromContinuous && continuousBusy) return;
   const btn = document.getElementById('captureBtn');
-  btn.disabled = true;
+  const startBtn = document.getElementById('continuousStartBtn');
+  if (fromContinuous) {
+    continuousBusy = true;
+  } else {
+    btn.disabled = true;
+    startBtn.disabled = true;
+  }
   const params = getCaptureParams();
   const prefix = params.trigger_enabled ? `等待 ${params.trigger_source} ${params.trigger_edge} 后采集...` : '正在采集一帧...';
-  setStatus(prefix, '');
+  setStatus(fromContinuous ? `连续采集 #${continuousFrameCount + 1}：${prefix}` : prefix, '');
   try {
     latestFrame = await postJson('/api/capture', params);
     latestMeasurement = null;
     document.getElementById('saveBtn').disabled = false;
     renderPlots();
     updateFrameInfo();
-    setStatus('采集完成。', 'ok');
     await measurePeaks();
+    if (fromContinuous) {
+      continuousFrameCount += 1;
+      updateContinuousStatus();
+      setStatus(`连续采集运行中，已采 ${continuousFrameCount} 帧。`, 'ok');
+    } else {
+      setStatus('采集完成。', 'ok');
+    }
   } catch (err) {
     setStatus(String(err.message || err), 'error');
+    if (fromContinuous) stopContinuousCapture();
   } finally {
-    btn.disabled = false;
+    if (fromContinuous) {
+      continuousBusy = false;
+    } else {
+      btn.disabled = false;
+      startBtn.disabled = false;
+    }
   }
+}
+
+function startContinuousCapture() {
+  if (continuousRunning) return;
+  const intervalMs = Math.max(20, Number(document.getElementById('continuous_interval_ms').value) || 200);
+  continuousRunning = true;
+  continuousBusy = false;
+  continuousFrameCount = 0;
+  document.getElementById('continuousStartBtn').disabled = true;
+  document.getElementById('continuousStopBtn').disabled = false;
+  document.getElementById('captureBtn').disabled = true;
+  updateContinuousStatus();
+
+  const tick = () => {
+    if (!continuousRunning) return;
+    captureFrame({fromContinuous: true});
+  };
+  tick();
+  continuousTimer = setInterval(tick, intervalMs);
+}
+
+function stopContinuousCapture() {
+  continuousRunning = false;
+  if (continuousTimer !== null) {
+    clearInterval(continuousTimer);
+    continuousTimer = null;
+  }
+  continuousBusy = false;
+  document.getElementById('continuousStartBtn').disabled = false;
+  document.getElementById('continuousStopBtn').disabled = true;
+  document.getElementById('captureBtn').disabled = false;
+  updateContinuousStatus();
+}
+
+function updateContinuousStatus() {
+  const text = continuousRunning ? `运行中，${continuousFrameCount} 帧` : '停止';
+  document.getElementById('continuous_status').value = text;
 }
 
 async function measurePeaks() {
