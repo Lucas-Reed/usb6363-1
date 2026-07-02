@@ -40,6 +40,22 @@ http://127.0.0.1:8766
 这个查看器只通过 `usb6363_client.py` 调用底层 API，不直接访问 NI-DAQmx。
 当前它只用于采集一帧波形、手动选 P1/P2、测峰和保存样本；还不做闭环 AO 输出。
 
+## 4. 检查 PFI 上升沿
+
+如果要确认信号源同步输出接到 PFI 后能不能被 USB-6363 看到，
+先保持底层 API 服务运行，然后执行：
+
+```powershell
+python pfi_rising_counter.py --line PFI0 --counter ctr0 --seconds 1
+```
+
+它会每 1 秒打印一次 PFI0 上升沿计数和估算频率。
+如果要换端子或计数器，例如：
+
+```powershell
+python pfi_rising_counter.py --line PFI1 --counter ctr1 --seconds 0.5
+```
+
 ## 代码结构
 
 ```text
@@ -63,9 +79,12 @@ legacy/
 
 two_peak_viewer.py
     最小双峰波形查看器。用于看真实 AI 波形、手动选峰、保存样本。
+
+pfi_rising_counter.py
+    最小 PFI 上升沿计数脚本。用于检查信号源同步输出是否能被 PFI 看到。
 ```
 
-## 4. 其他 Python 程序这样调用
+## 5. 其他 Python 程序这样调用
 
 ```python
 from usb6363_client import Usb6363Client
