@@ -41,6 +41,13 @@ class ManualAreaMeasurement:
     filtered_value: float
     filter_mode: str
     filter_window: int
+    baseline_mode: str
+    baseline_left_index: int | None = None
+    baseline_right_index: int | None = None
+    baseline_point_count: int = 0
+    baseline_value: float | None = None
+    baseline_area: float | None = None
+    corrected_value: float | None = None
     mode: str = "raw_sum"
 
 
@@ -178,6 +185,9 @@ def measure_manual_area(
     right_index: int,
     filter_mode: str = "none",
     filter_window: int = 1,
+    baseline_mode: str = "none",
+    baseline_left_index: int | None = None,
+    baseline_right_index: int | None = None,
 ) -> ManualAreaMeasurement:
     """按用户手动指定的左右零点，直接求原始面积。
 
@@ -210,6 +220,42 @@ def measure_manual_area(
     filtered_window = filtered_data[left : right + 1]
     raw_value = float(np.sum(raw_window))
     filtered_value = float(np.sum(filtered_window))
+    normalized_baseline_mode = baseline_mode.strip().lower()
+    baseline_left = None
+    baseline_right = None
+    baseline_count = 0
+    baseline_value = None
+    baseline_area = None
+    corrected_value = filtered_value
+
+    if normalized_baseline_mode not in ("", "none"):
+        if normalized_baseline_mode not in ("mean", "median"):
+            raise ValueError("baseline_mode must be none, mean, or median")
+        if baseline_left_index is None or baseline_right_index is None:
+            raise ValueError("baseline window is required when baseline_mode is enabled")
+
+        baseline_left = int(round(baseline_left_index))
+        baseline_right = int(round(baseline_right_index))
+        if baseline_right < baseline_left:
+            baseline_left, baseline_right = baseline_right, baseline_left
+        baseline_left = max(0, min(baseline_left, data.size - 1))
+        baseline_right = max(0, min(baseline_right, data.size - 1))
+        if baseline_right <= baseline_left:
+            raise ValueError("baseline right index must be greater than baseline left index")
+
+        # 本底估计使用“同一条滤波后的波形”，这样 filtered_area 和 baseline
+        # 处在同一种数据处理条件下。filter_mode=none 时就是原始波形。
+        baseline_window = filtered_data[baseline_left : baseline_right + 1]
+        baseline_count = int(baseline_window.size)
+        if normalized_baseline_mode == "mean":
+            baseline_value = float(np.mean(baseline_window))
+        else:
+            baseline_value = float(np.median(baseline_window))
+        baseline_area = baseline_value * float(raw_window.size)
+        corrected_value = filtered_value - baseline_area
+    else:
+        normalized_baseline_mode = "none"
+
     return ManualAreaMeasurement(
         left_index=left,
         right_index=right,
@@ -219,6 +265,13 @@ def measure_manual_area(
         filtered_value=filtered_value,
         filter_mode=normalized_filter_mode,
         filter_window=normalized_filter_window,
+        baseline_mode=normalized_baseline_mode,
+        baseline_left_index=baseline_left,
+        baseline_right_index=baseline_right,
+        baseline_point_count=baseline_count,
+        baseline_value=baseline_value,
+        baseline_area=baseline_area,
+        corrected_value=corrected_value,
     )
 
 
