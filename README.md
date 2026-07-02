@@ -39,6 +39,7 @@ http://127.0.0.1:8766
 
 这个查看器只通过 `usb6363_client.py` 调用底层 API，不直接访问 NI-DAQmx。
 当前它只用于采集一帧波形、手动选 P1/P2、测峰和保存样本；还不做闭环 AO 输出。
+如果勾选“PFI 硬件触发”，采集卡会等待指定 PFI 边沿后才开始采这一帧。
 
 ## 4. 检查 PFI 上升沿
 
@@ -73,6 +74,10 @@ usb6363_client.py
 
 two_peak/
     双峰锁定的新实现。这里不直接调用 NI-DAQmx，只处理参数、信号和 PI 算法。
+    viewer_state.py 保存查看器状态。
+    viewer_capture.py 处理采集、测峰、保存样本。
+    viewer_server.py 处理查看器 HTTP 路由。
+    static/viewer.html 是查看器前端页面。
 
 legacy/
     旧版双峰锁定程序参考快照。只作为需求和算法参考，不建议继续直接修改。
@@ -223,12 +228,16 @@ shape = (1, 2000000)
   "rate": 50000,
   "terminal_config": "DIFF",
   "min_val": -5.0,
-  "max_val": 5.0
+  "max_val": 5.0,
+  "trigger_enabled": true,
+  "trigger_source": "PFI0",
+  "trigger_edge": "RISING"
 }
 ```
 
 注意：调用 `capture_ai_frame` 前，后台连续采样必须是停止状态。
 如果已经调用过 `set_ai_channels`，请先调用 `clear_ai_channels`。
+如果 `trigger_enabled=true`，采集会等待触发边沿；触发信号没来时会直到超时报错。
 
 AO 输出 JSON 例子：
 

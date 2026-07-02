@@ -442,6 +442,9 @@ class DaqController:
         min_val: float = -5.0,
         max_val: float = 5.0,
         timeout: float = 10.0,
+        trigger_enabled: bool = False,
+        trigger_source: str = "PFI0",
+        trigger_edge: str = "RISING",
     ) -> dict[str, Any]:
         """同步采集多路 AI 的一帧数据。
 
@@ -452,6 +455,9 @@ class DaqController:
 
         注意：它会把数据直接放进 JSON 返回，所以只适合“一帧波形”。
         长时间高速记录请用 record_ai_to_file。
+
+        trigger_enabled=True 时，会用 PFI 等数字端子作为硬件开始触发源。
+        例如 trigger_source="PFI0" 表示等待 /Dev2/PFI0 的指定边沿后开始采样。
         """
 
         if not channels:
@@ -468,6 +474,10 @@ class DaqController:
             physical_channel = self._normalize_ai_channel(channel)
             if physical_channel not in physical_channels:
                 physical_channels.append(physical_channel)
+
+        physical_trigger_source = None
+        if trigger_enabled:
+            physical_trigger_source = self._normalize_pfi_terminal(trigger_source)
 
         total_json_samples = len(physical_channels) * samples
         if total_json_samples > AI_FRAME_MAX_JSON_SAMPLES:
@@ -496,6 +506,8 @@ class DaqController:
                     min_val=min_val,
                     max_val=max_val,
                     timeout=timeout,
+                    trigger_source=physical_trigger_source,
+                    trigger_edge_name=trigger_edge,
                 )
         duration_seconds = time.perf_counter() - t0
 
@@ -512,6 +524,9 @@ class DaqController:
             "duration_seconds": duration_seconds,
             "started_at": started_at,
             "finished_at": time.time(),
+            "trigger_enabled": trigger_enabled,
+            "trigger_source": physical_trigger_source,
+            "trigger_edge": trigger_edge,
             "values": values,
         }
 

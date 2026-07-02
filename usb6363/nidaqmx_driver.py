@@ -104,12 +104,17 @@ def capture_ai_frame(
     min_val: float,
     max_val: float,
     timeout: float,
+    trigger_source: str | None = None,
+    trigger_edge_name: str = "RISING",
 ) -> list[list[float]]:
     """同步读取多路 AI 的一帧数据。
 
     这里的“一帧”指：在同一个 NI-DAQmx Task 里，同时添加多个 AI 通道，
     然后用同一个采样时钟读取 samples 个点。这样 ai0/ai1 的时间轴是一致的，
     适合后面的双峰锁定程序读取 FP 透射信号和 PZT 监视信号。
+
+    trigger_source 不为 None 时，AI Task 会等待这个数字端子的边沿后才开始采样。
+    例如 trigger_source="/Dev2/PFI0"，trigger_edge_name="RISING"。
     """
 
     _get_device(device_name)
@@ -132,6 +137,13 @@ def capture_ai_frame(
             sample_mode=AcquisitionType.FINITE,
             samps_per_chan=samples,
         )
+        if trigger_source is not None:
+            task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                trigger_source=trigger_source,
+                trigger_edge=_edge(trigger_edge_name),
+            )
+            task.start()
+
         raw_values = task.read(
             number_of_samples_per_channel=samples,
             timeout=timeout,

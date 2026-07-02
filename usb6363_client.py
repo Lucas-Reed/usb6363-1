@@ -213,6 +213,9 @@ class Usb6363Client:
         min_val: float = -5.0,
         max_val: float = 5.0,
         timeout: float = 10.0,
+        trigger_enabled: bool = False,
+        trigger_source: str = "PFI0",
+        trigger_edge: str = "RISING",
     ) -> dict[str, Any]:
         """同步读取多路 AI 的一帧数据。
 
@@ -220,6 +223,8 @@ class Usb6363Client:
         返回值里的 values 是二维列表：
             values[0] 对应 channels[0]
             values[1] 对应 channels[1]
+
+        trigger_enabled=True 时，底层采集会等待 PFI 等数字触发源的边沿。
         """
 
         return self._post(
@@ -232,6 +237,9 @@ class Usb6363Client:
                 "min_val": min_val,
                 "max_val": max_val,
                 "timeout": timeout,
+                "trigger_enabled": trigger_enabled,
+                "trigger_source": trigger_source,
+                "trigger_edge": trigger_edge,
             },
         )
 

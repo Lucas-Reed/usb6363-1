@@ -261,6 +261,9 @@ def _ai_capture_frame_body(body: dict[str, Any]) -> dict[str, Any]:
         "min_val": float(body.get("min_val", -5.0)),
         "max_val": float(body.get("max_val", 5.0)),
         "timeout": float(body.get("timeout", 10.0)),
+        "trigger_enabled": _bool_value(body.get("trigger_enabled", False)),
+        "trigger_source": str(body.get("trigger_source", "PFI0")),
+        "trigger_edge": str(body.get("trigger_edge", "RISING")),
     }
 
 

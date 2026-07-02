@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>双峰波形查看器</title>
+<style>
+  :root {
+    --bg: #f4f6f8;
+    --panel: #ffffff;
+    --line: #d7dde5;
+    --text: #17202a;
+    --muted: #697586;
+    --blue: #1f6feb;
+    --green: #16833a;
+    --red: #c62828;
+    --amber: #9a6700;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", Arial, sans-serif;
+    height: 100vh;
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    overflow: hidden;
+  }
+  aside {
+    background: var(--panel);
+    border-right: 1px solid var(--line);
+    padding: 12px;
+    overflow: auto;
+  }
+  main {
+    min-width: 0;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    gap: 10px;
+    padding: 12px;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  h2 {
+    font-size: 14px;
+    margin: 18px 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+  }
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin: 8px 0 4px;
+  }
+  input, select, button {
+    width: 100%;
+    font: inherit;
+    font-size: 13px;
+  }
+  input, select {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 7px 8px;
+    background: #fff;
+    color: var(--text);
+  }
+  input[type="checkbox"] {
+    width: auto;
+    margin-right: 7px;
+  }
+  button {
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    background: var(--blue);
+    color: white;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  button.secondary { background: #59636f; }
+  button.green { background: var(--green); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .inline {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 10px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .status {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 9px 10px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .status.error { color: var(--red); }
+  .status.ok { color: var(--green); }
+  .plots {
+    display: grid;
+    gap: 10px;
+    min-height: 0;
+    overflow: auto;
+    grid-auto-rows: minmax(220px, 1fr);
+  }
+  .plot {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    min-height: 0;
+    position: relative;
+    overflow: hidden;
+  }
+  .plot-title {
+    position: absolute;
+    left: 10px;
+    top: 8px;
+    background: rgba(255,255,255,0.88);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 3px 7px;
+    font-size: 12px;
+    color: var(--muted);
+    z-index: 2;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: crosshair;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  th, td {
+    text-align: right;
+    border-bottom: 1px solid var(--line);
+    padding: 6px 4px;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  .footer {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 8px;
+  }
+  .mono { font-family: Consolas, "SFMono-Regular", monospace; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>双峰波形查看器</h1>
+
+  <h2>采集</h2>
+  <label>AI 通道，逗号分隔</label>
+  <input id="channels" value="ai0, ai1">
+  <div class="grid2">
+    <div>
+      <label>采样率 / Hz</label>
+      <input id="rate" type="number" value="50000" step="1000">
+    </div>
+    <div>
+      <label>每通道点数</label>
+      <input id="samples" type="number" value="5000" step="100">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>接线方式</label>
+      <select id="terminal_config">
+        <option value="DIFF">DIFF</option>
+        <option value="RSE">RSE</option>
+        <option value="NRSE">NRSE</option>
+      </select>
+    </div>
+    <div>
+      <label>超时 / s</label>
+      <input id="timeout" type="number" value="10" step="1">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AI 最小值 / V</label>
+      <input id="min_val" type="number" value="-5" step="0.5">
+    </div>
+    <div>
+      <label>AI 最大值 / V</label>
+      <input id="max_val" type="number" value="5" step="0.5">
+    </div>
+  </div>
+
+  <h2>PFI 硬件触发</h2>
+  <label class="inline"><input id="trigger_enabled" type="checkbox"> 等待 PFI 边沿后开始采集</label>
+  <div class="grid2">
+    <div>
+      <label>触发源</label>
+      <input id="trigger_source" value="PFI0">
+    </div>
+    <div>
+      <label>触发边沿</label>
+      <select id="trigger_edge">
+        <option value="RISING">RISING</option>
+        <option value="FALLING">FALLING</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="captureBtn" onclick="captureFrame()">采集一帧</button>
+    <button class="green" id="saveBtn" onclick="saveFrame()" disabled>保存样本</button>
+  </div>
+
+  <h2>手动选峰</h2>
+  <label>点击波形时设置</label>
+  <select id="pick_target">
+    <option value="0">P1</option>
+    <option value="1">P2</option>
+  </select>
+  <div class="grid2">
+    <div>
+      <label>P1 索引</label>
+      <input id="peak0" type="number" value="642" step="1">
+    </div>
+    <div>
+      <label>P2 索引</label>
+      <input id="peak1" type="number" value="754" step="1">
+    </div>
+  </div>
+
+  <h2>测峰参数</h2>
+  <div class="grid2">
+    <div>
+      <label>分析通道序号</label>
+      <input id="analysis_channel_index" type="number" value="0" step="1">
+    </div>
+    <div>
+      <label>测峰模式</label>
+      <select id="peak_mode">
+        <option value="height">height</option>
+        <option value="area">area</option>
+      </select>
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>平滑窗口</label>
+      <input id="smooth_window" type="number" value="25" step="2">
+    </div>
+    <div>
+      <label>搜索半宽</label>
+      <input id="search_window_half" type="number" value="20" step="1">
+    </div>
+  </div>
+  <label>测量半宽</label>
+  <input id="measure_half" type="number" value="5" step="1">
+  <div class="actions">
+    <button class="secondary" onclick="measurePeaks()">重新测峰</button>
+    <button class="secondary" onclick="clearPeaks()">清空标记</button>
+  </div>
+
+  <h2>结果</h2>
+  <table>
+    <thead><tr><th>峰</th><th>索引</th><th>测量值</th><th>窗口</th></tr></thead>
+    <tbody id="peakRows">
+      <tr><td>P1</td><td>--</td><td>--</td><td>--</td></tr>
+      <tr><td>P2</td><td>--</td><td>--</td><td>--</td></tr>
+    </tbody>
+  </table>
+</aside>
+
+<main>
+  <div id="status" class="status">查看器已打开。请先确认底层 API 服务正在运行。</div>
+  <div id="plots" class="plots"></div>
+  <div class="footer">
+    <div id="frameInfo" class="status">尚未采集。</div>
+    <div class="mono" id="cursorInfo"></div>
+  </div>
+</main>
+
+<script>
+let latestFrame = null;
+let latestMeasurement = null;
+let plotCanvases = [];
+
+function getCaptureParams() {
+  return {
+    channels: document.getElementById('channels').value,
+    rate: Number(document.getElementById('rate').value),
+    samples: Number(document.getElementById('samples').value),
+    terminal_config: document.getElementById('terminal_config').value,
+    min_val: Number(document.getElementById('min_val').value),
+    max_val: Number(document.getElementById('max_val').value),
+    timeout: Number(document.getElementById('timeout').value),
+    trigger_enabled: document.getElementById('trigger_enabled').checked,
+    trigger_source: document.getElementById('trigger_source').value,
+    trigger_edge: document.getElementById('trigger_edge').value,
+  };
+}
+
+function getMeasureParams() {
+  return {
+    peak_indices: [
+      Number(document.getElementById('peak0').value),
+      Number(document.getElementById('peak1').value),
+    ],
+    analysis_channel_index: Number(document.getElementById('analysis_channel_index').value),
+    smooth_window: Number(document.getElementById('smooth_window').value),
+    search_window_half: Number(document.getElementById('search_window_half').value),
+    measure_half: Number(document.getElementById('measure_half').value),
+    peak_mode: document.getElementById('peak_mode').value,
+  };
+}
+
+function setStatus(text, kind) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = 'status' + (kind ? ' ' + kind : '');
+}
+
+async function postJson(path, body) {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || '请求失败');
+  }
+  return data;
+}
+
+async function captureFrame() {
+  const btn = document.getElementById('captureBtn');
+  btn.disabled = true;
+  const params = getCaptureParams();
+  const prefix = params.trigger_enabled ? `等待 ${params.trigger_source} ${params.trigger_edge} 后采集...` : '正在采集一帧...';
+  setStatus(prefix, '');
+  try {
+    latestFrame = await postJson('/api/capture', params);
+    latestMeasurement = null;
+    document.getElementById('saveBtn').disabled = false;
+    renderPlots();
+    updateFrameInfo();
+    setStatus('采集完成。', 'ok');
+    await measurePeaks();
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function measurePeaks() {
+  if (!latestFrame) {
+    setStatus('还没有采集波形。', 'error');
+    return;
+  }
+  try {
+    latestMeasurement = await postJson('/api/measure', getMeasureParams());
+    updatePeakTable();
+    renderPlots();
+    setStatus('测峰完成。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function saveFrame() {
+  if (!latestFrame) {
+    setStatus('还没有采集波形。', 'error');
+    return;
+  }
+  try {
+    const saved = await postJson('/api/save', {
+      parameters: {...getCaptureParams(), ...getMeasureParams()},
+    });
+    setStatus('样本已保存：' + saved.npy_file, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+function clearPeaks() {
+  latestMeasurement = null;
+  updatePeakTable();
+  renderPlots();
+}
+
+function renderPlots() {
+  const container = document.getElementById('plots');
+  container.innerHTML = '';
+  plotCanvases = [];
+  if (!latestFrame || !latestFrame.values) return;
+
+  const count = latestFrame.values.length;
+  if (count <= 2) {
+    container.style.gridTemplateRows = `repeat(${count}, minmax(0, 1fr))`;
+  } else {
+    container.style.gridTemplateRows = `repeat(${count}, minmax(220px, 1fr))`;
+  }
+
+  latestFrame.values.forEach((data, index) => {
+    const box = document.createElement('div');
+    box.className = 'plot';
+    const title = document.createElement('div');
+    title.className = 'plot-title';
+    title.textContent = `${latestFrame.channels[index]}  ${data.length} 点`;
+    const canvas = document.createElement('canvas');
+    canvas.addEventListener('click', event => handlePlotClick(event, index));
+    canvas.addEventListener('mousemove', event => updateCursor(event, index));
+    box.appendChild(title);
+    box.appendChild(canvas);
+    container.appendChild(box);
+    plotCanvases.push({canvas, data, index});
+  });
+
+  resizeAndDraw();
+}
+
+function resizeAndDraw() {
+  for (const item of plotCanvases) {
+    const rect = item.canvas.parentElement.getBoundingClientRect();
+    item.canvas.width = Math.max(300, Math.floor(rect.width * devicePixelRatio));
+    item.canvas.height = Math.max(180, Math.floor(rect.height * devicePixelRatio));
+    drawWaveform(item.canvas, item.data, item.index);
+  }
+}
+
+function drawWaveform(canvas, data, channelIndex) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+
+  if (!data || data.length < 2) return;
+  let min = data[0];
+  let max = data[0];
+  for (const value of data) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  const span = Math.max(1e-12, max - min);
+  const padX = 44 * devicePixelRatio;
+  const padY = 28 * devicePixelRatio;
+  const x0 = padX;
+  const y0 = padY;
+  const plotW = w - 2 * padX;
+  const plotH = h - 2 * padY;
+
+  ctx.strokeStyle = '#d7dde5';
+  ctx.lineWidth = 1 * devicePixelRatio;
+  ctx.strokeRect(x0, y0, plotW, plotH);
+
+  ctx.beginPath();
+  data.forEach((value, i) => {
+    const x = x0 + (i / (data.length - 1)) * plotW;
+    const y = y0 + (1 - (value - min) / span) * plotH;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = channelIndex === 0 ? '#1f6feb' : '#16833a';
+  ctx.lineWidth = 1.4 * devicePixelRatio;
+  ctx.stroke();
+
+  drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span);
+
+  ctx.fillStyle = '#697586';
+  ctx.font = `${11 * devicePixelRatio}px Consolas`;
+  ctx.fillText(`min ${min.toFixed(5)} V`, x0, h - 8 * devicePixelRatio);
+  ctx.fillText(`max ${max.toFixed(5)} V`, x0 + 150 * devicePixelRatio, h - 8 * devicePixelRatio);
+}
+
+function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span) {
+  const analysisIndex = Number(document.getElementById('analysis_channel_index').value);
+  if (channelIndex !== analysisIndex) return;
+
+  const peaks = [
+    Number(document.getElementById('peak0').value),
+    Number(document.getElementById('peak1').value),
+  ];
+  peaks.forEach((idx, i) => {
+    if (!Number.isFinite(idx) || idx < 0 || idx >= data.length) return;
+    const x = x0 + (idx / (data.length - 1)) * plotW;
+    ctx.strokeStyle = i === 0 ? '#c62828' : '#9a6700';
+    ctx.lineWidth = 1.3 * devicePixelRatio;
+    ctx.beginPath();
+    ctx.moveTo(x, y0);
+    ctx.lineTo(x, y0 + plotH);
+    ctx.stroke();
+    ctx.fillStyle = i === 0 ? '#c62828' : '#9a6700';
+    ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
+    ctx.fillText(i === 0 ? 'P1' : 'P2', x + 4 * devicePixelRatio, y0 + 16 * devicePixelRatio);
+  });
+
+  if (latestMeasurement && latestMeasurement.measurements) {
+    latestMeasurement.measurements.forEach((m, i) => {
+      const idx = m.index;
+      if (idx < 0 || idx >= data.length) return;
+      const x = x0 + (idx / (data.length - 1)) * plotW;
+      const y = y0 + (1 - (data[idx] - min) / span) * plotH;
+      ctx.fillStyle = i === 0 ? '#c62828' : '#9a6700';
+      ctx.beginPath();
+      ctx.arc(x, y, 4 * devicePixelRatio, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+}
+
+function handlePlotClick(event, channelIndex) {
+  const analysisIndex = Number(document.getElementById('analysis_channel_index').value);
+  if (channelIndex !== analysisIndex || !latestFrame) return;
+  const item = plotCanvases[channelIndex];
+  const idx = eventToSampleIndex(event, item.canvas, item.data.length);
+  const target = document.getElementById('pick_target').value;
+  document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
+  document.getElementById('pick_target').value = target === '0' ? '1' : '0';
+  measurePeaks();
+}
+
+function updateCursor(event, channelIndex) {
+  const item = plotCanvases[channelIndex];
+  const idx = eventToSampleIndex(event, item.canvas, item.data.length);
+  const value = item.data[idx];
+  document.getElementById('cursorInfo').textContent =
+    `${latestFrame.channels[channelIndex]}  index=${idx}  value=${value.toFixed(6)} V`;
+}
+
+function eventToSampleIndex(event, canvas, length) {
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+  return Math.round((x / Math.max(1, rect.width)) * (length - 1));
+}
+
+function updatePeakTable() {
+  const rows = document.getElementById('peakRows');
+  if (!latestMeasurement || !latestMeasurement.measurements) {
+    rows.innerHTML = '<tr><td>P1</td><td>--</td><td>--</td><td>--</td></tr><tr><td>P2</td><td>--</td><td>--</td><td>--</td></tr>';
+    return;
+  }
+  rows.innerHTML = latestMeasurement.measurements.map((m, i) => `
+    <tr>
+      <td>${i === 0 ? 'P1' : 'P2'}</td>
+      <td>${m.index}</td>
+      <td>${Number(m.value).toExponential(6)}</td>
+      <td>${m.window_left}-${m.window_right}</td>
+    </tr>
+  `).join('');
+}
+
+function updateFrameInfo() {
+  if (!latestFrame) return;
+  const trig = latestFrame.trigger_enabled
+    ? `  trigger=${latestFrame.trigger_source} ${latestFrame.trigger_edge}`
+    : '  trigger=off';
+  document.getElementById('frameInfo').textContent =
+    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${trig}`;
+}
+
+window.addEventListener('resize', resizeAndDraw);
+updatePeakTable();
+</script>
+</body>
+</html>
