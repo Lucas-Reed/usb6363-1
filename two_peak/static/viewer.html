@@ -571,8 +571,13 @@ async function startBackendStream() {
     setStatus('连续采集已启动，等待最新帧...', 'ok');
     streamTimer = setInterval(pollBackendStreamLatest, 80);
   } catch (err) {
-    setStatus(String(err.message || err), 'error');
-    stopBackendStreamUiOnly();
+    const message = String(err.message || err);
+    if (message.includes('AI frame stream is already running')) {
+      await syncBackendStreamStatus(true);
+    } else {
+      setStatus(message, 'error');
+      stopBackendStreamUiOnly();
+    }
   }
 }
 
@@ -597,6 +602,36 @@ function stopBackendStreamUiOnly() {
   document.getElementById('streamStopBtn').disabled = true;
   document.getElementById('captureBtn').disabled = false;
   updateStreamStatus({running: false, frame_id: streamLastFrameId});
+}
+
+async function syncBackendStreamStatus(showStatus = false) {
+  try {
+    const response = await fetch('/api/stream/status');
+    const status = await response.json();
+    if (!response.ok || status.ok === false) {
+      throw new Error(status.error || '查询连续采集状态失败');
+    }
+    updateStreamStatus(status);
+    streamLastFrameId = status.frame_id || 0;
+    streamRunning = Boolean(status.running);
+    document.getElementById('streamStartBtn').disabled = streamRunning;
+    document.getElementById('streamStopBtn').disabled = !streamRunning;
+    document.getElementById('captureBtn').disabled = streamRunning;
+    if (streamRunning && streamTimer === null) {
+      streamTimer = setInterval(pollBackendStreamLatest, 80);
+    }
+    if (!streamRunning && streamTimer !== null) {
+      clearInterval(streamTimer);
+      streamTimer = null;
+    }
+    if (showStatus && streamRunning) {
+      setStatus('检测到后端连续采集已经在运行，已接管状态。', 'ok');
+    }
+  } catch (err) {
+    if (showStatus) {
+      setStatus(String(err.message || err), 'error');
+    }
+  }
 }
 
 async function pollBackendStreamLatest() {
@@ -949,6 +984,7 @@ updateStreamStatus({running: false, frame_id: 0});
 updatePeakTable();
 loadDefaults();
 refreshSavedSamples();
+syncBackendStreamStatus(true);
 </script>
 </body>
 </html>
