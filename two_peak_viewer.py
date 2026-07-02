@@ -351,6 +351,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   main {
     min-width: 0;
+    min-height: 0;
     display: grid;
     grid-template-rows: auto 1fr auto;
     gap: 10px;
@@ -422,12 +423,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 10px;
     min-height: 0;
     overflow: auto;
+    grid-auto-rows: minmax(220px, 1fr);
   }
   .plot {
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 8px;
-    min-height: 230px;
+    min-height: 0;
     position: relative;
     overflow: hidden;
   }
@@ -694,6 +696,13 @@ function renderPlots() {
   container.innerHTML = '';
   plotCanvases = [];
   if (!latestFrame || !latestFrame.values) return;
+
+  const count = latestFrame.values.length;
+  if (count <= 2) {
+    container.style.gridTemplateRows = `repeat(${count}, minmax(0, 1fr))`;
+  } else {
+    container.style.gridTemplateRows = `repeat(${count}, minmax(220px, 1fr))`;
+  }
 
   latestFrame.values.forEach((data, index) => {
     const box = document.createElement('div');
