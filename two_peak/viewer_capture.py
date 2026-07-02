@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from two_peak.signal import locate_and_measure_two_peaks
+from two_peak.signal import measure_manual_area
 from two_peak.viewer_state import ViewerState
 
 
@@ -146,18 +147,33 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
     search_window_half = int(body.get("search_window_half", 20))
     measure_half = int(body.get("measure_half", 5))
     peak_mode = str(body.get("peak_mode", "height"))
+    manual_area_left = body.get("manual_area_left")
+    manual_area_right = body.get("manual_area_right")
     analysis_channel_index = int(body.get("analysis_channel_index", 0))
     if analysis_channel_index < 0 or analysis_channel_index >= values.shape[0]:
         raise ValueError("analysis_channel_index is out of range")
 
+    analysis_signal = values[analysis_channel_index]
     _, measurements = locate_and_measure_two_peaks(
-        ai0=values[analysis_channel_index],
+        ai0=analysis_signal,
         peak_indices=[int(peak_indices[0]), int(peak_indices[1])],
         smooth_window=smooth_window,
         search_window_half=search_window_half,
         measure_half=measure_half,
         mode=peak_mode,
     )
+
+    manual_area = None
+    if manual_area_left not in (None, "") and manual_area_right not in (None, ""):
+        # 手动面积是一个单独的、最朴素的监测量：
+        # 只对原始波形直接求和，不使用上面的平滑波形。
+        manual_area = asdict(
+            measure_manual_area(
+                analysis_signal,
+                left_index=int(manual_area_left),
+                right_index=int(manual_area_right),
+            )
+        )
 
     return {
         "analysis_channel_index": analysis_channel_index,
@@ -168,6 +184,7 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
         "measure_half": measure_half,
         "peak_mode": peak_mode,
         "measurements": [asdict(item) for item in measurements],
+        "manual_area": manual_area,
     }
 
 

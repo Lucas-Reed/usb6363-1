@@ -22,6 +22,22 @@ class PeakMeasurement:
     window_right: int
 
 
+@dataclass
+class ManualAreaMeasurement:
+    """手动面积测量结果。
+
+    这是最朴素的第一版面积算法：
+    用户手动给出左零点和右零点，程序只把这两个点之间的原始采样值相加。
+    这里暂时不做滤波、不扣本底、不自动找峰，目的是先观察面积本身的抖动。
+    """
+
+    left_index: int
+    right_index: int
+    point_count: int
+    value: float
+    mode: str = "raw_sum"
+
+
 def smooth_moving_average(signal: np.ndarray, window: int) -> np.ndarray:
     """移动平均平滑。
 
@@ -100,6 +116,42 @@ def measure_peak(
     )
 
 
+def measure_manual_area(
+    signal: np.ndarray,
+    left_index: int,
+    right_index: int,
+) -> ManualAreaMeasurement:
+    """按用户手动指定的左右零点，直接求原始面积。
+
+    注意：
+    - left_index/right_index 是样本点索引，不是时间。
+    - 返回的 value 是 sum(y[left:right+1])，单位近似是“V * 点数”。
+    - 这里故意不用 trapz，因为你现在想先看最简单的逐点相加是否稳定。
+    """
+
+    data = np.asarray(signal, dtype=float)
+    if data.size == 0:
+        raise ValueError("signal must not be empty")
+
+    left = int(round(left_index))
+    right = int(round(right_index))
+    if right < left:
+        left, right = right, left
+
+    left = max(0, min(left, data.size - 1))
+    right = max(0, min(right, data.size - 1))
+    if right <= left:
+        raise ValueError("manual area right index must be greater than left index")
+
+    window = data[left : right + 1]
+    return ManualAreaMeasurement(
+        left_index=left,
+        right_index=right,
+        point_count=int(window.size),
+        value=float(np.sum(window)),
+    )
+
+
 def locate_and_measure_two_peaks(
     ai0: np.ndarray,
     peak_indices: list[int],
@@ -133,4 +185,3 @@ def auto_identify_two_peaks_placeholder() -> None:
     """
 
     raise NotImplementedError("auto two-peak identification needs a reviewed algorithm")
-

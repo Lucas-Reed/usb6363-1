@@ -287,6 +287,8 @@
   <select id="pick_target">
     <option value="0">P1</option>
     <option value="1">P2</option>
+    <option value="area_left">面积左零点</option>
+    <option value="area_right">面积右零点</option>
   </select>
   <div class="grid2">
     <div>
@@ -296,6 +298,16 @@
     <div>
       <label>P2 索引</label>
       <input id="peak1" type="number" value="754" step="1">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>面积左零点</label>
+      <input id="manual_area_left" type="number" value="" step="1" placeholder="点击或手填">
+    </div>
+    <div>
+      <label>面积右零点</label>
+      <input id="manual_area_right" type="number" value="" step="1" placeholder="点击或手填">
     </div>
   </div>
 
@@ -338,6 +350,13 @@
       <tr><td>P2</td><td>--</td><td>--</td><td>--</td></tr>
     </tbody>
   </table>
+  <h2>手动面积</h2>
+  <table>
+    <tbody id="manualAreaRows">
+      <tr><td>面积</td><td>--</td></tr>
+      <tr><td>最近抖动</td><td>--</td></tr>
+    </tbody>
+  </table>
 </aside>
 
 <main>
@@ -358,6 +377,7 @@ let streamTimer = null;
 let streamLastFrameId = 0;
 let xViewStart = null;
 let xViewEnd = null;
+let manualAreaHistory = [];
 
 function getCaptureParams() {
   return {
@@ -385,6 +405,8 @@ function getMeasureParams() {
     search_window_half: Number(document.getElementById('search_window_half').value),
     measure_half: Number(document.getElementById('measure_half').value),
     peak_mode: document.getElementById('peak_mode').value,
+    manual_area_left: document.getElementById('manual_area_left').value,
+    manual_area_right: document.getElementById('manual_area_right').value,
   };
 }
 
@@ -430,6 +452,8 @@ function applyDefaultsToUi(defaults) {
   }
   setInputValue('peak0', defaults.peak0);
   setInputValue('peak1', defaults.peak1);
+  setInputValue('manual_area_left', defaults.manual_area_left);
+  setInputValue('manual_area_right', defaults.manual_area_right);
   setInputValue('analysis_channel_index', defaults.analysis_channel_index);
   setInputValue('smooth_window', defaults.smooth_window);
   setInputValue('search_window_half', defaults.search_window_half || defaults.window_half);
@@ -675,7 +699,9 @@ async function measurePeaks() {
   }
   try {
     latestMeasurement = await postJson('/api/measure', getMeasureParams());
+    updateManualAreaHistory();
     updatePeakTable();
+    updateManualAreaTable();
     renderPlots();
     setStatus('测峰完成。', 'ok');
   } catch (err) {
@@ -745,6 +771,7 @@ async function loadSavedSample() {
     renderPlots();
     updateFrameInfo();
     updatePeakTable();
+    updateManualAreaTable();
     setStatus('历史样本已加载。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
@@ -753,7 +780,9 @@ async function loadSavedSample() {
 
 function clearPeaks() {
   latestMeasurement = null;
+  manualAreaHistory = [];
   updatePeakTable();
+  updateManualAreaTable();
   renderPlots();
 }
 
@@ -904,6 +933,25 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
     ctx.fillText(i === 0 ? 'P1' : 'P2', x + 4 * devicePixelRatio, y0 + 16 * devicePixelRatio);
   });
 
+  const areaEdges = [
+    {id: 'manual_area_left', label: 'A-L'},
+    {id: 'manual_area_right', label: 'A-R'},
+  ];
+  areaEdges.forEach(edge => {
+    const idx = Number(document.getElementById(edge.id).value);
+    if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
+    const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
+    ctx.strokeStyle = '#7c3aed';
+    ctx.lineWidth = 1.2 * devicePixelRatio;
+    ctx.beginPath();
+    ctx.moveTo(x, y0);
+    ctx.lineTo(x, y0 + plotH);
+    ctx.stroke();
+    ctx.fillStyle = '#7c3aed';
+    ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
+    ctx.fillText(edge.label, x + 4 * devicePixelRatio, y0 + 32 * devicePixelRatio);
+  });
+
   if (latestMeasurement && latestMeasurement.measurements) {
     latestMeasurement.measurements.forEach((m, i) => {
       const idx = m.index;
@@ -924,8 +972,18 @@ function handlePlotClick(event, channelIndex) {
   const item = plotCanvases[channelIndex];
   const idx = eventToSampleIndex(event, item.canvas, item.data.length);
   const target = document.getElementById('pick_target').value;
-  document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
-  document.getElementById('pick_target').value = target === '0' ? '1' : '0';
+  if (target === 'area_left') {
+    document.getElementById('manual_area_left').value = idx;
+    document.getElementById('pick_target').value = 'area_right';
+    manualAreaHistory = [];
+  } else if (target === 'area_right') {
+    document.getElementById('manual_area_right').value = idx;
+    document.getElementById('pick_target').value = 'area_left';
+    manualAreaHistory = [];
+  } else {
+    document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
+    document.getElementById('pick_target').value = target === '0' ? '1' : '0';
+  }
   measurePeaks();
 }
 
@@ -960,6 +1018,39 @@ function updatePeakTable() {
   `).join('');
 }
 
+function updateManualAreaHistory() {
+  if (!latestMeasurement || !latestMeasurement.manual_area) return;
+  const value = Number(latestMeasurement.manual_area.value);
+  if (!Number.isFinite(value)) return;
+  manualAreaHistory.push(value);
+  if (manualAreaHistory.length > 200) {
+    manualAreaHistory = manualAreaHistory.slice(-200);
+  }
+}
+
+function updateManualAreaTable() {
+  const rows = document.getElementById('manualAreaRows');
+  const area = latestMeasurement ? latestMeasurement.manual_area : null;
+  if (!area) {
+    rows.innerHTML = '<tr><td>面积</td><td>--</td></tr><tr><td>最近抖动</td><td>--</td></tr>';
+    return;
+  }
+
+  const mean = manualAreaHistory.length
+    ? manualAreaHistory.reduce((sum, value) => sum + value, 0) / manualAreaHistory.length
+    : Number(area.value);
+  const variance = manualAreaHistory.length
+    ? manualAreaHistory.reduce((sum, value) => sum + (value - mean) ** 2, 0) / manualAreaHistory.length
+    : 0;
+  const std = Math.sqrt(variance);
+  rows.innerHTML = `
+    <tr><td>范围</td><td>${area.left_index}-${area.right_index}，${area.point_count} 点</td></tr>
+    <tr><td>面积</td><td>${Number(area.value).toExponential(6)}</td></tr>
+    <tr><td>最近均值</td><td>${mean.toExponential(6)}</td></tr>
+    <tr><td>最近标准差</td><td>${std.toExponential(6)} / ${manualAreaHistory.length} 帧</td></tr>
+  `;
+}
+
 function updateFrameInfo() {
   if (!latestFrame) return;
   const trig = latestFrame.trigger_enabled
@@ -979,9 +1070,17 @@ window.addEventListener('resize', resizeAndDraw);
 for (const id of ['rate', 'samples']) {
   document.getElementById(id).addEventListener('input', updateDerivedTimingFromInputs);
 }
+for (const id of ['manual_area_left', 'manual_area_right']) {
+  document.getElementById(id).addEventListener('input', () => {
+    manualAreaHistory = [];
+    updateManualAreaTable();
+    renderPlots();
+  });
+}
 updateDerivedTimingFromInputs();
 updateStreamStatus({running: false, frame_id: 0});
 updatePeakTable();
+updateManualAreaTable();
 loadDefaults();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
