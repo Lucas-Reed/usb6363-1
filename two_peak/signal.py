@@ -26,15 +26,21 @@ class PeakMeasurement:
 class ManualAreaMeasurement:
     """手动面积测量结果。
 
-    这是最朴素的第一版面积算法：
-    用户手动给出左零点和右零点，程序只把这两个点之间的原始采样值相加。
-    这里暂时不做滤波、不扣本底、不自动找峰，目的是先观察面积本身的抖动。
+    这个结构同时保留 raw 和 filtered 两个面积：
+    - value/raw_value：完全不滤波，直接对原始采样值求和，作为对照组。
+    - filtered_value：先做帧内滤波，再对同一段窗口求和。
+
+    这里仍然不扣本底、不自动找峰，目的是先比较滤波是否能压低面积抖动。
     """
 
     left_index: int
     right_index: int
     point_count: int
     value: float
+    raw_value: float
+    filtered_value: float
+    filter_mode: str
+    filter_window: int
     mode: str = "raw_sum"
 
 
@@ -51,6 +57,56 @@ def smooth_moving_average(signal: np.ndarray, window: int) -> np.ndarray:
 
     kernel = np.ones(window, dtype=float) / float(window)
     return np.convolve(data, kernel, mode="same")
+
+
+def smooth_median(signal: np.ndarray, window: int) -> np.ndarray:
+    """中值滤波。
+
+    中值滤波适合先试着去掉尖毛刺：窗口里偶尔出现的异常大点，
+    对中位数的影响通常比对平均值的影响小。
+    """
+
+    data = np.asarray(signal, dtype=float)
+    window = int(window)
+    if window < 3 or data.size < window:
+        return data.copy()
+    if window % 2 == 0:
+        window += 1
+
+    half = window // 2
+    padded = np.pad(data, pad_width=half, mode="edge")
+    output = np.empty_like(data, dtype=float)
+    for index in range(data.size):
+        output[index] = float(np.median(padded[index : index + window]))
+    return output
+
+
+def filter_signal_for_manual_area(
+    signal: np.ndarray,
+    filter_mode: str,
+    filter_window: int,
+) -> tuple[np.ndarray, str, int]:
+    """给手动面积实验使用的帧内滤波。
+
+    filter_mode:
+    - none：不滤波，filtered_area 会等于 raw_area。
+    - moving_average：移动平均，适合压随机噪声。
+    - median：中值滤波，适合压尖毛刺。
+    """
+
+    data = np.asarray(signal, dtype=float)
+    mode = filter_mode.strip().lower()
+    window = max(1, int(filter_window))
+    if window % 2 == 0:
+        window += 1
+
+    if mode in ("", "none"):
+        return data.copy(), "none", 1
+    if mode == "moving_average":
+        return smooth_moving_average(data, window), mode, window
+    if mode == "median":
+        return smooth_median(data, window), mode, window
+    raise ValueError("manual area filter_mode must be none, moving_average, or median")
 
 
 def find_peak_near(signal: np.ndarray, center_index: int, window_half: int) -> int:
@@ -120,6 +176,8 @@ def measure_manual_area(
     signal: np.ndarray,
     left_index: int,
     right_index: int,
+    filter_mode: str = "none",
+    filter_window: int = 1,
 ) -> ManualAreaMeasurement:
     """按用户手动指定的左右零点，直接求原始面积。
 
@@ -143,12 +201,24 @@ def measure_manual_area(
     if right <= left:
         raise ValueError("manual area right index must be greater than left index")
 
-    window = data[left : right + 1]
+    raw_window = data[left : right + 1]
+    filtered_data, normalized_filter_mode, normalized_filter_window = filter_signal_for_manual_area(
+        data,
+        filter_mode=filter_mode,
+        filter_window=filter_window,
+    )
+    filtered_window = filtered_data[left : right + 1]
+    raw_value = float(np.sum(raw_window))
+    filtered_value = float(np.sum(filtered_window))
     return ManualAreaMeasurement(
         left_index=left,
         right_index=right,
-        point_count=int(window.size),
-        value=float(np.sum(window)),
+        point_count=int(raw_window.size),
+        value=raw_value,
+        raw_value=raw_value,
+        filtered_value=filtered_value,
+        filter_mode=normalized_filter_mode,
+        filter_window=normalized_filter_window,
     )
 
 
