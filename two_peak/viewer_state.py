@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from two_peak.config import TwoPeakSettings
+from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
 
 
@@ -27,6 +28,12 @@ class ViewerState:
         self.user_defaults = self._load_user_defaults()
         self.latest_frame: dict[str, Any] | None = None
         self.latest_measurement: dict[str, Any] | None = None
+        # 慢漂记录器会在后端线程里读取底层 frame_stream 最新帧并写 CSV。
+        # 它不依赖浏览器是否一直打开。
+        self.trend_logger = AreaTrendLogger(
+            daq=self.daq,
+            output_dir=sample_dir.parent / "two_peak_trends",
+        )
 
     def factory_web_defaults(self) -> dict[str, Any]:
         """返回 WebUI 可以直接使用的出厂默认值。

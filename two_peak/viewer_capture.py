@@ -126,6 +126,40 @@ def get_frame_stream_latest(state: ViewerState) -> dict[str, Any]:
     return frame
 
 
+def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
+    """启动手动面积慢漂记录。
+
+    这个函数不直接采集波形，而是读取已经启动的后端连续采集流。
+    这样可以避免为了“记录趋势”再开一个新的 DAQ 任务，减少和采集卡抢资源的风险。
+    """
+
+    area_left = body.get("area_left")
+    area_right = body.get("area_right")
+    if area_left in (None, "") or area_right in (None, ""):
+        raise ValueError("area_left and area_right are required")
+
+    return state.trend_logger.start(
+        analysis_channel_index=int(body.get("analysis_channel_index", 0)),
+        area_left=int(area_left),
+        area_right=int(area_right),
+        window_frames=int(body.get("window_frames", 200)),
+        record_hz=float(body.get("record_hz", 1.0)),
+        poll_interval=float(body.get("poll_interval", 0.05)),
+    )
+
+
+def stop_area_trend(state: ViewerState) -> dict[str, Any]:
+    """停止手动面积慢漂记录。"""
+
+    return state.trend_logger.stop()
+
+
+def get_area_trend_status(state: ViewerState) -> dict[str, Any]:
+    """查询手动面积慢漂记录状态。"""
+
+    return state.trend_logger.status()
+
+
 def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """测量最近一帧里的 P1/P2。
 

@@ -359,6 +359,36 @@
       <tr><td>最近抖动</td><td>--</td></tr>
     </tbody>
   </table>
+
+  <h2>慢漂记录</h2>
+  <div class="grid2">
+    <div>
+      <label>统计窗口 / 帧</label>
+      <input id="trend_window_frames" type="number" value="200" min="2" step="1">
+    </div>
+    <div>
+      <label>记录频率 / Hz</label>
+      <input id="trend_record_hz" type="number" value="1" min="0.01" step="0.5">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>记录状态</label>
+      <input id="trend_status" value="停止" readonly>
+    </div>
+    <div>
+      <label>已写行数</label>
+      <input id="trend_records" value="0" readonly>
+    </div>
+  </div>
+  <label>CSV 文件</label>
+  <input id="trend_file" value="" readonly>
+  <label>最新统计</label>
+  <input id="trend_latest" value="--" readonly>
+  <div class="actions">
+    <button class="green" id="trendStartBtn" onclick="startAreaTrend()">开始慢漂记录</button>
+    <button class="secondary" id="trendStopBtn" onclick="stopAreaTrend()" disabled>停止慢漂记录</button>
+  </div>
 </aside>
 
 <main>
@@ -377,6 +407,7 @@ let plotCanvases = [];
 let streamRunning = false;
 let streamTimer = null;
 let streamLastFrameId = 0;
+let trendTimer = null;
 let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
@@ -420,11 +451,22 @@ function getViewParams() {
   };
 }
 
+function getTrendParams() {
+  return {
+    analysis_channel_index: Number(document.getElementById('analysis_channel_index').value),
+    area_left: document.getElementById('manual_area_left').value,
+    area_right: document.getElementById('manual_area_right').value,
+    window_frames: Number(document.getElementById('trend_window_frames').value),
+    record_hz: Number(document.getElementById('trend_record_hz').value),
+  };
+}
+
 function getAllUiParameters() {
   return {
     ...getCaptureParams(),
     ...getMeasureParams(),
     ...getViewParams(),
+    ...getTrendParams(),
   };
 }
 
@@ -465,6 +507,8 @@ function applyDefaultsToUi(defaults) {
   setInputValue('peak_mode', defaults.peak_mode);
   setInputValue('x_start', defaults.x_start);
   setInputValue('x_end', defaults.x_end);
+  setInputValue('trend_window_frames', defaults.window_frames || defaults.trend_window_frames);
+  setInputValue('trend_record_hz', defaults.record_hz || defaults.trend_record_hz);
   updateDerivedTimingFromInputs();
   applyXView(false);
 }
@@ -659,6 +703,88 @@ async function syncBackendStreamStatus(showStatus = false) {
     if (showStatus) {
       setStatus(String(err.message || err), 'error');
     }
+  }
+}
+
+function updateTrendStatus(status) {
+  const running = Boolean(status && status.running);
+  const latest = status && status.latest_stats ? status.latest_stats : {};
+  const error = status && status.error ? `错误：${status.error}` : '';
+  document.getElementById('trend_status').value = error || (running ? '记录中' : '停止');
+  document.getElementById('trend_records').value = status && status.records_written !== undefined
+    ? status.records_written
+    : 0;
+  document.getElementById('trend_file').value = status && status.csv_file ? status.csv_file : '';
+
+  if (latest.area_mean !== undefined) {
+    const rel = latest.area_rel_std_percent === null || latest.area_rel_std_percent === undefined
+      ? '--'
+      : `${formatNumber(latest.area_rel_std_percent, 3)}%`;
+    const shot = latest.shot2shot_rel_std_percent === null || latest.shot2shot_rel_std_percent === undefined
+      ? '--'
+      : `${formatNumber(latest.shot2shot_rel_std_percent, 3)}%`;
+    document.getElementById('trend_latest').value =
+      `mean=${Number(latest.area_mean).toExponential(6)}  std=${rel}  shot=${shot}`;
+  } else {
+    document.getElementById('trend_latest').value = '--';
+  }
+
+  document.getElementById('trendStartBtn').disabled = running;
+  document.getElementById('trendStopBtn').disabled = !running;
+  if (running && trendTimer === null) {
+    trendTimer = setInterval(() => refreshTrendStatus(false), 1000);
+  }
+  if (!running && trendTimer !== null) {
+    clearInterval(trendTimer);
+    trendTimer = null;
+  }
+}
+
+async function refreshTrendStatus(showStatus = false) {
+  try {
+    const response = await fetch('/api/trend/status');
+    const status = await response.json();
+    if (!response.ok || status.ok === false) {
+      throw new Error(status.error || '查询慢漂记录状态失败');
+    }
+    updateTrendStatus(status);
+    if (showStatus && status.running) {
+      setStatus('检测到慢漂记录正在运行，已接管状态。', 'ok');
+    }
+  } catch (err) {
+    if (showStatus) {
+      setStatus(String(err.message || err), 'error');
+    }
+  }
+}
+
+async function startAreaTrend() {
+  const params = getTrendParams();
+  if (params.area_left === '' || params.area_right === '') {
+    setStatus('请先设置手动面积的左右零点。', 'error');
+    return;
+  }
+  if (!streamRunning) {
+    setStatus('请先启动后端连续采集，再开始慢漂记录。', 'error');
+    return;
+  }
+  try {
+    const status = await postJson('/api/trend/start', params);
+    updateTrendStatus(status);
+    setStatus('慢漂记录已启动，正在写入 CSV。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshTrendStatus(false);
+  }
+}
+
+async function stopAreaTrend() {
+  try {
+    const status = await postJson('/api/trend/stop', {});
+    updateTrendStatus(status);
+    setStatus('慢漂记录已停止。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
   }
 }
 
@@ -1091,6 +1217,7 @@ updateManualAreaTable();
 loadDefaults();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
+refreshTrendStatus(true);
 </script>
 </body>
 </html>

@@ -11,13 +11,16 @@ from typing import Any
 from two_peak.viewer_capture import (
     capture_frame,
     frame_summary,
+    get_area_trend_status,
     get_frame_stream_latest,
     get_frame_stream_status,
     list_saved_frames,
     load_saved_frame,
     measure_latest_frame,
     save_latest_frame,
+    start_area_trend,
     start_frame_stream,
+    stop_area_trend,
     stop_frame_stream,
 )
 from two_peak.viewer_state import ViewerState
@@ -58,6 +61,8 @@ def make_handler(state: ViewerState):
                     self._send_json(get_frame_stream_status(state))
                 elif self.path == "/api/stream/latest":
                     self._send_json(get_frame_stream_latest(state))
+                elif self.path == "/api/trend/status":
+                    self._send_json(get_area_trend_status(state))
                 elif self.path == "/api/samples":
                     self._send_json(list_saved_frames(state))
                 else:
@@ -80,6 +85,11 @@ def make_handler(state: ViewerState):
                     self._send_json(start_frame_stream(state, body))
                 elif self.path == "/api/stream/stop":
                     self._send_json(stop_frame_stream(state))
+                elif self.path == "/api/trend/start":
+                    body = self._read_json()
+                    self._send_json(start_area_trend(state, body))
+                elif self.path == "/api/trend/stop":
+                    self._send_json(stop_area_trend(state))
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)
