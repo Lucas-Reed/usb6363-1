@@ -13,6 +13,8 @@ from two_peak.viewer_capture import (
     frame_summary,
     get_frame_stream_latest,
     get_frame_stream_status,
+    list_saved_frames,
+    load_saved_frame,
     measure_latest_frame,
     save_latest_frame,
     start_frame_stream,
@@ -43,7 +45,7 @@ def make_handler(state: ViewerState):
                 if self.path == "/" or self.path.startswith("/?"):
                     self._send_html(load_viewer_html())
                 elif self.path == "/api/defaults":
-                    self._send_json(state.settings.to_web_parameters())
+                    self._send_json(state.active_web_defaults())
                 elif self.path == "/api/latest":
                     self._send_json(
                         {
@@ -56,6 +58,8 @@ def make_handler(state: ViewerState):
                     self._send_json(get_frame_stream_status(state))
                 elif self.path == "/api/stream/latest":
                     self._send_json(get_frame_stream_latest(state))
+                elif self.path == "/api/samples":
+                    self._send_json(list_saved_frames(state))
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:
@@ -85,6 +89,17 @@ def make_handler(state: ViewerState):
                     body = self._read_json()
                     saved = save_latest_frame(state, body)
                     self._send_json(saved)
+                elif self.path == "/api/load":
+                    body = self._read_json()
+                    loaded = load_saved_frame(state, body)
+                    self._send_json(loaded)
+                elif self.path == "/api/defaults/save":
+                    body = self._read_json()
+                    defaults = state.save_user_defaults(body.get("parameters", body))
+                    self._send_json(defaults)
+                elif self.path == "/api/defaults/reset":
+                    defaults = state.reset_user_defaults()
+                    self._send_json(defaults)
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:

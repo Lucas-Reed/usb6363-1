@@ -6,6 +6,7 @@ import json
 import time
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -200,6 +201,7 @@ def save_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any
         "measurement": state.latest_measurement,
         "web_parameters": body.get("parameters", {}),
         "factory_defaults": state.settings.to_web_parameters(),
+        "active_defaults": state.active_web_defaults(),
         "format": "numpy .npy, shape=(channel_count, samples_per_channel)",
     }
     json_path.write_text(
@@ -208,6 +210,70 @@ def save_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any
     )
 
     return metadata
+
+
+def list_saved_frames(state: ViewerState, limit: int = 50) -> dict[str, Any]:
+    """列出最近保存的样本元数据文件。
+
+    这里只读取 .json 元数据，不会把巨大的 .npy 波形数组都加载进内存。
+    """
+
+    sample_dir = state.sample_dir
+    if not sample_dir.exists():
+        return {"samples": []}
+
+    rows: list[dict[str, Any]] = []
+    for json_path in sorted(sample_dir.glob("*.json"), reverse=True)[:limit]:
+        try:
+            metadata = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rows.append(
+            {
+                "metadata_file": str(json_path.resolve()),
+                "npy_file": metadata.get("npy_file"),
+                "saved_at": metadata.get("saved_at"),
+                "shape": metadata.get("shape"),
+                "frame": metadata.get("frame"),
+                "measurement": metadata.get("measurement"),
+            }
+        )
+    return {"samples": rows}
+
+
+def load_saved_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
+    """从保存过的 .json/.npy 文件中加载一帧波形。
+
+    加载后，WebUI 可以像刚采集完一样继续缩放、选峰、测峰。
+    """
+
+    metadata_file = body.get("metadata_file")
+    if not metadata_file:
+        raise ValueError("metadata_file is required")
+
+    sample_dir = state.sample_dir.resolve()
+    json_path = _resolve_sample_file(sample_dir, Path(str(metadata_file)), ".json")
+    metadata = json.loads(json_path.read_text(encoding="utf-8"))
+
+    npy_value = metadata.get("npy_file") or json_path.with_suffix(".npy")
+    npy_path = _resolve_sample_file(sample_dir, Path(str(npy_value)), ".npy")
+    values = np.load(npy_path)
+
+    frame = dict(metadata.get("frame") or {})
+    frame["values"] = values.tolist()
+    frame.setdefault("channel_count", int(values.shape[0]) if values.ndim >= 1 else 1)
+    frame.setdefault("samples_per_channel", int(values.shape[-1]) if values.ndim >= 1 else 0)
+    frame["captured_by"] = "saved_sample"
+    frame["loaded_from"] = str(json_path)
+    frame["viewer_received_at"] = time.time()
+
+    state.latest_frame = frame
+    state.latest_measurement = metadata.get("measurement")
+    return {
+        "frame": frame,
+        "measurement": state.latest_measurement,
+        "metadata": metadata,
+    }
 
 
 def frame_summary(frame: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -231,4 +297,24 @@ def frame_summary(frame: dict[str, Any] | None) -> dict[str, Any] | None:
         "trigger_enabled": frame.get("trigger_enabled"),
         "trigger_source": frame.get("trigger_source"),
         "trigger_edge": frame.get("trigger_edge"),
+        "trigger_mode": frame.get("trigger_mode"),
+        "frame_duration_seconds": frame.get("frame_duration_seconds"),
+        "frame_duration_ms": frame.get("frame_duration_ms"),
+        "frame_rate_hz": frame.get("frame_rate_hz"),
     }
+
+
+def _resolve_sample_file(sample_dir: Path, path: Path, suffix: str) -> Path:
+    """把样本文件路径限制在 sample_dir 内，避免误读其他文件。"""
+
+    candidate = path if path.is_absolute() else sample_dir / path
+    resolved = candidate.resolve()
+    if resolved.suffix.lower() != suffix:
+        raise ValueError(f"sample file must end with {suffix}")
+    try:
+        resolved.relative_to(sample_dir)
+    except ValueError as exc:
+        raise ValueError("sample file must be inside the sample directory") from exc
+    if not resolved.exists():
+        raise FileNotFoundError(str(resolved))
+    return resolved

@@ -168,6 +168,12 @@
 <aside>
   <h1>双峰波形查看器</h1>
 
+  <h2>默认值</h2>
+  <div class="actions">
+    <button class="secondary" onclick="saveDefaults()">保存为默认值</button>
+    <button class="secondary" onclick="resetDefaults()">恢复出厂默认</button>
+  </div>
+
   <h2>采集</h2>
   <label>AI 通道，逗号分隔</label>
   <input id="channels" value="ai0, ai1">
@@ -227,6 +233,13 @@
     <button class="green" id="saveBtn" onclick="saveFrame()" disabled>保存样本</button>
   </div>
 
+  <h2>历史样本</h2>
+  <select id="saved_samples"></select>
+  <div class="actions">
+    <button class="secondary" onclick="refreshSavedSamples()">刷新列表</button>
+    <button class="secondary" onclick="loadSavedSample()">加载样本</button>
+  </div>
+
   <h2>连续采集</h2>
   <div class="grid2">
     <div>
@@ -251,6 +264,22 @@
   <div class="actions">
     <button class="green" id="streamStartBtn" onclick="startBackendStream()">开始连续采集</button>
     <button class="secondary" id="streamStopBtn" onclick="stopBackendStream()" disabled>停止连续采集</button>
+  </div>
+
+  <h2>视图</h2>
+  <div class="grid2">
+    <div>
+      <label>X 起点索引</label>
+      <input id="x_start" type="number" value="" placeholder="自动">
+    </div>
+    <div>
+      <label>X 终点索引</label>
+      <input id="x_end" type="number" value="" placeholder="自动">
+    </div>
+  </div>
+  <div class="actions">
+    <button class="secondary" onclick="applyXView()">应用范围</button>
+    <button class="secondary" onclick="resetXView()">显示全帧</button>
   </div>
 
   <h2>手动选峰</h2>
@@ -327,6 +356,8 @@ let plotCanvases = [];
 let streamRunning = false;
 let streamTimer = null;
 let streamLastFrameId = 0;
+let xViewStart = null;
+let xViewEnd = null;
 
 function getCaptureParams() {
   return {
@@ -357,6 +388,59 @@ function getMeasureParams() {
   };
 }
 
+function getViewParams() {
+  return {
+    x_start: document.getElementById('x_start').value,
+    x_end: document.getElementById('x_end').value,
+  };
+}
+
+function getAllUiParameters() {
+  return {
+    ...getCaptureParams(),
+    ...getMeasureParams(),
+    ...getViewParams(),
+  };
+}
+
+function setInputValue(id, value) {
+  const element = document.getElementById(id);
+  if (!element || value === undefined || value === null) return;
+  if (element.type === 'checkbox') {
+    element.checked = Boolean(value);
+  } else {
+    element.value = Array.isArray(value) ? value.join(', ') : value;
+  }
+}
+
+function applyDefaultsToUi(defaults) {
+  setInputValue('channels', defaults.channels || defaults.ai_channels);
+  setInputValue('rate', defaults.rate || defaults.sample_rate);
+  setInputValue('samples', defaults.samples || defaults.samples_per_frame);
+  setInputValue('terminal_config', defaults.terminal_config);
+  setInputValue('timeout', defaults.timeout);
+  setInputValue('min_val', defaults.min_val || defaults.ai_min_val);
+  setInputValue('max_val', defaults.max_val || defaults.ai_max_val);
+  setInputValue('trigger_enabled', defaults.trigger_enabled);
+  setInputValue('trigger_source', defaults.trigger_source);
+  setInputValue('trigger_edge', defaults.trigger_edge);
+  if (defaults.peak_indices) {
+    setInputValue('peak0', defaults.peak_indices[0]);
+    setInputValue('peak1', defaults.peak_indices[1]);
+  }
+  setInputValue('peak0', defaults.peak0);
+  setInputValue('peak1', defaults.peak1);
+  setInputValue('analysis_channel_index', defaults.analysis_channel_index);
+  setInputValue('smooth_window', defaults.smooth_window);
+  setInputValue('search_window_half', defaults.search_window_half || defaults.window_half);
+  setInputValue('measure_half', defaults.measure_half || defaults.peak_avg_half);
+  setInputValue('peak_mode', defaults.peak_mode);
+  setInputValue('x_start', defaults.x_start);
+  setInputValue('x_end', defaults.x_end);
+  updateDerivedTimingFromInputs();
+  applyXView(false);
+}
+
 function setStatus(text, kind) {
   const el = document.getElementById('status');
   el.textContent = text;
@@ -374,6 +458,43 @@ async function postJson(path, body) {
     throw new Error(data.error || '请求失败');
   }
   return data;
+}
+
+async function loadDefaults() {
+  try {
+    const response = await fetch('/api/defaults');
+    const defaults = await response.json();
+    if (!response.ok || defaults.ok === false) {
+      throw new Error(defaults.error || '读取默认值失败');
+    }
+    applyDefaultsToUi(defaults);
+    const source = defaults.defaults_source === 'user' ? '用户默认值' : '出厂默认值';
+    setStatus(`已加载${source}。`, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function saveDefaults() {
+  try {
+    const defaults = await postJson('/api/defaults/save', {
+      parameters: getAllUiParameters(),
+    });
+    applyDefaultsToUi(defaults);
+    setStatus('当前参数已保存为默认值。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function resetDefaults() {
+  try {
+    const defaults = await postJson('/api/defaults/reset', {});
+    applyDefaultsToUi(defaults);
+    setStatus('已恢复出厂默认值。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
 }
 
 function formatNumber(value, digits = 3) {
@@ -534,9 +655,62 @@ async function saveFrame() {
   }
   try {
     const saved = await postJson('/api/save', {
-      parameters: {...getCaptureParams(), ...getMeasureParams()},
+      parameters: getAllUiParameters(),
     });
     setStatus('样本已保存：' + saved.npy_file, 'ok');
+    await refreshSavedSamples();
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function refreshSavedSamples() {
+  try {
+    const response = await fetch('/api/samples');
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error || '读取样本列表失败');
+    }
+    const select = document.getElementById('saved_samples');
+    select.innerHTML = '';
+    for (const item of data.samples || []) {
+      const option = document.createElement('option');
+      option.value = item.metadata_file;
+      const frame = item.frame || {};
+      const dateText = item.saved_at ? new Date(item.saved_at * 1000).toLocaleString() : item.metadata_file;
+      option.textContent = `${dateText}  ${frame.channels || ''}  ${frame.samples_per_channel || ''}点`;
+      select.appendChild(option);
+    }
+    if (!select.options.length) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = '暂无已保存样本';
+      select.appendChild(option);
+    }
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function loadSavedSample() {
+  const metadataFile = document.getElementById('saved_samples').value;
+  if (!metadataFile) {
+    setStatus('没有可加载的样本。', 'error');
+    return;
+  }
+  if (streamRunning) {
+    await stopBackendStream();
+  }
+  try {
+    const loaded = await postJson('/api/load', {metadata_file: metadataFile});
+    latestFrame = loaded.frame;
+    latestMeasurement = loaded.measurement;
+    document.getElementById('saveBtn').disabled = false;
+    resetXView(false);
+    renderPlots();
+    updateFrameInfo();
+    updatePeakTable();
+    setStatus('历史样本已加载。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }
@@ -546,6 +720,41 @@ function clearPeaks() {
   latestMeasurement = null;
   updatePeakTable();
   renderPlots();
+}
+
+function getVisibleRange(length) {
+  if (!length || length < 2) return {start: 0, end: 0};
+  let start = Number.isFinite(xViewStart) ? Math.round(xViewStart) : 0;
+  let end = Number.isFinite(xViewEnd) ? Math.round(xViewEnd) : length - 1;
+  start = Math.min(Math.max(start, 0), length - 1);
+  end = Math.min(Math.max(end, 0), length - 1);
+  if (end <= start) {
+    start = 0;
+    end = length - 1;
+  }
+  return {start, end};
+}
+
+function applyXView(showStatus = true) {
+  const startText = document.getElementById('x_start').value.trim();
+  const endText = document.getElementById('x_end').value.trim();
+  xViewStart = startText === '' ? null : Number(startText);
+  xViewEnd = endText === '' ? null : Number(endText);
+  renderPlots();
+  if (showStatus) {
+    setStatus('已应用横向视图范围。', 'ok');
+  }
+}
+
+function resetXView(showStatus = true) {
+  xViewStart = null;
+  xViewEnd = null;
+  document.getElementById('x_start').value = '';
+  document.getElementById('x_end').value = '';
+  renderPlots();
+  if (showStatus) {
+    setStatus('已显示全帧。', 'ok');
+  }
 }
 
 function renderPlots() {
@@ -597,9 +806,11 @@ function drawWaveform(canvas, data, channelIndex) {
   ctx.fillRect(0, 0, w, h);
 
   if (!data || data.length < 2) return;
-  let min = data[0];
-  let max = data[0];
-  for (const value of data) {
+  const range = getVisibleRange(data.length);
+  let min = data[range.start];
+  let max = data[range.start];
+  for (let i = range.start; i <= range.end; i += 1) {
+    const value = data[i];
     if (value < min) min = value;
     if (value > max) max = value;
   }
@@ -616,25 +827,27 @@ function drawWaveform(canvas, data, channelIndex) {
   ctx.strokeRect(x0, y0, plotW, plotH);
 
   ctx.beginPath();
-  data.forEach((value, i) => {
-    const x = x0 + (i / (data.length - 1)) * plotW;
+  for (let i = range.start; i <= range.end; i += 1) {
+    const value = data[i];
+    const x = x0 + ((i - range.start) / Math.max(1, range.end - range.start)) * plotW;
     const y = y0 + (1 - (value - min) / span) * plotH;
-    if (i === 0) ctx.moveTo(x, y);
+    if (i === range.start) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
-  });
+  }
   ctx.strokeStyle = channelIndex === 0 ? '#1f6feb' : '#16833a';
   ctx.lineWidth = 1.4 * devicePixelRatio;
   ctx.stroke();
 
-  drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span);
+  drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, range);
 
   ctx.fillStyle = '#697586';
   ctx.font = `${11 * devicePixelRatio}px Consolas`;
   ctx.fillText(`min ${min.toFixed(5)} V`, x0, h - 8 * devicePixelRatio);
   ctx.fillText(`max ${max.toFixed(5)} V`, x0 + 150 * devicePixelRatio, h - 8 * devicePixelRatio);
+  ctx.fillText(`x ${range.start}-${range.end}`, x0 + 300 * devicePixelRatio, h - 8 * devicePixelRatio);
 }
 
-function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span) {
+function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, range) {
   const analysisIndex = Number(document.getElementById('analysis_channel_index').value);
   if (channelIndex !== analysisIndex) return;
 
@@ -643,8 +856,8 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span) {
     Number(document.getElementById('peak1').value),
   ];
   peaks.forEach((idx, i) => {
-    if (!Number.isFinite(idx) || idx < 0 || idx >= data.length) return;
-    const x = x0 + (idx / (data.length - 1)) * plotW;
+    if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
+    const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
     ctx.strokeStyle = i === 0 ? '#c62828' : '#9a6700';
     ctx.lineWidth = 1.3 * devicePixelRatio;
     ctx.beginPath();
@@ -659,8 +872,8 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span) {
   if (latestMeasurement && latestMeasurement.measurements) {
     latestMeasurement.measurements.forEach((m, i) => {
       const idx = m.index;
-      if (idx < 0 || idx >= data.length) return;
-      const x = x0 + (idx / (data.length - 1)) * plotW;
+      if (idx < range.start || idx > range.end) return;
+      const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
       const y = y0 + (1 - (data[idx] - min) / span) * plotH;
       ctx.fillStyle = i === 0 ? '#c62828' : '#9a6700';
       ctx.beginPath();
@@ -692,7 +905,8 @@ function updateCursor(event, channelIndex) {
 function eventToSampleIndex(event, canvas, length) {
   const rect = canvas.getBoundingClientRect();
   const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
-  return Math.round((x / Math.max(1, rect.width)) * (length - 1));
+  const range = getVisibleRange(length);
+  return Math.round(range.start + (x / Math.max(1, rect.width)) * (range.end - range.start));
 }
 
 function updatePeakTable() {
@@ -733,6 +947,8 @@ for (const id of ['rate', 'samples']) {
 updateDerivedTimingFromInputs();
 updateStreamStatus({running: false, frame_id: 0});
 updatePeakTable();
+loadDefaults();
+refreshSavedSamples();
 </script>
 </body>
 </html>

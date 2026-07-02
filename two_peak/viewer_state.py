@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -20,5 +21,83 @@ class ViewerState:
         self.daq = Usb6363Client(base_url=api_base_url)
         self.sample_dir = sample_dir
         self.settings = TwoPeakSettings.defaults()
+        # 用户在 WebUI 里点击“保存为默认值”后，会写到这个 JSON 文件。
+        # 它放在 data/ 下面，属于实验运行时配置，不进入 git。
+        self.defaults_path = sample_dir.parent / "two_peak_defaults.json"
+        self.user_defaults = self._load_user_defaults()
         self.latest_frame: dict[str, Any] | None = None
         self.latest_measurement: dict[str, Any] | None = None
+
+    def factory_web_defaults(self) -> dict[str, Any]:
+        """返回 WebUI 可以直接使用的出厂默认值。
+
+        TwoPeakSettings 里保留的是比较结构化的实验参数；
+        WebUI 的 input id 更扁平，所以这里额外给出一份方便前端填表的字段。
+        """
+
+        parameters = self.settings.to_web_parameters()
+        peak_indices = parameters["peak_indices"]
+        parameters.update(
+            {
+                "channels": ", ".join(parameters["ai_channels"]),
+                "rate": parameters["sample_rate"],
+                "samples": parameters["samples_per_frame"],
+                "min_val": parameters["ai_min_val"],
+                "max_val": parameters["ai_max_val"],
+                "timeout": self.settings.daq.timeout,
+                "trigger_enabled": False,
+                "trigger_source": "PFI0",
+                "trigger_edge": "RISING",
+                "peak0": peak_indices[0],
+                "peak1": peak_indices[1],
+                "analysis_channel_index": 0,
+                "search_window_half": parameters["window_half"],
+                "measure_half": parameters["peak_avg_half"],
+            }
+        )
+        return parameters
+
+    def active_web_defaults(self) -> dict[str, Any]:
+        """返回当前启动时实际使用的默认值。
+
+        如果用户保存过默认值，就在出厂默认值上覆盖用户默认值；
+        这样以后新增字段时，旧的 JSON 文件也不会缺字段。
+        """
+
+        parameters = self.factory_web_defaults()
+        parameters.update(self.user_defaults)
+        parameters["defaults_source"] = "user" if self.user_defaults else "factory"
+        parameters["defaults_file"] = str(self.defaults_path.resolve())
+        return parameters
+
+    def save_user_defaults(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """把当前 WebUI 参数保存为下次启动时的默认值。"""
+
+        self.defaults_path.parent.mkdir(parents=True, exist_ok=True)
+        self.user_defaults = dict(parameters)
+        self.defaults_path.write_text(
+            json.dumps(self.user_defaults, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return self.active_web_defaults()
+
+    def reset_user_defaults(self) -> dict[str, Any]:
+        """删除用户默认值，恢复到代码里的出厂默认值。"""
+
+        self.user_defaults = {}
+        if self.defaults_path.exists():
+            self.defaults_path.unlink()
+        return self.active_web_defaults()
+
+    def _load_user_defaults(self) -> dict[str, Any]:
+        """启动查看器时读取用户默认值文件。"""
+
+        if not self.defaults_path.exists():
+            return {}
+        try:
+            data = json.loads(self.defaults_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return data
