@@ -23,6 +23,23 @@ python usb6363_server.py
 http://127.0.0.1:8765
 ```
 
+## 3. 启动双峰波形查看器
+
+再打开一个新的 PowerShell 窗口运行：
+
+```powershell
+python two_peak_viewer.py
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8766
+```
+
+这个查看器只通过 `usb6363_client.py` 调用底层 API，不直接访问 NI-DAQmx。
+当前它只用于采集一帧波形、手动选 P1/P2、测峰和保存样本；还不做闭环 AO 输出。
+
 ## 代码结构
 
 ```text
@@ -43,9 +60,12 @@ two_peak/
 
 legacy/
     旧版双峰锁定程序参考快照。只作为需求和算法参考，不建议继续直接修改。
+
+two_peak_viewer.py
+    最小双峰波形查看器。用于看真实 AI 波形、手动选峰、保存样本。
 ```
 
-## 3. 其他 Python 程序这样调用
+## 4. 其他 Python 程序这样调用
 
 ```python
 from usb6363_client import Usb6363Client
