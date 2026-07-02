@@ -149,11 +149,6 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
     peak_mode = str(body.get("peak_mode", "height"))
     manual_area_left = body.get("manual_area_left")
     manual_area_right = body.get("manual_area_right")
-    manual_area_filter_mode = str(body.get("manual_area_filter_mode", "none"))
-    manual_area_filter_window = int(body.get("manual_area_filter_window", 1))
-    manual_baseline_left = body.get("manual_baseline_left")
-    manual_baseline_right = body.get("manual_baseline_right")
-    manual_baseline_mode = str(body.get("manual_baseline_mode", "none"))
     analysis_channel_index = int(body.get("analysis_channel_index", 0))
     if analysis_channel_index < 0 or analysis_channel_index >= values.shape[0]:
         raise ValueError("analysis_channel_index is out of range")
@@ -177,11 +172,6 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
                 analysis_signal,
                 left_index=int(manual_area_left),
                 right_index=int(manual_area_right),
-                filter_mode=manual_area_filter_mode,
-                filter_window=manual_area_filter_window,
-                baseline_mode=manual_baseline_mode,
-                baseline_left_index=None if manual_baseline_left in (None, "") else int(manual_baseline_left),
-                baseline_right_index=None if manual_baseline_right in (None, "") else int(manual_baseline_right),
             )
         )
 

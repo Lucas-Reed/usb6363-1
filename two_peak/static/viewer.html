@@ -289,8 +289,6 @@
     <option value="1">P2</option>
     <option value="area_left">面积左零点</option>
     <option value="area_right">面积右零点</option>
-    <option value="baseline_left">本底左零点</option>
-    <option value="baseline_right">本底右零点</option>
   </select>
   <div class="grid2">
     <div>
@@ -312,38 +310,6 @@
       <input id="manual_area_right" type="number" value="" step="1" placeholder="点击或手填">
     </div>
   </div>
-  <div class="grid2">
-    <div>
-      <label>面积帧内滤波</label>
-      <select id="manual_area_filter_mode">
-        <option value="none">none</option>
-        <option value="moving_average">moving_average</option>
-        <option value="median">median</option>
-      </select>
-    </div>
-    <div>
-      <label>滤波窗口</label>
-      <input id="manual_area_filter_window" type="number" value="5" step="2">
-    </div>
-  </div>
-  <div class="grid2">
-    <div>
-      <label>本底左零点</label>
-      <input id="manual_baseline_left" type="number" value="" step="1" placeholder="点击或手填">
-    </div>
-    <div>
-      <label>本底右零点</label>
-      <input id="manual_baseline_right" type="number" value="" step="1" placeholder="点击或手填">
-    </div>
-  </div>
-  <label>本底模式</label>
-  <select id="manual_baseline_mode">
-    <option value="none">none</option>
-    <option value="mean">mean</option>
-    <option value="median">median</option>
-  </select>
-  <label>面积 EMA alpha，0 表示关闭</label>
-  <input id="manual_area_ema_alpha" type="number" value="0" min="0" max="1" step="0.01">
 
   <h2>测峰参数</h2>
   <div class="grid2">
@@ -412,7 +378,6 @@ let streamLastFrameId = 0;
 let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
-let manualAreaEma = null;
 
 function getCaptureParams() {
   return {
@@ -442,12 +407,6 @@ function getMeasureParams() {
     peak_mode: document.getElementById('peak_mode').value,
     manual_area_left: document.getElementById('manual_area_left').value,
     manual_area_right: document.getElementById('manual_area_right').value,
-    manual_area_filter_mode: document.getElementById('manual_area_filter_mode').value,
-    manual_area_filter_window: Number(document.getElementById('manual_area_filter_window').value),
-    manual_baseline_left: document.getElementById('manual_baseline_left').value,
-    manual_baseline_right: document.getElementById('manual_baseline_right').value,
-    manual_baseline_mode: document.getElementById('manual_baseline_mode').value,
-    manual_area_ema_alpha: Number(document.getElementById('manual_area_ema_alpha').value),
   };
 }
 
@@ -495,12 +454,6 @@ function applyDefaultsToUi(defaults) {
   setInputValue('peak1', defaults.peak1);
   setInputValue('manual_area_left', defaults.manual_area_left);
   setInputValue('manual_area_right', defaults.manual_area_right);
-  setInputValue('manual_area_filter_mode', defaults.manual_area_filter_mode);
-  setInputValue('manual_area_filter_window', defaults.manual_area_filter_window);
-  setInputValue('manual_baseline_left', defaults.manual_baseline_left);
-  setInputValue('manual_baseline_right', defaults.manual_baseline_right);
-  setInputValue('manual_baseline_mode', defaults.manual_baseline_mode);
-  setInputValue('manual_area_ema_alpha', defaults.manual_area_ema_alpha);
   setInputValue('analysis_channel_index', defaults.analysis_channel_index);
   setInputValue('smooth_window', defaults.smooth_window);
   setInputValue('search_window_half', defaults.search_window_half || defaults.window_half);
@@ -827,15 +780,10 @@ async function loadSavedSample() {
 
 function clearPeaks() {
   latestMeasurement = null;
-  resetManualAreaHistory();
+  manualAreaHistory = [];
   updatePeakTable();
   updateManualAreaTable();
   renderPlots();
-}
-
-function resetManualAreaHistory() {
-  manualAreaHistory = [];
-  manualAreaEma = null;
 }
 
 function getVisibleRange(length) {
@@ -986,24 +934,22 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
   });
 
   const areaEdges = [
-    {id: 'manual_area_left', label: 'A-L', color: '#7c3aed', yOffset: 32},
-    {id: 'manual_area_right', label: 'A-R', color: '#7c3aed', yOffset: 32},
-    {id: 'manual_baseline_left', label: 'B-L', color: '#0f766e', yOffset: 48},
-    {id: 'manual_baseline_right', label: 'B-R', color: '#0f766e', yOffset: 48},
+    {id: 'manual_area_left', label: 'A-L'},
+    {id: 'manual_area_right', label: 'A-R'},
   ];
   areaEdges.forEach(edge => {
     const idx = Number(document.getElementById(edge.id).value);
     if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
     const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
-    ctx.strokeStyle = edge.color;
+    ctx.strokeStyle = '#7c3aed';
     ctx.lineWidth = 1.2 * devicePixelRatio;
     ctx.beginPath();
     ctx.moveTo(x, y0);
     ctx.lineTo(x, y0 + plotH);
     ctx.stroke();
-    ctx.fillStyle = edge.color;
+    ctx.fillStyle = '#7c3aed';
     ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
-    ctx.fillText(edge.label, x + 4 * devicePixelRatio, y0 + edge.yOffset * devicePixelRatio);
+    ctx.fillText(edge.label, x + 4 * devicePixelRatio, y0 + 32 * devicePixelRatio);
   });
 
   if (latestMeasurement && latestMeasurement.measurements) {
@@ -1029,19 +975,11 @@ function handlePlotClick(event, channelIndex) {
   if (target === 'area_left') {
     document.getElementById('manual_area_left').value = idx;
     document.getElementById('pick_target').value = 'area_right';
-    resetManualAreaHistory();
+    manualAreaHistory = [];
   } else if (target === 'area_right') {
     document.getElementById('manual_area_right').value = idx;
     document.getElementById('pick_target').value = 'area_left';
-    resetManualAreaHistory();
-  } else if (target === 'baseline_left') {
-    document.getElementById('manual_baseline_left').value = idx;
-    document.getElementById('pick_target').value = 'baseline_right';
-    resetManualAreaHistory();
-  } else if (target === 'baseline_right') {
-    document.getElementById('manual_baseline_right').value = idx;
-    document.getElementById('pick_target').value = 'baseline_left';
-    resetManualAreaHistory();
+    manualAreaHistory = [];
   } else {
     document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
     document.getElementById('pick_target').value = target === '0' ? '1' : '0';
@@ -1082,23 +1020,9 @@ function updatePeakTable() {
 
 function updateManualAreaHistory() {
   if (!latestMeasurement || !latestMeasurement.manual_area) return;
-  const area = latestMeasurement.manual_area;
-  const raw = Number(area.raw_value !== undefined ? area.raw_value : area.value);
-  const filtered = Number(area.filtered_value !== undefined ? area.filtered_value : raw);
-  const corrected = Number(area.corrected_value !== undefined && area.corrected_value !== null ? area.corrected_value : filtered);
-  const baseline = Number(area.baseline_value);
-  if (!Number.isFinite(raw) || !Number.isFinite(filtered) || !Number.isFinite(corrected)) return;
-
-  const alpha = Math.min(1, Math.max(0, Number(document.getElementById('manual_area_ema_alpha').value) || 0));
-  let ema = null;
-  if (alpha > 0) {
-    manualAreaEma = manualAreaEma === null ? corrected : alpha * corrected + (1 - alpha) * manualAreaEma;
-    ema = manualAreaEma;
-  } else {
-    manualAreaEma = null;
-  }
-
-  manualAreaHistory.push({raw, filtered, corrected, baseline, ema});
+  const value = Number(latestMeasurement.manual_area.value);
+  if (!Number.isFinite(value)) return;
+  manualAreaHistory.push(value);
   if (manualAreaHistory.length > 200) {
     manualAreaHistory = manualAreaHistory.slice(-200);
   }
@@ -1108,57 +1032,23 @@ function updateManualAreaTable() {
   const rows = document.getElementById('manualAreaRows');
   const area = latestMeasurement ? latestMeasurement.manual_area : null;
   if (!area) {
-    rows.innerHTML = '<tr><td>范围</td><td>--</td></tr><tr><td>raw</td><td>--</td></tr><tr><td>filtered</td><td>--</td></tr><tr><td>EMA</td><td>--</td></tr>';
+    rows.innerHTML = '<tr><td>面积</td><td>--</td></tr><tr><td>最近抖动</td><td>--</td></tr>';
     return;
   }
 
-  const rawStats = areaStats('raw');
-  const filteredStats = areaStats('filtered');
-  const correctedStats = areaStats('corrected');
-  const baselineStats = areaStats('baseline');
-  const emaStats = areaStats('ema');
-  const filterText = `${area.filter_mode || 'none'} / ${area.filter_window || 1}`;
-  const baselineWindow = area.baseline_mode && area.baseline_mode !== 'none'
-    ? `${area.baseline_left_index}-${area.baseline_right_index}，${area.baseline_point_count} 点`
-    : '--';
+  const mean = manualAreaHistory.length
+    ? manualAreaHistory.reduce((sum, value) => sum + value, 0) / manualAreaHistory.length
+    : Number(area.value);
+  const variance = manualAreaHistory.length
+    ? manualAreaHistory.reduce((sum, value) => sum + (value - mean) ** 2, 0) / manualAreaHistory.length
+    : 0;
+  const std = Math.sqrt(variance);
   rows.innerHTML = `
     <tr><td>范围</td><td>${area.left_index}-${area.right_index}，${area.point_count} 点</td></tr>
-    <tr><td>滤波</td><td>${filterText}</td></tr>
-    <tr><td>本底模式</td><td>${area.baseline_mode || 'none'}</td></tr>
-    <tr><td>本底范围</td><td>${baselineWindow}</td></tr>
-    <tr><td>本底值</td><td>${formatSci(area.baseline_value)}</td></tr>
-    <tr><td>本底均值/标准差</td><td>${formatStats(baselineStats)}</td></tr>
-    <tr><td>raw 当前</td><td>${formatSci(area.raw_value !== undefined ? area.raw_value : area.value)}</td></tr>
-    <tr><td>raw 均值/标准差</td><td>${formatStats(rawStats)}</td></tr>
-    <tr><td>filtered 当前</td><td>${formatSci(area.filtered_value !== undefined ? area.filtered_value : area.value)}</td></tr>
-    <tr><td>filtered 均值/标准差</td><td>${formatStats(filteredStats)}</td></tr>
-    <tr><td>扣本底面积</td><td>${formatSci(area.corrected_value)}</td></tr>
-    <tr><td>扣本底均值/标准差</td><td>${formatStats(correctedStats)}</td></tr>
-    <tr><td>EMA alpha</td><td>${formatNumber(Number(document.getElementById('manual_area_ema_alpha').value) || 0, 3)}</td></tr>
-    <tr><td>EMA 当前</td><td>${formatSci(manualAreaEma)}</td></tr>
-    <tr><td>EMA 均值/标准差</td><td>${formatStats(emaStats)}</td></tr>
+    <tr><td>面积</td><td>${Number(area.value).toExponential(6)}</td></tr>
+    <tr><td>最近均值</td><td>${mean.toExponential(6)}</td></tr>
+    <tr><td>最近标准差</td><td>${std.toExponential(6)} / ${manualAreaHistory.length} 帧</td></tr>
   `;
-}
-
-function areaStats(key) {
-  const values = manualAreaHistory
-    .map(item => item[key])
-    .filter(value => Number.isFinite(value));
-  if (!values.length) return null;
-  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
-  return {mean, std: Math.sqrt(variance), count: values.length};
-}
-
-function formatSci(value) {
-  return Number.isFinite(Number(value)) ? Number(value).toExponential(6) : '--';
-}
-
-function formatStats(stats) {
-  if (!stats) return '--';
-  const rel = Math.abs(stats.mean) > 1e-30 ? stats.std / Math.abs(stats.mean) * 100 : null;
-  const relText = rel === null ? '--' : `${rel.toFixed(3)}%`;
-  return `${stats.mean.toExponential(6)} / ${stats.std.toExponential(6)} / ${relText} / ${stats.count} 帧`;
 }
 
 function updateFrameInfo() {
@@ -1180,24 +1070,12 @@ window.addEventListener('resize', resizeAndDraw);
 for (const id of ['rate', 'samples']) {
   document.getElementById(id).addEventListener('input', updateDerivedTimingFromInputs);
 }
-for (const id of [
-  'manual_area_left',
-  'manual_area_right',
-  'manual_area_filter_mode',
-  'manual_area_filter_window',
-  'manual_baseline_left',
-  'manual_baseline_right',
-  'manual_baseline_mode',
-  'manual_area_ema_alpha',
-]) {
-  const element = document.getElementById(id);
-  const resetAreaView = () => {
-    resetManualAreaHistory();
+for (const id of ['manual_area_left', 'manual_area_right']) {
+  document.getElementById(id).addEventListener('input', () => {
+    manualAreaHistory = [];
     updateManualAreaTable();
     renderPlots();
-  };
-  element.addEventListener('input', resetAreaView);
-  element.addEventListener('change', resetAreaView);
+  });
 }
 updateDerivedTimingFromInputs();
 updateStreamStatus({running: false, frame_id: 0});
