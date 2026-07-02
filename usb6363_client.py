@@ -243,6 +243,55 @@ class Usb6363Client:
             },
         )
 
+    def start_ai_frame_stream(
+        self,
+        channels: list[str] | None = None,
+        samples_per_frame: int = 5000,
+        rate: float = 50_000.0,
+        terminal_config: str = "DIFF",
+        min_val: float = -5.0,
+        max_val: float = 5.0,
+        timeout: float = 10.0,
+        trigger_enabled: bool = False,
+        trigger_source: str = "PFI0",
+        trigger_edge: str = "RISING",
+    ) -> dict[str, Any]:
+        """启动固定点数分帧连续采集。
+
+        这是旧版程序那种模式：创建一次连续 AI task，每次读取固定点数作为一帧。
+        """
+
+        return self._post(
+            "/api/ai/frame_stream/start",
+            {
+                "channels": ["ai0", "ai1"] if channels is None else channels,
+                "samples_per_frame": samples_per_frame,
+                "rate": rate,
+                "terminal_config": terminal_config,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+                "trigger_enabled": trigger_enabled,
+                "trigger_source": trigger_source,
+                "trigger_edge": trigger_edge,
+            },
+        )
+
+    def stop_ai_frame_stream(self) -> dict[str, Any]:
+        """停止固定点数分帧连续采集。"""
+
+        return self._post("/api/ai/frame_stream/stop", {})
+
+    def get_ai_frame_stream_status(self) -> dict[str, Any]:
+        """查询固定点数分帧连续采集状态。"""
+
+        return self._get("/api/ai/frame_stream/status")
+
+    def get_ai_frame_stream_latest(self) -> dict[str, Any]:
+        """读取固定点数分帧连续采集的最新一帧。"""
+
+        return self._get("/api/ai/frame_stream/latest")
+
     def write_ao(
         self,
         channel: str = "ao0",

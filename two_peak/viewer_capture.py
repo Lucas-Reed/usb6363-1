@@ -82,6 +82,47 @@ def capture_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     return frame
 
 
+def start_frame_stream(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
+    """通过底层 API 启动固定点数分帧连续采集。"""
+
+    channels = parse_channels(body.get("channels", ["ai0", "ai1"]))
+    return state.daq.start_ai_frame_stream(
+        channels=channels,
+        samples_per_frame=int(body.get("samples_per_frame", body.get("samples", 5000))),
+        rate=float(body.get("rate", 50_000.0)),
+        terminal_config=str(body.get("terminal_config", "DIFF")),
+        min_val=float(body.get("min_val", -5.0)),
+        max_val=float(body.get("max_val", 5.0)),
+        timeout=float(body.get("timeout", 10.0)),
+        trigger_enabled=bool_value(body.get("trigger_enabled", False)),
+        trigger_source=str(body.get("trigger_source", "PFI0")),
+        trigger_edge=str(body.get("trigger_edge", "RISING")),
+    )
+
+
+def stop_frame_stream(state: ViewerState) -> dict[str, Any]:
+    """通过底层 API 停止固定点数分帧连续采集。"""
+
+    return state.daq.stop_ai_frame_stream()
+
+
+def get_frame_stream_status(state: ViewerState) -> dict[str, Any]:
+    """通过底层 API 查询固定点数分帧连续采集状态。"""
+
+    return state.daq.get_ai_frame_stream_status()
+
+
+def get_frame_stream_latest(state: ViewerState) -> dict[str, Any]:
+    """通过底层 API 获取最新帧，并同步到查看器状态。"""
+
+    frame = state.daq.get_ai_frame_stream_latest()
+    frame["captured_by"] = "usb6363_frame_stream"
+    frame["viewer_received_at"] = time.time()
+    state.latest_frame = frame
+    state.latest_measurement = None
+    return frame
+
+
 def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """测量最近一帧里的 P1/P2。
 

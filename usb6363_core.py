@@ -101,6 +101,17 @@ class DaqController:
         self._ai_thread: threading.Thread | None = None
         self._ai_stop_event: threading.Event | None = None
 
+        # frame_stream 是“固定点数分帧”的连续 AI 采集，接近旧版程序的方式：
+        # 创建一次连续 AI task，然后每次 read(samples_per_frame) 得到一帧。
+        # 它暂时和 subscribe_ai 互斥，避免两个 AI task 抢同一套采集硬件。
+        self._frame_stream_running = False
+        self._frame_stream_error: str | None = None
+        self._frame_stream_thread: threading.Thread | None = None
+        self._frame_stream_stop_event: threading.Event | None = None
+        self._frame_stream_latest: dict[str, Any] | None = None
+        self._frame_stream_frame_id = 0
+        self._frame_stream_settings: dict[str, Any] | None = None
+
     # ---------------------------------------------------------------------
     # 设备信息
     # ---------------------------------------------------------------------
@@ -142,6 +153,8 @@ class DaqController:
 
         physical_channel = self._normalize_ai_channel(channel)
         with self._ai_lock:
+            if self._frame_stream_running:
+                raise RuntimeError("Stop AI frame stream before subscribing AI channels")
             if physical_channel not in self._ai_active_channels:
                 self._ai_active_channels.append(physical_channel)
 
@@ -153,6 +166,8 @@ class DaqController:
 
         physical_channel = self._normalize_ai_channel(channel)
         with self._ai_lock:
+            if self._frame_stream_running:
+                raise RuntimeError("Stop AI frame stream before changing subscribed AI channels")
             if physical_channel in self._ai_active_channels:
                 self._ai_active_channels.remove(physical_channel)
 
@@ -172,6 +187,8 @@ class DaqController:
                 normalized_channels.append(physical_channel)
 
         with self._ai_lock:
+            if self._frame_stream_running:
+                raise RuntimeError("Stop AI frame stream before setting AI channels")
             self._ai_active_channels = normalized_channels
 
         self._restart_ai_sampling()
@@ -181,6 +198,8 @@ class DaqController:
         """取消所有 AI 通道订阅，并停止后台连续采样。"""
 
         with self._ai_lock:
+            if self._frame_stream_running:
+                raise RuntimeError("Stop AI frame stream before clearing subscribed AI channels")
             self._ai_active_channels = []
 
         self._restart_ai_sampling()
@@ -489,6 +508,8 @@ class DaqController:
         started_at = time.time()
         t0 = time.perf_counter()
         with self._ai_lock:
+            if self._frame_stream_running:
+                raise RuntimeError("Stop AI frame stream before capture_ai_frame")
             if self._ai_active_channels:
                 raise RuntimeError(
                     "Background AI sampling is running. Call clear_ai_channels before "
@@ -529,6 +550,115 @@ class DaqController:
             "trigger_edge": trigger_edge,
             "values": values,
         }
+
+    def start_ai_frame_stream(
+        self,
+        channels: list[str],
+        samples_per_frame: int = 5000,
+        rate: float = 50_000.0,
+        terminal_config: str = "DIFF",
+        min_val: float = -5.0,
+        max_val: float = 5.0,
+        timeout: float = 10.0,
+        trigger_enabled: bool = False,
+        trigger_source: str = "PFI0",
+        trigger_edge: str = "RISING",
+    ) -> dict[str, Any]:
+        """启动固定点数分帧的连续 AI 采集。
+
+        旧版程序的核心方式就是：连续采样 task 不停，每次读取固定点数作为一帧。
+        trigger_enabled=True 时，PFI 只作为“启动触发”，不是每帧触发。
+        """
+
+        if not channels:
+            raise ValueError("channels must not be empty")
+        if samples_per_frame < 1:
+            raise ValueError("samples_per_frame must be >= 1")
+        if rate <= 0:
+            raise ValueError("rate must be > 0")
+        if min_val >= max_val:
+            raise ValueError("min_val must be smaller than max_val")
+
+        physical_channels: list[str] = []
+        for channel in channels:
+            physical_channel = self._normalize_ai_channel(channel)
+            if physical_channel not in physical_channels:
+                physical_channels.append(physical_channel)
+
+        physical_trigger_source = None
+        if trigger_enabled:
+            physical_trigger_source = self._normalize_pfi_terminal(trigger_source)
+
+        total_json_samples = len(physical_channels) * samples_per_frame
+        if total_json_samples > AI_FRAME_MAX_JSON_SAMPLES:
+            raise ValueError(
+                f"frame stream latest frame would return {total_json_samples} samples as JSON. "
+                "Reduce channel count/samples_per_frame for the viewer experiment."
+            )
+
+        with self._ai_lock:
+            if self._ai_active_channels or self._ai_running:
+                raise RuntimeError("Stop subscribe_ai/background AI before starting frame stream")
+            if self._frame_stream_running:
+                raise RuntimeError("AI frame stream is already running")
+
+            settings = {
+                "device": self.device_name,
+                "channels": physical_channels,
+                "samples_per_frame": samples_per_frame,
+                "rate_per_channel": rate,
+                "aggregate_rate": rate * len(physical_channels),
+                "terminal_config": terminal_config,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+                "trigger_enabled": trigger_enabled,
+                "trigger_source": physical_trigger_source,
+                "trigger_edge": trigger_edge,
+            }
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._ai_frame_stream_worker,
+                args=(settings, stop_event),
+                daemon=True,
+                name="usb6363-ai-frame-stream",
+            )
+            self._frame_stream_stop_event = stop_event
+            self._frame_stream_thread = thread
+            self._frame_stream_latest = None
+            self._frame_stream_frame_id = 0
+            self._frame_stream_error = None
+            self._frame_stream_settings = dict(settings)
+            self._frame_stream_running = True
+            thread.start()
+
+        return self.get_ai_frame_stream_status()
+
+    def stop_ai_frame_stream(self) -> dict[str, Any]:
+        """停止固定点数分帧的连续 AI 采集。"""
+
+        self._stop_ai_frame_stream()
+        return self.get_ai_frame_stream_status()
+
+    def get_ai_frame_stream_status(self) -> dict[str, Any]:
+        """查询固定点数分帧采集状态。"""
+
+        with self._ai_lock:
+            return {
+                "running": self._frame_stream_running,
+                "error": self._frame_stream_error,
+                "frame_id": self._frame_stream_frame_id,
+                "has_frame": self._frame_stream_latest is not None,
+                "settings": dict(self._frame_stream_settings or {}),
+            }
+
+    def get_ai_frame_stream_latest(self) -> dict[str, Any]:
+        """返回最新一帧固定点数采集数据。"""
+
+        with self._ai_lock:
+            if self._frame_stream_latest is None:
+                raise RuntimeError("AI frame stream has no frame yet")
+            return dict(self._frame_stream_latest)
 
     # ---------------------------------------------------------------------
     # AO / PFI
@@ -699,6 +829,86 @@ class DaqController:
                 self._ai_thread = None
                 self._ai_stop_event = None
                 self._ai_running = False
+
+    def _stop_ai_frame_stream(self) -> None:
+        """停止固定点数分帧采集线程。"""
+
+        with self._ai_lock:
+            stop_event = self._frame_stream_stop_event
+            thread = self._frame_stream_thread
+            if stop_event is not None:
+                stop_event.set()
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+
+        with self._ai_lock:
+            if self._frame_stream_thread is thread:
+                self._frame_stream_thread = None
+                self._frame_stream_stop_event = None
+                self._frame_stream_running = False
+
+    def _ai_frame_stream_worker(
+        self,
+        settings: dict[str, Any],
+        stop_event: threading.Event,
+    ) -> None:
+        """固定点数分帧采集线程。"""
+
+        channels = list(settings["channels"])
+        samples_per_frame = int(settings["samples_per_frame"])
+        try:
+            task = nidaqmx_driver.create_continuous_ai_task(
+                channels=channels,
+                rate=float(settings["rate_per_channel"]),
+                samples_per_read=samples_per_frame,
+                terminal_config_name=str(settings["terminal_config"]),
+                min_val=float(settings["min_val"]),
+                max_val=float(settings["max_val"]),
+                start_trigger_source=settings["trigger_source"],
+                start_trigger_edge_name=str(settings["trigger_edge"]),
+            )
+            try:
+                while not stop_event.is_set():
+                    channel_values = nidaqmx_driver.read_continuous_ai_chunk(
+                        task=task,
+                        samples_per_read=samples_per_frame,
+                        channel_count=len(channels),
+                        timeout=float(settings["timeout"]),
+                    )
+                    now = time.time()
+                    with self._ai_lock:
+                        if stop_event.is_set():
+                            break
+                        self._frame_stream_frame_id += 1
+                        self._frame_stream_latest = {
+                            "device": self.device_name,
+                            "channels": channels,
+                            "channel_count": len(channels),
+                            "samples_per_channel": samples_per_frame,
+                            "rate_per_channel": float(settings["rate_per_channel"]),
+                            "aggregate_rate": float(settings["aggregate_rate"]),
+                            "terminal_config": str(settings["terminal_config"]),
+                            "min_val": float(settings["min_val"]),
+                            "max_val": float(settings["max_val"]),
+                            "trigger_enabled": bool(settings["trigger_enabled"]),
+                            "trigger_source": settings["trigger_source"],
+                            "trigger_edge": str(settings["trigger_edge"]),
+                            "frame_id": self._frame_stream_frame_id,
+                            "started_at": now,
+                            "finished_at": now,
+                            "values": channel_values,
+                        }
+                        self._frame_stream_error = None
+            finally:
+                task.close()
+        except Exception as exc:
+            with self._ai_lock:
+                self._frame_stream_error = str(exc)
+        finally:
+            with self._ai_lock:
+                if self._frame_stream_thread is threading.current_thread():
+                    self._frame_stream_running = False
 
     def _ai_sampling_worker(
         self,

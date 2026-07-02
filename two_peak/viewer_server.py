@@ -11,8 +11,12 @@ from typing import Any
 from two_peak.viewer_capture import (
     capture_frame,
     frame_summary,
+    get_frame_stream_latest,
+    get_frame_stream_status,
     measure_latest_frame,
     save_latest_frame,
+    start_frame_stream,
+    stop_frame_stream,
 )
 from two_peak.viewer_state import ViewerState
 
@@ -48,6 +52,10 @@ def make_handler(state: ViewerState):
                             "measurement": state.latest_measurement,
                         }
                     )
+                elif self.path == "/api/stream/status":
+                    self._send_json(get_frame_stream_status(state))
+                elif self.path == "/api/stream/latest":
+                    self._send_json(get_frame_stream_latest(state))
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:
@@ -63,6 +71,11 @@ def make_handler(state: ViewerState):
                     state.latest_frame = frame
                     state.latest_measurement = None
                     self._send_json(frame)
+                elif self.path == "/api/stream/start":
+                    body = self._read_json()
+                    self._send_json(start_frame_stream(state, body))
+                elif self.path == "/api/stream/stop":
+                    self._send_json(stop_frame_stream(state))
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)

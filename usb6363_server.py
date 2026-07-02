@@ -76,6 +76,12 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/stats":
                     # 返回某个通道最近缓存数据的统计量，用于实时监测反馈。
                     self._send_json(controller.get_ai_stats(**_ai_stats_args(query)))
+                elif parsed.path == "/api/ai/frame_stream/status":
+                    # 查询固定点数分帧连续采集状态。
+                    self._send_json(controller.get_ai_frame_stream_status())
+                elif parsed.path == "/api/ai/frame_stream/latest":
+                    # 读取固定点数分帧连续采集的最新一帧。
+                    self._send_json(controller.get_ai_frame_stream_latest())
                 elif parsed.path == "/api/pfi/read":
                     # 读取某个 PFI 或数字线的当前高低电平。
                     self._send_json(controller.read_digital_line(**_digital_read_args(query)))
@@ -119,6 +125,12 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/capture_frame":
                     # 同步读取多路 AI 的一帧数据，例如双峰锁定里的 ai0/ai1。
                     self._send_json(controller.capture_ai_frame(**_ai_capture_frame_body(body)))
+                elif parsed.path == "/api/ai/frame_stream/start":
+                    # 启动固定点数分帧连续采集。
+                    self._send_json(controller.start_ai_frame_stream(**_ai_frame_stream_body(body)))
+                elif parsed.path == "/api/ai/frame_stream/stop":
+                    # 停止固定点数分帧连续采集。
+                    self._send_json(controller.stop_ai_frame_stream())
                 elif parsed.path == "/api/pfi/write":
                     # 写 PFI 或数字线电平。请求体例如 {"line": "PFI0", "value": true}。
                     self._send_json(controller.write_digital_line(**_digital_write_args(body)))
@@ -256,6 +268,27 @@ def _ai_capture_frame_body(body: dict[str, Any]) -> dict[str, Any]:
     return {
         "channels": [str(channel) for channel in channels],
         "samples": int(body.get("samples", 5000)),
+        "rate": float(body.get("rate", 50_000.0)),
+        "terminal_config": str(body.get("terminal_config", "DIFF")),
+        "min_val": float(body.get("min_val", -5.0)),
+        "max_val": float(body.get("max_val", 5.0)),
+        "timeout": float(body.get("timeout", 10.0)),
+        "trigger_enabled": _bool_value(body.get("trigger_enabled", False)),
+        "trigger_source": str(body.get("trigger_source", "PFI0")),
+        "trigger_edge": str(body.get("trigger_edge", "RISING")),
+    }
+
+
+def _ai_frame_stream_body(body: dict[str, Any]) -> dict[str, Any]:
+    """把 POST JSON 转换成 start_ai_frame_stream 需要的参数。"""
+
+    channels = body.get("channels", ["ai0", "ai1"])
+    if not isinstance(channels, list):
+        raise ValueError("channels must be a list")
+
+    return {
+        "channels": [str(channel) for channel in channels],
+        "samples_per_frame": int(body.get("samples_per_frame", body.get("samples", 5000))),
         "rate": float(body.get("rate", 50_000.0)),
         "terminal_config": str(body.get("terminal_config", "DIFF")),
         "min_val": float(body.get("min_val", -5.0)),

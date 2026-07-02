@@ -173,11 +173,16 @@ def create_continuous_ai_task(
     terminal_config_name: str = "RSE",
     min_val: float = -10.0,
     max_val: float = 10.0,
+    start_trigger_source: str | None = None,
+    start_trigger_edge_name: str = "RISING",
 ) -> Any:
     """创建并启动连续 AI Task。
 
     返回的 task 仍由调用方负责 close。这个函数保留在 driver 内，
     是为了让 nidaqmx 的创建细节集中在一个文件里。
+
+    start_trigger_source 不为 None 时，连续采集会等待这个数字边沿后启动。
+    注意：这是“启动触发”，不是每一帧都重新触发。
     """
 
     config = _terminal_config(terminal_config_name)
@@ -195,6 +200,11 @@ def create_continuous_ai_task(
             sample_mode=AcquisitionType.CONTINUOUS,
             samps_per_chan=samples_per_read * 10,
         )
+        if start_trigger_source is not None:
+            task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                trigger_source=start_trigger_source,
+                trigger_edge=_edge(start_trigger_edge_name),
+            )
         task.start()
         return task
     except Exception:

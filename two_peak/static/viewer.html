@@ -240,6 +240,10 @@
     <button class="green" id="continuousStartBtn" onclick="startContinuousCapture()">开始连续</button>
     <button class="secondary" id="continuousStopBtn" onclick="stopContinuousCapture()" disabled>停止连续</button>
   </div>
+  <div class="actions">
+    <button class="green" id="streamStartBtn" onclick="startBackendStream()">开始后端连续</button>
+    <button class="secondary" id="streamStopBtn" onclick="stopBackendStream()" disabled>停止后端连续</button>
+  </div>
 
   <h2>手动选峰</h2>
   <label>点击波形时设置</label>
@@ -316,6 +320,9 @@ let continuousRunning = false;
 let continuousBusy = false;
 let continuousTimer = null;
 let continuousFrameCount = 0;
+let streamRunning = false;
+let streamTimer = null;
+let streamLastFrameId = 0;
 
 function getCaptureParams() {
   return {
@@ -368,6 +375,9 @@ async function postJson(path, body) {
 async function captureFrame(options = {}) {
   const fromContinuous = options.fromContinuous === true;
   if (fromContinuous && continuousBusy) return;
+  if (!fromContinuous && streamRunning) {
+    await stopBackendStream();
+  }
   const btn = document.getElementById('captureBtn');
   const startBtn = document.getElementById('continuousStartBtn');
   if (fromContinuous) {
@@ -406,8 +416,9 @@ async function captureFrame(options = {}) {
   }
 }
 
-function startContinuousCapture() {
+async function startContinuousCapture() {
   if (continuousRunning) return;
+  if (streamRunning) await stopBackendStream();
   const intervalMs = Math.max(20, Number(document.getElementById('continuous_interval_ms').value) || 200);
   continuousRunning = true;
   continuousBusy = false;
@@ -441,6 +452,75 @@ function stopContinuousCapture() {
 function updateContinuousStatus() {
   const text = continuousRunning ? `运行中，${continuousFrameCount} 帧` : '停止';
   document.getElementById('continuous_status').value = text;
+}
+
+async function startBackendStream() {
+  if (streamRunning) return;
+  stopContinuousCapture();
+  const params = getCaptureParams();
+  params.samples_per_frame = params.samples;
+  try {
+    await postJson('/api/stream/start', params);
+    streamRunning = true;
+    streamLastFrameId = 0;
+    document.getElementById('streamStartBtn').disabled = true;
+    document.getElementById('streamStopBtn').disabled = false;
+    document.getElementById('captureBtn').disabled = true;
+    setStatus('后端连续采集已启动，等待最新帧...', 'ok');
+    streamTimer = setInterval(pollBackendStreamLatest, 80);
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    stopBackendStreamUiOnly();
+  }
+}
+
+async function stopBackendStream() {
+  try {
+    await postJson('/api/stream/stop', {});
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  } finally {
+    stopBackendStreamUiOnly();
+  }
+}
+
+function stopBackendStreamUiOnly() {
+  streamRunning = false;
+  if (streamTimer !== null) {
+    clearInterval(streamTimer);
+    streamTimer = null;
+  }
+  document.getElementById('streamStartBtn').disabled = false;
+  document.getElementById('streamStopBtn').disabled = true;
+  document.getElementById('captureBtn').disabled = false;
+}
+
+async function pollBackendStreamLatest() {
+  if (!streamRunning) return;
+  try {
+    const response = await fetch('/api/stream/latest');
+    const frame = await response.json();
+    if (!response.ok || frame.ok === false) {
+      const statusResponse = await fetch('/api/stream/status');
+      const status = await statusResponse.json();
+      if (status.error) {
+        throw new Error(status.error);
+      }
+      return;
+    }
+    if (frame.frame_id === streamLastFrameId) return;
+    streamLastFrameId = frame.frame_id;
+    latestFrame = frame;
+    latestMeasurement = null;
+    document.getElementById('saveBtn').disabled = false;
+    renderPlots();
+    updateFrameInfo();
+    await measurePeaks();
+    setStatus(`后端连续采集中，最新帧 #${streamLastFrameId}。`, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    stopBackendStreamUiOnly();
+  }
 }
 
 async function measurePeaks() {
