@@ -596,6 +596,12 @@ class DaqController:
                 "Reduce channel count/samples_per_frame for the viewer experiment."
             )
 
+        # 后端连续采集的“帧间隔”不是网页定时器决定的，
+        # 而是由每通道点数 / 每通道采样率这个物理关系决定的。
+        frame_duration_seconds = samples_per_frame / rate
+        frame_duration_ms = frame_duration_seconds * 1000.0
+        frame_rate_hz = rate / samples_per_frame
+
         with self._ai_lock:
             if self._ai_active_channels or self._ai_running:
                 raise RuntimeError("Stop subscribe_ai/background AI before starting frame stream")
@@ -615,6 +621,10 @@ class DaqController:
                 "trigger_enabled": trigger_enabled,
                 "trigger_source": physical_trigger_source,
                 "trigger_edge": trigger_edge,
+                "trigger_mode": "start_only" if trigger_enabled else "off",
+                "frame_duration_seconds": frame_duration_seconds,
+                "frame_duration_ms": frame_duration_ms,
+                "frame_rate_hz": frame_rate_hz,
             }
             stop_event = threading.Event()
             thread = threading.Thread(
@@ -644,12 +654,17 @@ class DaqController:
         """查询固定点数分帧采集状态。"""
 
         with self._ai_lock:
+            settings = dict(self._frame_stream_settings or {})
             return {
                 "running": self._frame_stream_running,
                 "error": self._frame_stream_error,
                 "frame_id": self._frame_stream_frame_id,
                 "has_frame": self._frame_stream_latest is not None,
-                "settings": dict(self._frame_stream_settings or {}),
+                "frame_duration_seconds": settings.get("frame_duration_seconds"),
+                "frame_duration_ms": settings.get("frame_duration_ms"),
+                "frame_rate_hz": settings.get("frame_rate_hz"),
+                "trigger_mode": settings.get("trigger_mode", "off"),
+                "settings": settings,
             }
 
     def get_ai_frame_stream_latest(self) -> dict[str, Any]:
@@ -894,6 +909,10 @@ class DaqController:
                             "trigger_enabled": bool(settings["trigger_enabled"]),
                             "trigger_source": settings["trigger_source"],
                             "trigger_edge": str(settings["trigger_edge"]),
+                            "trigger_mode": str(settings["trigger_mode"]),
+                            "frame_duration_seconds": float(settings["frame_duration_seconds"]),
+                            "frame_duration_ms": float(settings["frame_duration_ms"]),
+                            "frame_rate_hz": float(settings["frame_rate_hz"]),
                             "frame_id": self._frame_stream_frame_id,
                             "started_at": now,
                             "finished_at": now,

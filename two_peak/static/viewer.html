@@ -226,23 +226,31 @@
     <button id="captureBtn" onclick="captureFrame()">采集一帧</button>
     <button class="green" id="saveBtn" onclick="saveFrame()" disabled>保存样本</button>
   </div>
+
+  <h2>连续采集</h2>
   <div class="grid2">
     <div>
-      <label>连续采集间隔 / ms</label>
-      <input id="continuous_interval_ms" type="number" value="200" step="50">
+      <label>连续状态</label>
+      <input id="stream_status" value="停止" readonly>
     </div>
     <div>
-      <label>连续状态</label>
-      <input id="continuous_status" value="停止" readonly>
+      <label>最新帧编号</label>
+      <input id="stream_frame_id" value="0" readonly>
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>每帧时长 / ms</label>
+      <input id="frame_duration_ms" value="--" readonly>
+    </div>
+    <div>
+      <label>帧率 / Hz</label>
+      <input id="frame_rate_hz" value="--" readonly>
     </div>
   </div>
   <div class="actions">
-    <button class="green" id="continuousStartBtn" onclick="startContinuousCapture()">开始连续</button>
-    <button class="secondary" id="continuousStopBtn" onclick="stopContinuousCapture()" disabled>停止连续</button>
-  </div>
-  <div class="actions">
-    <button class="green" id="streamStartBtn" onclick="startBackendStream()">开始后端连续</button>
-    <button class="secondary" id="streamStopBtn" onclick="stopBackendStream()" disabled>停止后端连续</button>
+    <button class="green" id="streamStartBtn" onclick="startBackendStream()">开始连续采集</button>
+    <button class="secondary" id="streamStopBtn" onclick="stopBackendStream()" disabled>停止连续采集</button>
   </div>
 
   <h2>手动选峰</h2>
@@ -316,10 +324,6 @@
 let latestFrame = null;
 let latestMeasurement = null;
 let plotCanvases = [];
-let continuousRunning = false;
-let continuousBusy = false;
-let continuousTimer = null;
-let continuousFrameCount = 0;
 let streamRunning = false;
 let streamTimer = null;
 let streamLastFrameId = 0;
@@ -372,23 +376,48 @@ async function postJson(path, body) {
   return data;
 }
 
-async function captureFrame(options = {}) {
-  const fromContinuous = options.fromContinuous === true;
-  if (fromContinuous && continuousBusy) return;
-  if (!fromContinuous && streamRunning) {
+function formatNumber(value, digits = 3) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
+  return Number(value).toFixed(digits);
+}
+
+function updateDerivedTimingFromInputs() {
+  const rate = Number(document.getElementById('rate').value);
+  const samples = Number(document.getElementById('samples').value);
+  if (rate > 0 && samples > 0) {
+    document.getElementById('frame_duration_ms').value = formatNumber(samples / rate * 1000.0, 3);
+    document.getElementById('frame_rate_hz').value = formatNumber(rate / samples, 3);
+  } else {
+    document.getElementById('frame_duration_ms').value = '--';
+    document.getElementById('frame_rate_hz').value = '--';
+  }
+}
+
+function updateStreamStatus(status) {
+  const running = Boolean(status && status.running);
+  const frameId = status && status.frame_id !== undefined ? status.frame_id : streamLastFrameId;
+  const error = status && status.error ? `错误：${status.error}` : '';
+  document.getElementById('stream_status').value = error || (running ? '运行中' : '停止');
+  document.getElementById('stream_frame_id').value = frameId || 0;
+  if (status && status.frame_duration_ms !== null && status.frame_duration_ms !== undefined) {
+    document.getElementById('frame_duration_ms').value = formatNumber(status.frame_duration_ms, 3);
+  }
+  if (status && status.frame_rate_hz !== null && status.frame_rate_hz !== undefined) {
+    document.getElementById('frame_rate_hz').value = formatNumber(status.frame_rate_hz, 3);
+  }
+}
+
+async function captureFrame() {
+  if (streamRunning) {
     await stopBackendStream();
   }
   const btn = document.getElementById('captureBtn');
-  const startBtn = document.getElementById('continuousStartBtn');
-  if (fromContinuous) {
-    continuousBusy = true;
-  } else {
-    btn.disabled = true;
-    startBtn.disabled = true;
-  }
+  const streamStartBtn = document.getElementById('streamStartBtn');
+  btn.disabled = true;
+  streamStartBtn.disabled = true;
   const params = getCaptureParams();
   const prefix = params.trigger_enabled ? `等待 ${params.trigger_source} ${params.trigger_edge} 后采集...` : '正在采集一帧...';
-  setStatus(fromContinuous ? `连续采集 #${continuousFrameCount + 1}：${prefix}` : prefix, '');
+  setStatus(prefix, '');
   try {
     latestFrame = await postJson('/api/capture', params);
     latestMeasurement = null;
@@ -396,77 +425,29 @@ async function captureFrame(options = {}) {
     renderPlots();
     updateFrameInfo();
     await measurePeaks();
-    if (fromContinuous) {
-      continuousFrameCount += 1;
-      updateContinuousStatus();
-      setStatus(`连续采集运行中，已采 ${continuousFrameCount} 帧。`, 'ok');
-    } else {
-      setStatus('采集完成。', 'ok');
-    }
+    setStatus('采集完成。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
-    if (fromContinuous) stopContinuousCapture();
   } finally {
-    if (fromContinuous) {
-      continuousBusy = false;
-    } else {
-      btn.disabled = false;
-      startBtn.disabled = false;
-    }
+    btn.disabled = false;
+    streamStartBtn.disabled = false;
   }
-}
-
-async function startContinuousCapture() {
-  if (continuousRunning) return;
-  if (streamRunning) await stopBackendStream();
-  const intervalMs = Math.max(20, Number(document.getElementById('continuous_interval_ms').value) || 200);
-  continuousRunning = true;
-  continuousBusy = false;
-  continuousFrameCount = 0;
-  document.getElementById('continuousStartBtn').disabled = true;
-  document.getElementById('continuousStopBtn').disabled = false;
-  document.getElementById('captureBtn').disabled = true;
-  updateContinuousStatus();
-
-  const tick = () => {
-    if (!continuousRunning) return;
-    captureFrame({fromContinuous: true});
-  };
-  tick();
-  continuousTimer = setInterval(tick, intervalMs);
-}
-
-function stopContinuousCapture() {
-  continuousRunning = false;
-  if (continuousTimer !== null) {
-    clearInterval(continuousTimer);
-    continuousTimer = null;
-  }
-  continuousBusy = false;
-  document.getElementById('continuousStartBtn').disabled = false;
-  document.getElementById('continuousStopBtn').disabled = true;
-  document.getElementById('captureBtn').disabled = false;
-  updateContinuousStatus();
-}
-
-function updateContinuousStatus() {
-  const text = continuousRunning ? `运行中，${continuousFrameCount} 帧` : '停止';
-  document.getElementById('continuous_status').value = text;
 }
 
 async function startBackendStream() {
   if (streamRunning) return;
-  stopContinuousCapture();
   const params = getCaptureParams();
   params.samples_per_frame = params.samples;
+  updateDerivedTimingFromInputs();
   try {
-    await postJson('/api/stream/start', params);
+    const status = await postJson('/api/stream/start', params);
     streamRunning = true;
     streamLastFrameId = 0;
     document.getElementById('streamStartBtn').disabled = true;
     document.getElementById('streamStopBtn').disabled = false;
     document.getElementById('captureBtn').disabled = true;
-    setStatus('后端连续采集已启动，等待最新帧...', 'ok');
+    updateStreamStatus(status);
+    setStatus('连续采集已启动，等待最新帧...', 'ok');
     streamTimer = setInterval(pollBackendStreamLatest, 80);
   } catch (err) {
     setStatus(String(err.message || err), 'error');
@@ -476,7 +457,8 @@ async function startBackendStream() {
 
 async function stopBackendStream() {
   try {
-    await postJson('/api/stream/stop', {});
+    const status = await postJson('/api/stream/stop', {});
+    updateStreamStatus(status);
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   } finally {
@@ -493,6 +475,7 @@ function stopBackendStreamUiOnly() {
   document.getElementById('streamStartBtn').disabled = false;
   document.getElementById('streamStopBtn').disabled = true;
   document.getElementById('captureBtn').disabled = false;
+  updateStreamStatus({running: false, frame_id: streamLastFrameId});
 }
 
 async function pollBackendStreamLatest() {
@@ -513,10 +496,16 @@ async function pollBackendStreamLatest() {
     latestFrame = frame;
     latestMeasurement = null;
     document.getElementById('saveBtn').disabled = false;
+    updateStreamStatus({
+      running: true,
+      frame_id: frame.frame_id,
+      frame_duration_ms: frame.frame_duration_ms,
+      frame_rate_hz: frame.frame_rate_hz,
+    });
     renderPlots();
     updateFrameInfo();
     await measurePeaks();
-    setStatus(`后端连续采集中，最新帧 #${streamLastFrameId}。`, 'ok');
+    setStatus(`连续采集中，最新帧 #${streamLastFrameId}。`, 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
     stopBackendStreamUiOnly();
@@ -725,13 +714,24 @@ function updatePeakTable() {
 function updateFrameInfo() {
   if (!latestFrame) return;
   const trig = latestFrame.trigger_enabled
-    ? `  trigger=${latestFrame.trigger_source} ${latestFrame.trigger_edge}`
+    ? `  trigger=${latestFrame.trigger_source} ${latestFrame.trigger_edge} ${latestFrame.trigger_mode || 'start_only'}`
     : '  trigger=off';
+  const frameMs = latestFrame.frame_duration_ms !== undefined
+    ? `  frame=${formatNumber(latestFrame.frame_duration_ms, 3)} ms`
+    : '';
+  const frameHz = latestFrame.frame_rate_hz !== undefined
+    ? `  fps=${formatNumber(latestFrame.frame_rate_hz, 3)} Hz`
+    : '';
   document.getElementById('frameInfo').textContent =
-    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${trig}`;
+    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${frameMs}${frameHz}${trig}`;
 }
 
 window.addEventListener('resize', resizeAndDraw);
+for (const id of ['rate', 'samples']) {
+  document.getElementById(id).addEventListener('input', updateDerivedTimingFromInputs);
+}
+updateDerivedTimingFromInputs();
+updateStreamStatus({running: false, frame_id: 0});
 updatePeakTable();
 </script>
 </body>
