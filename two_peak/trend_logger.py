@@ -1,7 +1,7 @@
 """手动面积慢漂记录器。
 
 这个模块只负责一件事：在后端长期记录手动面积的慢漂趋势。
-它不直接访问 nidaqmx，而是通过 Usb6363Client 读取底层 frame_stream 的最新帧。
+它不直接访问 nidaqmx，而是通过 Usb6363Client 读取统一 AI 流的最新帧。
 
 第一版刻意保持简单：
 - 只记录一个手动面积窗口。
@@ -65,6 +65,8 @@ class AreaTrendLogger:
         window_frames: int = 200,
         record_hz: float = 1.0,
         poll_interval: float = 0.05,
+        stream_source: str = "unified_stream",
+        channels: list[str] | None = None,
     ) -> dict[str, Any]:
         """启动长期记录。
 
@@ -98,6 +100,8 @@ class AreaTrendLogger:
                 "window_frames": int(window_frames),
                 "record_hz": float(record_hz),
                 "poll_interval": float(poll_interval),
+                "stream_source": str(stream_source),
+                "channels": list(channels or []),
             }
 
             stop_event = threading.Event()
@@ -177,15 +181,15 @@ class AreaTrendLogger:
 
                 while not stop_event.is_set():
                     try:
-                        status = self._daq.get_ai_frame_stream_status()
+                        status = self._get_stream_status(settings)
                         frame_id = int(status.get("frame_id", 0))
                         if status.get("running") is not True and not status.get("has_frame"):
-                            self._set_error("frame stream is not running and has no frame")
+                            self._set_error("AI stream is not running and has no frame")
                             time.sleep(float(settings["poll_interval"]))
                             continue
 
                         if frame_id > last_seen_frame_id:
-                            frame = self._daq.get_ai_frame_stream_latest()
+                            frame = self._get_stream_latest(settings)
                             sample = self._measure_frame(frame, settings)
                             samples.append(sample)
                             last_seen_frame_id = sample.frame_id
@@ -216,6 +220,26 @@ class AreaTrendLogger:
             with self._lock:
                 if self._thread is threading.current_thread():
                     self._running = False
+
+    def _get_stream_status(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """读取当前面积慢漂记录所依赖的数据流状态。"""
+
+        if settings.get("stream_source") == "unified_stream":
+            return self._daq.get_unified_ai_stream_status()
+        return self._daq.get_ai_frame_stream_status()
+
+    def _get_stream_latest(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """读取当前数据流的最新帧，并按需要过滤到 WebUI 选择的通道。"""
+
+        if settings.get("stream_source") == "unified_stream":
+            frame = self._daq.get_unified_ai_stream_latest_frame()
+        else:
+            frame = self._daq.get_ai_frame_stream_latest()
+
+        channels = settings.get("channels") or []
+        if channels:
+            frame = _filter_frame_channels(frame, [str(channel) for channel in channels])
+        return frame
 
     def _measure_frame(self, frame: dict[str, Any], settings: dict[str, Any]) -> AreaTrendSample:
         """从一帧波形里计算手动面积。"""
@@ -302,6 +326,49 @@ def _relative_percent(std_or_delta: float, mean: float) -> float | None:
     if abs(mean) < 1e-30:
         return None
     return float(std_or_delta / abs(mean) * 100.0)
+
+
+def _channel_short_name(channel: str) -> str:
+    """把 Dev2/ai1、ai1 这两种写法统一成 ai1。"""
+
+    return str(channel).strip().split("/")[-1].lower()
+
+
+def _filter_frame_channels(frame: dict[str, Any], requested_channels: list[str]) -> dict[str, Any]:
+    """把统一流的大帧裁成双峰查看器当前选择的通道。"""
+
+    frame_channels = [str(channel) for channel in frame.get("channels", [])]
+    frame_values = frame.get("values", [])
+    if len(frame_channels) != len(frame_values):
+        raise RuntimeError("latest frame channels and values length do not match")
+
+    selected_channels: list[str] = []
+    selected_values: list[Any] = []
+    used_indices: set[int] = set()
+    for requested in requested_channels:
+        requested_short = _channel_short_name(requested)
+        match_index = None
+        for index, channel in enumerate(frame_channels):
+            if index in used_indices:
+                continue
+            if _channel_short_name(channel) == requested_short:
+                match_index = index
+                break
+        if match_index is None:
+            raise RuntimeError(
+                f"latest frame does not contain requested channel {requested}; "
+                f"available channels are {frame_channels}"
+            )
+        used_indices.add(match_index)
+        selected_channels.append(frame_channels[match_index])
+        selected_values.append(frame_values[match_index])
+
+    filtered = dict(frame)
+    filtered["source_channels"] = frame_channels
+    filtered["channels"] = selected_channels
+    filtered["values"] = selected_values
+    filtered["channel_count"] = len(selected_channels)
+    return filtered
 
 
 def _csv_fieldnames() -> list[str]:

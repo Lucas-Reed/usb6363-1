@@ -155,37 +155,6 @@ def _ensure_unified_has_channels(status: dict[str, Any], requested_channels: lis
         )
 
 
-def capture_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
-    """调用底层 API 同步采集一帧。"""
-
-    channels = parse_channels(body.get("channels", ["ai0", "ai1"]))
-    samples = int(body.get("samples", 5000))
-    rate = float(body.get("rate", 50_000.0))
-    terminal_config = str(body.get("terminal_config", "DIFF"))
-    min_val = float(body.get("min_val", -5.0))
-    max_val = float(body.get("max_val", 5.0))
-    timeout = float(body.get("timeout", 10.0))
-    trigger_enabled = bool_value(body.get("trigger_enabled", False))
-    trigger_source = str(body.get("trigger_source", "PFI0"))
-    trigger_edge = str(body.get("trigger_edge", "RISING"))
-
-    frame = state.daq.capture_ai_frame(
-        channels=channels,
-        samples=samples,
-        rate=rate,
-        terminal_config=terminal_config,
-        min_val=min_val,
-        max_val=max_val,
-        timeout=timeout,
-        trigger_enabled=trigger_enabled,
-        trigger_source=trigger_source,
-        trigger_edge=trigger_edge,
-    )
-    frame["captured_by"] = "two_peak_viewer"
-    frame["viewer_received_at"] = time.time()
-    return frame
-
-
 def start_frame_stream(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """通过底层 API 启动固定点数分帧连续采集。"""
 
@@ -245,8 +214,15 @@ def get_frame_stream_status(state: ViewerState) -> dict[str, Any]:
 def get_frame_stream_latest(state: ViewerState, body: dict[str, Any] | None = None) -> dict[str, Any]:
     """通过底层 API 获取最新帧，并同步到查看器状态。"""
 
+    requested_source = stream_source_from_body(body) if body and body.get("stream_source") else None
     status = get_frame_stream_status(state)
-    if status.get("stream_source") == "unified_stream":
+    if requested_source == "unified_stream":
+        unified_status = state.daq.get_unified_ai_stream_status()
+        if not unified_status.get("running") and not unified_status.get("has_frame"):
+            raise RuntimeError("统一 AI 流未运行。请先在统一 AI 控制台启动统一流。")
+        frame = state.daq.get_unified_ai_stream_latest_frame()
+        frame["captured_by"] = "usb6363_unified_stream"
+    elif status.get("stream_source") == "unified_stream":
         frame = state.daq.get_unified_ai_stream_latest_frame()
         frame["captured_by"] = "usb6363_unified_stream"
     else:
@@ -281,6 +257,8 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         window_frames=int(body.get("window_frames", 200)),
         record_hz=float(body.get("record_hz", 1.0)),
         poll_interval=float(body.get("poll_interval", 0.05)),
+        stream_source=stream_source_from_body(body),
+        channels=parse_channels(body.get("channels", ["ai0", "ai1"])),
     )
 
 

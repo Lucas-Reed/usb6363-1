@@ -11,7 +11,6 @@ from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 from two_peak.viewer_capture import (
-    capture_frame,
     frame_summary,
     get_area_trend_status,
     get_frame_stream_latest,
@@ -70,6 +69,7 @@ def make_handler(state: ViewerState):
                             state,
                             {
                                 "channels": query.get("channels", [""])[0],
+                                "stream_source": query.get("stream_source", [""])[0],
                             },
                         )
                     )
@@ -86,13 +86,7 @@ def make_handler(state: ViewerState):
             """处理会改变查看器状态的 API。"""
 
             try:
-                if self.path == "/api/capture":
-                    body = self._read_json()
-                    frame = capture_frame(state, body)
-                    state.latest_frame = frame
-                    state.latest_measurement = None
-                    self._send_json(frame)
-                elif self.path == "/api/stream/start":
+                if self.path == "/api/stream/start":
                     body = self._read_json()
                     self._send_json(start_frame_stream(state, body))
                 elif self.path == "/api/stream/stop":

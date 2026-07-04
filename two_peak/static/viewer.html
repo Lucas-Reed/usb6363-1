@@ -231,7 +231,7 @@
   <input id="resync_every_frames" type="number" value="0" min="0" step="1">
 
   <div class="actions">
-    <button id="captureBtn" onclick="captureFrame()">采集一帧</button>
+    <button id="captureBtn" onclick="captureFrame()">抓取最新帧</button>
     <button class="green" id="saveBtn" onclick="saveFrame()" disabled>保存样本</button>
   </div>
 
@@ -243,11 +243,7 @@
   </div>
 
   <h2>连续采集</h2>
-  <label>采集来源</label>
-  <select id="stream_source">
-    <option value="frame_stream">frame_stream：双峰查看器独占采集</option>
-    <option value="unified_stream">unified_stream：读取/启动统一 AI 流</option>
-  </select>
+  <input id="stream_source" type="hidden" value="unified_stream">
   <div class="grid2">
     <div>
       <label>连续状态</label>
@@ -612,24 +608,25 @@ function updateStreamStatus(status) {
 }
 
 async function captureFrame() {
-  if (streamRunning) {
-    await stopBackendStream();
-  }
   const btn = document.getElementById('captureBtn');
   const streamStartBtn = document.getElementById('streamStartBtn');
   btn.disabled = true;
   streamStartBtn.disabled = true;
   const params = getCaptureParams();
-  const prefix = params.trigger_enabled ? `等待 ${params.trigger_source} ${params.trigger_edge} 后采集...` : '正在采集一帧...';
-  setStatus(prefix, '');
+  setStatus('正在从统一 AI 流抓取最新一帧...', '');
   try {
-    latestFrame = await postJson('/api/capture', params);
+    const selectedChannels = encodeURIComponent(params.channels);
+    const response = await fetch(`/api/stream/latest?stream_source=unified_stream&channels=${selectedChannels}`);
+    latestFrame = await response.json();
+    if (!response.ok || latestFrame.ok === false) {
+      throw new Error(latestFrame.error || '抓取统一 AI 流最新帧失败');
+    }
     latestMeasurement = null;
     document.getElementById('saveBtn').disabled = false;
     renderPlots();
     updateFrameInfo();
     await measurePeaks();
-    setStatus('采集完成。', 'ok');
+    setStatus('已抓取统一 AI 流最新帧。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   } finally {
@@ -772,7 +769,10 @@ async function refreshTrendStatus(showStatus = false) {
 }
 
 async function startAreaTrend() {
-  const params = getTrendParams();
+  const params = {
+    ...getCaptureParams(),
+    ...getTrendParams(),
+  };
   if (params.area_left === '' || params.area_right === '') {
     setStatus('请先设置手动面积的左右零点。', 'error');
     return;
@@ -805,7 +805,7 @@ async function pollBackendStreamLatest() {
   if (!streamRunning) return;
   try {
     const selectedChannels = encodeURIComponent(document.getElementById('channels').value);
-    const response = await fetch(`/api/stream/latest?channels=${selectedChannels}`);
+    const response = await fetch(`/api/stream/latest?stream_source=unified_stream&channels=${selectedChannels}`);
     const frame = await response.json();
     if (!response.ok || frame.ok === false) {
       const statusResponse = await fetch('/api/stream/status');
