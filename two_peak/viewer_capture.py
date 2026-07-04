@@ -130,6 +130,31 @@ def _filter_frame_channels(frame: dict[str, Any], requested_channels: list[str])
     return filtered
 
 
+def _ensure_unified_has_channels(status: dict[str, Any], requested_channels: list[str]) -> None:
+    """确认统一 AI 流包含双峰查看器想读取的通道。
+
+    注意：这里只检查，不修改统一流配置。统一流真实采哪些通道，只能由统一 AI 控制台决定。
+    """
+
+    settings = status.get("settings") or {}
+    available = settings.get("channels") or status.get("channels") or []
+    if not available:
+        sample_counts = status.get("sample_counts") or {}
+        available = list(sample_counts)
+    available_short = {_channel_short_name(channel) for channel in available}
+    missing = [
+        channel
+        for channel in requested_channels
+        if _channel_short_name(channel) not in available_short
+    ]
+    if missing:
+        raise RuntimeError(
+            f"统一 AI 流没有包含双峰查看器选择的通道 {missing}。"
+            f"当前统一流通道为：{available}。"
+            "请先在统一 AI 控制台中设置并启动包含这些通道的统一流。"
+        )
+
+
 def capture_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """调用底层 API 同步采集一帧。"""
 
@@ -167,6 +192,13 @@ def start_frame_stream(state: ViewerState, body: dict[str, Any]) -> dict[str, An
     source = stream_source_from_body(body)
     channels = parse_channels(body.get("channels", ["ai0", "ai1"]))
 
+    if source == "unified_stream":
+        status = state.daq.get_unified_ai_stream_status()
+        if not status.get("running"):
+            raise RuntimeError("统一 AI 流未运行。请先在统一 AI 控制台启动统一流。")
+        _ensure_unified_has_channels(status, channels)
+        return _status_with_source(status, "unified_stream")
+
     common_kwargs = {
         "channels": channels,
         "samples_per_frame": int(body.get("samples_per_frame", body.get("samples", 5000))),
@@ -181,12 +213,6 @@ def start_frame_stream(state: ViewerState, body: dict[str, Any]) -> dict[str, An
         "resync_every_frames": int(body.get("resync_every_frames", 0)),
     }
 
-    if source == "unified_stream":
-        status = state.daq.get_unified_ai_stream_status()
-        if status.get("running"):
-            return _status_with_source(status, "unified_stream")
-        return _status_with_source(state.daq.start_unified_ai_stream(**common_kwargs), "unified_stream")
-
     return _status_with_source(state.daq.start_ai_frame_stream(**common_kwargs), "frame_stream")
 
 
@@ -195,7 +221,10 @@ def stop_frame_stream(state: ViewerState, body: dict[str, Any] | None = None) ->
 
     source = stream_source_from_body(body)
     if source == "unified_stream":
-        return _status_with_source(state.daq.stop_unified_ai_stream(), "unified_stream")
+        status = _status_with_source(state.daq.get_unified_ai_stream_status(), "unified_stream")
+        status["running"] = False
+        status["viewer_detached"] = True
+        return status
     return _status_with_source(state.daq.stop_ai_frame_stream(), "frame_stream")
 
 
