@@ -53,6 +53,32 @@ def bool_value(value: Any) -> bool:
     raise ValueError(f"Invalid boolean value: {value!r}")
 
 
+def stream_source_from_body(body: dict[str, Any] | None) -> str:
+    """读取前端选择的连续采集来源。
+
+    frame_stream:
+        旧模式，双峰查看器独占启动一个固定点数分帧 AI 采集。
+    unified_stream:
+        新模式，双峰查看器读取统一 AI 流；统一流可以同时被功率慢漂等模块消费。
+    """
+
+    source = str((body or {}).get("stream_source", "frame_stream"))
+    if source not in ("frame_stream", "unified_stream"):
+        raise ValueError("stream_source must be frame_stream or unified_stream")
+    return source
+
+
+def _status_with_source(status: dict[str, Any], source: str) -> dict[str, Any]:
+    """给底层状态补一个来源标记，方便前端显示和调试。"""
+
+    result = dict(status)
+    result["stream_source"] = source
+    settings = result.get("settings") or {}
+    if "channels" not in result and isinstance(settings, dict):
+        result["channels"] = settings.get("channels")
+    return result
+
+
 def capture_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """调用底层 API 同步采集一帧。"""
 
@@ -87,39 +113,65 @@ def capture_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
 def start_frame_stream(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """通过底层 API 启动固定点数分帧连续采集。"""
 
+    source = stream_source_from_body(body)
     channels = parse_channels(body.get("channels", ["ai0", "ai1"]))
-    return state.daq.start_ai_frame_stream(
-        channels=channels,
-        samples_per_frame=int(body.get("samples_per_frame", body.get("samples", 5000))),
-        rate=float(body.get("rate", 50_000.0)),
-        terminal_config=str(body.get("terminal_config", "DIFF")),
-        min_val=float(body.get("min_val", -5.0)),
-        max_val=float(body.get("max_val", 5.0)),
-        timeout=float(body.get("timeout", 10.0)),
-        trigger_enabled=bool_value(body.get("trigger_enabled", False)),
-        trigger_source=str(body.get("trigger_source", "PFI0")),
-        trigger_edge=str(body.get("trigger_edge", "RISING")),
-        resync_every_frames=int(body.get("resync_every_frames", 0)),
-    )
+
+    common_kwargs = {
+        "channels": channels,
+        "samples_per_frame": int(body.get("samples_per_frame", body.get("samples", 5000))),
+        "rate": float(body.get("rate", 50_000.0)),
+        "terminal_config": str(body.get("terminal_config", "DIFF")),
+        "min_val": float(body.get("min_val", -5.0)),
+        "max_val": float(body.get("max_val", 5.0)),
+        "timeout": float(body.get("timeout", 10.0)),
+        "trigger_enabled": bool_value(body.get("trigger_enabled", False)),
+        "trigger_source": str(body.get("trigger_source", "PFI0")),
+        "trigger_edge": str(body.get("trigger_edge", "RISING")),
+        "resync_every_frames": int(body.get("resync_every_frames", 0)),
+    }
+
+    if source == "unified_stream":
+        status = state.daq.get_unified_ai_stream_status()
+        if status.get("running"):
+            return _status_with_source(status, "unified_stream")
+        return _status_with_source(state.daq.start_unified_ai_stream(**common_kwargs), "unified_stream")
+
+    return _status_with_source(state.daq.start_ai_frame_stream(**common_kwargs), "frame_stream")
 
 
-def stop_frame_stream(state: ViewerState) -> dict[str, Any]:
+def stop_frame_stream(state: ViewerState, body: dict[str, Any] | None = None) -> dict[str, Any]:
     """通过底层 API 停止固定点数分帧连续采集。"""
 
-    return state.daq.stop_ai_frame_stream()
+    source = stream_source_from_body(body)
+    if source == "unified_stream":
+        return _status_with_source(state.daq.stop_unified_ai_stream(), "unified_stream")
+    return _status_with_source(state.daq.stop_ai_frame_stream(), "frame_stream")
 
 
 def get_frame_stream_status(state: ViewerState) -> dict[str, Any]:
     """通过底层 API 查询固定点数分帧连续采集状态。"""
 
-    return state.daq.get_ai_frame_stream_status()
+    frame_status = state.daq.get_ai_frame_stream_status()
+    if frame_status.get("running"):
+        return _status_with_source(frame_status, "frame_stream")
+
+    unified_status = state.daq.get_unified_ai_stream_status()
+    if unified_status.get("running"):
+        return _status_with_source(unified_status, "unified_stream")
+
+    return _status_with_source(frame_status, "frame_stream")
 
 
 def get_frame_stream_latest(state: ViewerState) -> dict[str, Any]:
     """通过底层 API 获取最新帧，并同步到查看器状态。"""
 
-    frame = state.daq.get_ai_frame_stream_latest()
-    frame["captured_by"] = "usb6363_frame_stream"
+    status = get_frame_stream_status(state)
+    if status.get("stream_source") == "unified_stream":
+        frame = state.daq.get_unified_ai_stream_latest_frame()
+        frame["captured_by"] = "usb6363_unified_stream"
+    else:
+        frame = state.daq.get_ai_frame_stream_latest()
+        frame["captured_by"] = "usb6363_frame_stream"
     frame["viewer_received_at"] = time.time()
     state.latest_frame = frame
     state.latest_measurement = None

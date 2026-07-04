@@ -243,6 +243,11 @@
   </div>
 
   <h2>连续采集</h2>
+  <label>采集来源</label>
+  <select id="stream_source">
+    <option value="frame_stream">frame_stream：双峰查看器独占采集</option>
+    <option value="unified_stream">unified_stream：读取/启动统一 AI 流</option>
+  </select>
   <div class="grid2">
     <div>
       <label>连续状态</label>
@@ -414,6 +419,7 @@ let manualAreaHistory = [];
 
 function getCaptureParams() {
   return {
+    stream_source: document.getElementById('stream_source').value,
     channels: document.getElementById('channels').value,
     rate: Number(document.getElementById('rate').value),
     samples: Number(document.getElementById('samples').value),
@@ -492,6 +498,7 @@ function applyDefaultsToUi(defaults) {
   setInputValue('trigger_source', defaults.trigger_source);
   setInputValue('trigger_edge', defaults.trigger_edge);
   setInputValue('resync_every_frames', defaults.resync_every_frames);
+  setInputValue('stream_source', defaults.stream_source);
   if (defaults.peak_indices) {
     setInputValue('peak0', defaults.peak_indices[0]);
     setInputValue('peak1', defaults.peak_indices[1]);
@@ -590,7 +597,11 @@ function updateStreamStatus(status) {
   const running = Boolean(status && status.running);
   const frameId = status && status.frame_id !== undefined ? status.frame_id : streamLastFrameId;
   const error = status && status.error ? `错误：${status.error}` : '';
-  document.getElementById('stream_status').value = error || (running ? '运行中' : '停止');
+  const source = status && status.stream_source ? status.stream_source : document.getElementById('stream_source').value;
+  if (status && status.stream_source) {
+    document.getElementById('stream_source').value = status.stream_source;
+  }
+  document.getElementById('stream_status').value = error || (running ? `运行中 / ${source}` : `停止 / ${source}`);
   document.getElementById('stream_frame_id').value = frameId || 0;
   if (status && status.frame_duration_ms !== null && status.frame_duration_ms !== undefined) {
     document.getElementById('frame_duration_ms').value = formatNumber(status.frame_duration_ms, 3);
@@ -655,7 +666,9 @@ async function startBackendStream() {
 
 async function stopBackendStream() {
   try {
-    const status = await postJson('/api/stream/stop', {});
+    const status = await postJson('/api/stream/stop', {
+      stream_source: document.getElementById('stream_source').value,
+    });
     updateStreamStatus(status);
   } catch (err) {
     setStatus(String(err.message || err), 'error');

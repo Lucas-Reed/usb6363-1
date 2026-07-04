@@ -84,7 +84,8 @@ def make_handler(state: ViewerState):
                     body = self._read_json()
                     self._send_json(start_frame_stream(state, body))
                 elif self.path == "/api/stream/stop":
-                    self._send_json(stop_frame_stream(state))
+                    body = self._read_json()
+                    self._send_json(stop_frame_stream(state, body))
                 elif self.path == "/api/trend/start":
                     body = self._read_json()
                     self._send_json(start_area_trend(state, body))
