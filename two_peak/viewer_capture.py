@@ -298,6 +298,8 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
     peak_mode = str(body.get("peak_mode", "height"))
     manual_area_left = body.get("manual_area_left")
     manual_area_right = body.get("manual_area_right")
+    manual_area2_left = body.get("manual_area2_left")
+    manual_area2_right = body.get("manual_area2_right")
     analysis_channel_index = int(body.get("analysis_channel_index", 0))
     if analysis_channel_index < 0 or analysis_channel_index >= values.shape[0]:
         raise ValueError("analysis_channel_index is out of range")
@@ -313,6 +315,7 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
     )
 
     manual_area = None
+    manual_areas: list[dict[str, Any]] = []
     if manual_area_left not in (None, "") and manual_area_right not in (None, ""):
         # 手动面积是一个单独的、最朴素的监测量：
         # 只对原始波形直接求和，不使用上面的平滑波形。
@@ -323,6 +326,22 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
                 right_index=int(manual_area_right),
             )
         )
+        area_a = dict(manual_area)
+        area_a["name"] = "A"
+        manual_areas.append(area_a)
+
+    if manual_area2_left not in (None, "") and manual_area2_right not in (None, ""):
+        # 第二个面积窗口用于同时观察两个峰。
+        # 这里依然只做原始点值求和，不扣本底、不滤波，便于和第一个窗口直接比较。
+        area_b = asdict(
+            measure_manual_area(
+                analysis_signal,
+                left_index=int(manual_area2_left),
+                right_index=int(manual_area2_right),
+            )
+        )
+        area_b["name"] = "B"
+        manual_areas.append(area_b)
 
     return {
         "analysis_channel_index": analysis_channel_index,
@@ -334,6 +353,7 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
         "peak_mode": peak_mode,
         "measurements": [asdict(item) for item in measurements],
         "manual_area": manual_area,
+        "manual_areas": manual_areas,
     }
 
 

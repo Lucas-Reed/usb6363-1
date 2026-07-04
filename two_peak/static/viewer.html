@@ -292,6 +292,8 @@
     <option value="1">P2</option>
     <option value="area_left">面积左零点</option>
     <option value="area_right">面积右零点</option>
+    <option value="area2_left">面积 B 左零点</option>
+    <option value="area2_right">面积 B 右零点</option>
   </select>
   <div class="grid2">
     <div>
@@ -311,6 +313,16 @@
     <div>
       <label>面积右零点</label>
       <input id="manual_area_right" type="number" value="" step="1" placeholder="点击或手填">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>面积 B 左零点</label>
+      <input id="manual_area2_left" type="number" value="" step="1" placeholder="点击或手填">
+    </div>
+    <div>
+      <label>面积 B 右零点</label>
+      <input id="manual_area2_right" type="number" value="" step="1" placeholder="点击或手填">
     </div>
   </div>
 
@@ -358,6 +370,14 @@
     <tbody id="manualAreaRows">
       <tr><td>面积</td><td>--</td></tr>
       <tr><td>最近抖动</td><td>--</td></tr>
+    </tbody>
+  </table>
+  <h2>双面积统计</h2>
+  <table>
+    <thead><tr><th>窗口</th><th>范围</th><th>当前</th><th>最近均值/标准差</th></tr></thead>
+    <tbody id="dualAreaRows">
+      <tr><td>A</td><td>--</td><td>--</td><td>--</td></tr>
+      <tr><td>B</td><td>--</td><td>--</td><td>--</td></tr>
     </tbody>
   </table>
 
@@ -412,6 +432,7 @@ let trendTimer = null;
 let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
+let manualArea2History = [];
 
 function getCaptureParams() {
   return {
@@ -443,6 +464,8 @@ function getMeasureParams() {
     peak_mode: document.getElementById('peak_mode').value,
     manual_area_left: document.getElementById('manual_area_left').value,
     manual_area_right: document.getElementById('manual_area_right').value,
+    manual_area2_left: document.getElementById('manual_area2_left').value,
+    manual_area2_right: document.getElementById('manual_area2_right').value,
   };
 }
 
@@ -503,6 +526,8 @@ function applyDefaultsToUi(defaults) {
   setInputValue('peak1', defaults.peak1);
   setInputValue('manual_area_left', defaults.manual_area_left);
   setInputValue('manual_area_right', defaults.manual_area_right);
+  setInputValue('manual_area2_left', defaults.manual_area2_left);
+  setInputValue('manual_area2_right', defaults.manual_area2_right);
   setInputValue('analysis_channel_index', defaults.analysis_channel_index);
   setInputValue('smooth_window', defaults.smooth_window);
   setInputValue('search_window_half', defaults.search_window_half || defaults.window_half);
@@ -843,9 +868,10 @@ async function measurePeaks() {
   }
   try {
     latestMeasurement = await postJson('/api/measure', getMeasureParams());
-    updateManualAreaHistory();
+    updateDualAreaHistory();
     updatePeakTable();
     updateManualAreaTable();
+    updateDualAreaTable();
     renderPlots();
     setStatus('测峰完成。', 'ok');
   } catch (err) {
@@ -916,6 +942,7 @@ async function loadSavedSample() {
     updateFrameInfo();
     updatePeakTable();
     updateManualAreaTable();
+    updateDualAreaTable();
     setStatus('历史样本已加载。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
@@ -925,8 +952,10 @@ async function loadSavedSample() {
 function clearPeaks() {
   latestMeasurement = null;
   manualAreaHistory = [];
+  manualArea2History = [];
   updatePeakTable();
   updateManualAreaTable();
+  updateDualAreaTable();
   renderPlots();
 }
 
@@ -1078,20 +1107,22 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
   });
 
   const areaEdges = [
-    {id: 'manual_area_left', label: 'A-L'},
-    {id: 'manual_area_right', label: 'A-R'},
+    {id: 'manual_area_left', label: 'A-L', color: '#7c3aed'},
+    {id: 'manual_area_right', label: 'A-R', color: '#7c3aed'},
+    {id: 'manual_area2_left', label: 'B-L', color: '#16803c'},
+    {id: 'manual_area2_right', label: 'B-R', color: '#16803c'},
   ];
   areaEdges.forEach(edge => {
     const idx = Number(document.getElementById(edge.id).value);
     if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
     const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
-    ctx.strokeStyle = '#7c3aed';
+    ctx.strokeStyle = edge.color;
     ctx.lineWidth = 1.2 * devicePixelRatio;
     ctx.beginPath();
     ctx.moveTo(x, y0);
     ctx.lineTo(x, y0 + plotH);
     ctx.stroke();
-    ctx.fillStyle = '#7c3aed';
+    ctx.fillStyle = edge.color;
     ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
     ctx.fillText(edge.label, x + 4 * devicePixelRatio, y0 + 32 * devicePixelRatio);
   });
@@ -1124,6 +1155,14 @@ function handlePlotClick(event, channelIndex) {
     document.getElementById('manual_area_right').value = idx;
     document.getElementById('pick_target').value = 'area_left';
     manualAreaHistory = [];
+  } else if (target === 'area2_left') {
+    document.getElementById('manual_area2_left').value = idx;
+    document.getElementById('pick_target').value = 'area2_right';
+    manualArea2History = [];
+  } else if (target === 'area2_right') {
+    document.getElementById('manual_area2_right').value = idx;
+    document.getElementById('pick_target').value = 'area2_left';
+    manualArea2History = [];
   } else {
     document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
     document.getElementById('pick_target').value = target === '0' ? '1' : '0';
@@ -1172,6 +1211,30 @@ function updateManualAreaHistory() {
   }
 }
 
+function getAreaByName(name) {
+  const areas = latestMeasurement && Array.isArray(latestMeasurement.manual_areas)
+    ? latestMeasurement.manual_areas
+    : [];
+  return areas.find(area => area.name === name) || null;
+}
+
+function pushAreaHistory(history, area) {
+  if (!area) return history;
+  const value = Number(area.value);
+  if (!Number.isFinite(value)) return history;
+  const next = [...history, value];
+  return next.length > 200 ? next.slice(-200) : next;
+}
+
+function updateDualAreaHistory() {
+  // A 窗口复用旧 manual_area；B 窗口读取新增 manual_areas 里的 B。
+  // 这里只保存最近 200 帧，目的是看 shot-to-shot 抖动，不做长期存档。
+  const areaA = getAreaByName('A') || (latestMeasurement ? latestMeasurement.manual_area : null);
+  const areaB = getAreaByName('B');
+  manualAreaHistory = pushAreaHistory(manualAreaHistory, areaA);
+  manualArea2History = pushAreaHistory(manualArea2History, areaB);
+}
+
 function updateManualAreaTable() {
   const rows = document.getElementById('manualAreaRows');
   const area = latestMeasurement ? latestMeasurement.manual_area : null;
@@ -1192,6 +1255,37 @@ function updateManualAreaTable() {
     <tr><td>面积</td><td>${Number(area.value).toExponential(6)}</td></tr>
     <tr><td>最近均值</td><td>${mean.toExponential(6)}</td></tr>
     <tr><td>最近标准差</td><td>${std.toExponential(6)} / ${manualAreaHistory.length} 帧</td></tr>
+  `;
+}
+
+function areaStats(history, area) {
+  if (!area) {
+    return {
+      range: '--',
+      current: '--',
+      stats: '--',
+    };
+  }
+  const values = history.length ? history : [Number(area.value)];
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+  const std = Math.sqrt(variance);
+  return {
+    range: `${area.left_index}-${area.right_index}，${area.point_count} 点`,
+    current: Number(area.value).toExponential(6),
+    stats: `${mean.toExponential(6)} / ${std.toExponential(6)} / ${values.length} 帧`,
+  };
+}
+
+function updateDualAreaTable() {
+  const rows = document.getElementById('dualAreaRows');
+  const areaA = getAreaByName('A') || (latestMeasurement ? latestMeasurement.manual_area : null);
+  const areaB = getAreaByName('B');
+  const statsA = areaStats(manualAreaHistory, areaA);
+  const statsB = areaStats(manualArea2History, areaB);
+  rows.innerHTML = `
+    <tr><td>A</td><td>${statsA.range}</td><td>${statsA.current}</td><td>${statsA.stats}</td></tr>
+    <tr><td>B</td><td>${statsB.range}</td><td>${statsB.current}</td><td>${statsB.stats}</td></tr>
   `;
 }
 
@@ -1217,10 +1311,15 @@ window.addEventListener('resize', resizeAndDraw);
 for (const id of ['rate', 'samples']) {
   document.getElementById(id).addEventListener('input', updateDerivedTimingFromInputs);
 }
-for (const id of ['manual_area_left', 'manual_area_right']) {
+for (const id of ['manual_area_left', 'manual_area_right', 'manual_area2_left', 'manual_area2_right']) {
   document.getElementById(id).addEventListener('input', () => {
-    manualAreaHistory = [];
+    if (id.startsWith('manual_area2')) {
+      manualArea2History = [];
+    } else {
+      manualAreaHistory = [];
+    }
     updateManualAreaTable();
+    updateDualAreaTable();
     renderPlots();
   });
 }
@@ -1228,6 +1327,7 @@ updateDerivedTimingFromInputs();
 updateStreamStatus({running: false, frame_id: 0});
 updatePeakTable();
 updateManualAreaTable();
+updateDualAreaTable();
 loadDefaults();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
