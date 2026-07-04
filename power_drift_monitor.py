@@ -127,12 +127,11 @@ class PowerDriftMonitor:
             settings = unified_status.get("settings") or {}
             channels = settings.get("channels") or unified_status.get("channels") or []
             requested = self.settings.channel
-            if channels and not _ai_channel_in_list(requested, channels):
+            requested_full = requested if "/" in requested else f"Dev2/{requested}"
+            if channels and requested not in channels and requested_full not in channels:
                 raise RuntimeError(
                     f"统一 AI 流正在运行，但没有包含功率通道 {requested}。"
-                    f"当前统一流通道为：{channels}。"
-                    "如果要监测这个通道，请先在统一 AI 控制台里把 channels 设置为包含它，"
-                    "然后重新启动统一 AI 流。"
+                    f"当前统一流通道为：{channels}"
                 )
             return
 
@@ -322,26 +321,6 @@ def _as_float_list(values: Any) -> list[float]:
     if isinstance(values, list):
         return [float(value) for value in values]
     return [float(values)]
-
-
-def _ai_channel_short_name(channel: Any) -> str:
-    """把 Dev2/ai0、ai0、AI0 都归一成 ai0，便于判断是不是同一路 AI。
-
-    这里不能硬编码 Dev2，因为以后设备名可能会变；只比较最后一段 aiN 更稳。
-    """
-
-    return str(channel).strip().split("/")[-1].lower()
-
-
-def _ai_channel_in_list(requested: str, channels: list[Any]) -> bool:
-    """判断 requested 是否包含在统一 AI 流通道列表里。
-
-    底层返回的通道可能是 Dev2/ai0，而 WebUI 里常写 ai0。
-    这两种写法在物理上是同一个通道，所以这里按短名比较。
-    """
-
-    requested_short = _ai_channel_short_name(requested)
-    return any(_ai_channel_short_name(channel) == requested_short for channel in channels)
 
 
 def _settings_for_json(settings: PowerDriftSettings) -> dict[str, Any]:
