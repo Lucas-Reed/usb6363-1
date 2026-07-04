@@ -247,13 +247,19 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
 
     area_left = body.get("area_left")
     area_right = body.get("area_right")
+    area2_left = body.get("area2_left")
+    area2_right = body.get("area2_right")
     if area_left in (None, "") or area_right in (None, ""):
         raise ValueError("area_left and area_right are required")
+    if (area2_left in (None, "")) != (area2_right in (None, "")):
+        raise ValueError("area2_left and area2_right must be set together")
 
     return state.trend_logger.start(
         analysis_channel_index=int(body.get("analysis_channel_index", 0)),
         area_left=int(area_left),
         area_right=int(area_right),
+        area2_left=None if area2_left in (None, "") else int(area2_left),
+        area2_right=None if area2_right in (None, "") else int(area2_right),
         window_frames=int(body.get("window_frames", 200)),
         record_hz=float(body.get("record_hz", 1.0)),
         poll_interval=float(body.get("poll_interval", 0.05)),

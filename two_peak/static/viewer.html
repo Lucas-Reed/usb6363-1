@@ -481,6 +481,8 @@ function getTrendParams() {
     analysis_channel_index: Number(document.getElementById('analysis_channel_index').value),
     area_left: document.getElementById('manual_area_left').value,
     area_right: document.getElementById('manual_area_right').value,
+    area2_left: document.getElementById('manual_area2_left').value,
+    area2_right: document.getElementById('manual_area2_right').value,
     window_frames: Number(document.getElementById('trend_window_frames').value),
     record_hz: Number(document.getElementById('trend_record_hz').value),
   };
@@ -758,8 +760,11 @@ function updateTrendStatus(status) {
     const shot = latest.shot2shot_rel_std_percent === null || latest.shot2shot_rel_std_percent === undefined
       ? '--'
       : `${formatNumber(latest.shot2shot_rel_std_percent, 3)}%`;
+    const area2Text = latest.area2_mean === null || latest.area2_mean === undefined
+      ? ''
+      : `  B=${Number(latest.area2_mean).toExponential(6)}`;
     document.getElementById('trend_latest').value =
-      `mean=${Number(latest.area_mean).toExponential(6)}  std=${rel}  shot=${shot}`;
+      `A=${Number(latest.area_mean).toExponential(6)}${area2Text}  A_std=${rel}  A_shot=${shot}`;
   } else {
     document.getElementById('trend_latest').value = '--';
   }
@@ -800,6 +805,10 @@ async function startAreaTrend() {
   };
   if (params.area_left === '' || params.area_right === '') {
     setStatus('请先设置手动面积的左右零点。', 'error');
+    return;
+  }
+  if ((params.area2_left === '') !== (params.area2_right === '')) {
+    setStatus('面积 B 的左右零点需要同时设置，或者同时留空。', 'error');
     return;
   }
   if (!streamRunning) {

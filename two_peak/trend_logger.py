@@ -34,6 +34,7 @@ class AreaTrendSample:
     frame_id: int
     timestamp: float
     area: float
+    area2: float | None = None
 
 
 class AreaTrendLogger:
@@ -62,6 +63,8 @@ class AreaTrendLogger:
         analysis_channel_index: int,
         area_left: int,
         area_right: int,
+        area2_left: int | None = None,
+        area2_right: int | None = None,
         window_frames: int = 200,
         record_hz: float = 1.0,
         poll_interval: float = 0.05,
@@ -73,6 +76,7 @@ class AreaTrendLogger:
         参数说明：
         - analysis_channel_index：分析哪一路 AI。
         - area_left/area_right：手动面积窗口左右边界。
+        - area2_left/area2_right：可选的第二个面积窗口，用于同时记录另一个峰。
         - window_frames：每个 CSV 点使用最近多少帧做滑动统计。
         - record_hz：每秒写几行 CSV，例如 1 Hz 表示每秒记录一次。
         - poll_interval：后端检查新帧的间隔，一般保持默认即可。
@@ -97,6 +101,8 @@ class AreaTrendLogger:
                 "analysis_channel_index": int(analysis_channel_index),
                 "area_left": int(area_left),
                 "area_right": int(area_right),
+                "area2_left": None if area2_left is None else int(area2_left),
+                "area2_right": None if area2_right is None else int(area2_right),
                 "window_frames": int(window_frames),
                 "record_hz": float(record_hz),
                 "poll_interval": float(poll_interval),
@@ -256,10 +262,19 @@ class AreaTrendLogger:
             left_index=int(settings["area_left"]),
             right_index=int(settings["area_right"]),
         )
+        measurement2 = None
+        if settings.get("area2_left") is not None and settings.get("area2_right") is not None:
+            # 第二个面积窗口和第一个完全独立，仍然使用同一帧、同一分析通道。
+            measurement2 = measure_manual_area(
+                values[channel_index],
+                left_index=int(settings["area2_left"]),
+                right_index=int(settings["area2_right"]),
+            )
         return AreaTrendSample(
             frame_id=int(frame.get("frame_id", 0)),
             timestamp=float(frame.get("finished_at", time.time())),
             area=float(measurement.value),
+            area2=None if measurement2 is None else float(measurement2.value),
         )
 
     def _build_csv_row(
@@ -272,23 +287,11 @@ class AreaTrendLogger:
         window_frames = int(settings["window_frames"])
         recent = list(samples)[-window_frames:]
         areas = np.asarray([sample.area for sample in recent], dtype=float)
+        area2_values = [sample.area2 for sample in recent if sample.area2 is not None]
         frame_ids = [sample.frame_id for sample in recent]
 
-        mean = float(np.mean(areas))
-        std = float(np.std(areas))
-        rel_std_percent = _relative_percent(std, mean)
-
-        if areas.size >= 2:
-            diffs = np.diff(areas)
-            shot2shot_std = float(np.std(diffs))
-            shot2shot_rel_std_percent = _relative_percent(shot2shot_std, mean)
-            last_delta = float(areas[-1] - areas[-2])
-            last_delta_rel_percent = _relative_percent(last_delta, mean)
-        else:
-            shot2shot_std = 0.0
-            shot2shot_rel_std_percent = None
-            last_delta = 0.0
-            last_delta_rel_percent = None
+        area_stats = _area_stats(areas)
+        area2_stats = _area_stats(np.asarray(area2_values, dtype=float)) if area2_values else {}
 
         latest = recent[-1]
         return {
@@ -300,16 +303,26 @@ class AreaTrendLogger:
             "analysis_channel_index": int(settings["analysis_channel_index"]),
             "area_left": int(settings["area_left"]),
             "area_right": int(settings["area_right"]),
+            "area2_left": settings.get("area2_left"),
+            "area2_right": settings.get("area2_right"),
             "window_frames": window_frames,
             "sample_count": int(areas.size),
             "area_current": float(areas[-1]),
-            "area_mean": mean,
-            "area_std": std,
-            "area_rel_std_percent": rel_std_percent,
-            "shot2shot_last_delta": last_delta,
-            "shot2shot_last_delta_rel_percent": last_delta_rel_percent,
-            "shot2shot_std": shot2shot_std,
-            "shot2shot_rel_std_percent": shot2shot_rel_std_percent,
+            "area_mean": area_stats["mean"],
+            "area_std": area_stats["std"],
+            "area_rel_std_percent": area_stats["rel_std_percent"],
+            "area2_current": latest.area2,
+            "area2_mean": area2_stats.get("mean"),
+            "area2_std": area2_stats.get("std"),
+            "area2_rel_std_percent": area2_stats.get("rel_std_percent"),
+            "shot2shot_last_delta": area_stats["last_delta"],
+            "shot2shot_last_delta_rel_percent": area_stats["last_delta_rel_percent"],
+            "shot2shot_std": area_stats["shot2shot_std"],
+            "shot2shot_rel_std_percent": area_stats["shot2shot_rel_std_percent"],
+            "area2_shot2shot_last_delta": area2_stats.get("last_delta"),
+            "area2_shot2shot_last_delta_rel_percent": area2_stats.get("last_delta_rel_percent"),
+            "area2_shot2shot_std": area2_stats.get("shot2shot_std"),
+            "area2_shot2shot_rel_std_percent": area2_stats.get("shot2shot_rel_std_percent"),
             "record_hz": float(settings["record_hz"]),
         }
 
@@ -326,6 +339,50 @@ def _relative_percent(std_or_delta: float, mean: float) -> float | None:
     if abs(mean) < 1e-30:
         return None
     return float(std_or_delta / abs(mean) * 100.0)
+
+
+def _area_stats(values: np.ndarray) -> dict[str, Any]:
+    """计算一个面积序列的滑动统计量。
+
+    这里被 A/B 两个面积窗口共用，避免两套公式以后不小心改得不一致。
+    """
+
+    if values.size < 1:
+        return {
+            "mean": None,
+            "std": None,
+            "rel_std_percent": None,
+            "last_delta": None,
+            "last_delta_rel_percent": None,
+            "shot2shot_std": None,
+            "shot2shot_rel_std_percent": None,
+        }
+
+    mean = float(np.mean(values))
+    std = float(np.std(values))
+    rel_std_percent = _relative_percent(std, mean)
+
+    if values.size >= 2:
+        diffs = np.diff(values)
+        shot2shot_std = float(np.std(diffs))
+        shot2shot_rel_std_percent = _relative_percent(shot2shot_std, mean)
+        last_delta = float(values[-1] - values[-2])
+        last_delta_rel_percent = _relative_percent(last_delta, mean)
+    else:
+        shot2shot_std = 0.0
+        shot2shot_rel_std_percent = None
+        last_delta = 0.0
+        last_delta_rel_percent = None
+
+    return {
+        "mean": mean,
+        "std": std,
+        "rel_std_percent": rel_std_percent,
+        "last_delta": last_delta,
+        "last_delta_rel_percent": last_delta_rel_percent,
+        "shot2shot_std": shot2shot_std,
+        "shot2shot_rel_std_percent": shot2shot_rel_std_percent,
+    }
 
 
 def _channel_short_name(channel: str) -> str:
@@ -383,15 +440,25 @@ def _csv_fieldnames() -> list[str]:
         "analysis_channel_index",
         "area_left",
         "area_right",
+        "area2_left",
+        "area2_right",
         "window_frames",
         "sample_count",
         "area_current",
         "area_mean",
         "area_std",
         "area_rel_std_percent",
+        "area2_current",
+        "area2_mean",
+        "area2_std",
+        "area2_rel_std_percent",
         "shot2shot_last_delta",
         "shot2shot_last_delta_rel_percent",
         "shot2shot_std",
         "shot2shot_rel_std_percent",
+        "area2_shot2shot_last_delta",
+        "area2_shot2shot_last_delta_rel_percent",
+        "area2_shot2shot_std",
+        "area2_shot2shot_rel_std_percent",
         "record_hz",
     ]
