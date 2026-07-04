@@ -76,6 +76,21 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/stats":
                     # 返回某个通道最近缓存数据的统计量，用于实时监测反馈。
                     self._send_json(controller.get_ai_stats(**_ai_stats_args(query)))
+                elif parsed.path == "/api/ai/unified/status":
+                    # 查询统一 AI 数据流状态。
+                    self._send_json(controller.get_unified_ai_stream_status())
+                elif parsed.path == "/api/ai/unified/latest_frame":
+                    # 读取统一 AI 数据流的最新一帧完整波形。
+                    self._send_json(controller.get_unified_ai_stream_latest_frame())
+                elif parsed.path == "/api/ai/unified/latest":
+                    # 读取统一 AI 数据流中某个通道的最近一个点。
+                    self._send_json(controller.get_unified_ai_latest(**_ai_latest_args(query)))
+                elif parsed.path == "/api/ai/unified/buffer":
+                    # 读取统一 AI 数据流中某个通道最近的一段缓存。
+                    self._send_json(controller.get_unified_ai_buffer(**_ai_buffer_args(query)))
+                elif parsed.path == "/api/ai/unified/stats":
+                    # 读取统一 AI 数据流中某个通道最近缓存的统计量。
+                    self._send_json(controller.get_unified_ai_stats(**_ai_stats_args(query)))
                 elif parsed.path == "/api/ai/frame_stream/status":
                     # 查询固定点数分帧连续采集状态。
                     self._send_json(controller.get_ai_frame_stream_status())
@@ -125,6 +140,12 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/capture_frame":
                     # 同步读取多路 AI 的一帧数据，例如双峰锁定里的 ai0/ai1。
                     self._send_json(controller.capture_ai_frame(**_ai_capture_frame_body(body)))
+                elif parsed.path == "/api/ai/unified/start":
+                    # 启动统一 AI 数据流。
+                    self._send_json(controller.start_unified_ai_stream(**_ai_frame_stream_body(body)))
+                elif parsed.path == "/api/ai/unified/stop":
+                    # 停止统一 AI 数据流。
+                    self._send_json(controller.stop_unified_ai_stream())
                 elif parsed.path == "/api/ai/frame_stream/start":
                     # 启动固定点数分帧连续采集。
                     self._send_json(controller.start_ai_frame_stream(**_ai_frame_stream_body(body)))

@@ -112,6 +112,20 @@ class DaqController:
         self._frame_stream_frame_id = 0
         self._frame_stream_settings: dict[str, Any] | None = None
 
+        # unified_ai_stream 是未来推荐使用的统一 AI 数据流。
+        # 它只打开一个真实 AI task；双峰、功率慢漂、示波器等上层模块都从这里读同一份数据。
+        self._unified_running = False
+        self._unified_error: str | None = None
+        self._unified_thread: threading.Thread | None = None
+        self._unified_stop_event: threading.Event | None = None
+        self._unified_settings: dict[str, Any] | None = None
+        self._unified_frame_id = 0
+        self._unified_latest_frame: dict[str, Any] | None = None
+        self._unified_last_update = 0.0
+        self._unified_latest: dict[str, float] = {}
+        self._unified_buffers: dict[str, deque[float]] = {}
+        self._unified_sample_counts: dict[str, int] = {}
+
     # ---------------------------------------------------------------------
     # 设备信息
     # ---------------------------------------------------------------------
@@ -153,6 +167,8 @@ class DaqController:
 
         physical_channel = self._normalize_ai_channel(channel)
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before subscribing AI channels")
             if self._frame_stream_running:
                 raise RuntimeError("Stop AI frame stream before subscribing AI channels")
             if physical_channel not in self._ai_active_channels:
@@ -166,6 +182,8 @@ class DaqController:
 
         physical_channel = self._normalize_ai_channel(channel)
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before changing subscribed AI channels")
             if self._frame_stream_running:
                 raise RuntimeError("Stop AI frame stream before changing subscribed AI channels")
             if physical_channel in self._ai_active_channels:
@@ -187,6 +205,8 @@ class DaqController:
                 normalized_channels.append(physical_channel)
 
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before setting AI channels")
             if self._frame_stream_running:
                 raise RuntimeError("Stop AI frame stream before setting AI channels")
             self._ai_active_channels = normalized_channels
@@ -198,6 +218,8 @@ class DaqController:
         """取消所有 AI 通道订阅，并停止后台连续采样。"""
 
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before clearing subscribed AI channels")
             if self._frame_stream_running:
                 raise RuntimeError("Stop AI frame stream before clearing subscribed AI channels")
             self._ai_active_channels = []
@@ -406,6 +428,8 @@ class DaqController:
 
         physical_channel = self._normalize_ai_channel(channel)
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before direct AI read")
             if self._ai_active_channels:
                 if physical_channel not in self._ai_active_channels:
                     raise RuntimeError(
@@ -508,6 +532,8 @@ class DaqController:
         started_at = time.time()
         t0 = time.perf_counter()
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before capture_ai_frame")
             if self._frame_stream_running:
                 raise RuntimeError("Stop AI frame stream before capture_ai_frame")
             if self._ai_active_channels:
@@ -610,6 +636,8 @@ class DaqController:
         frame_rate_hz = rate / samples_per_frame
 
         with self._ai_lock:
+            if self._unified_running:
+                raise RuntimeError("Stop unified AI stream before starting frame stream")
             if self._ai_active_channels or self._ai_running:
                 raise RuntimeError("Stop subscribe_ai/background AI before starting frame stream")
             if self._frame_stream_running:
@@ -682,6 +710,230 @@ class DaqController:
             if self._frame_stream_latest is None:
                 raise RuntimeError("AI frame stream has no frame yet")
             return dict(self._frame_stream_latest)
+
+    # ---------------------------------------------------------------------
+    # 统一 AI 采集流
+    # ---------------------------------------------------------------------
+    def start_unified_ai_stream(
+        self,
+        channels: list[str],
+        samples_per_frame: int = 5000,
+        rate: float = 50_000.0,
+        terminal_config: str = "DIFF",
+        min_val: float = -5.0,
+        max_val: float = 5.0,
+        timeout: float = 10.0,
+        trigger_enabled: bool = False,
+        trigger_source: str = "PFI0",
+        trigger_edge: str = "RISING",
+        resync_every_frames: int = 0,
+    ) -> dict[str, Any]:
+        """启动统一 AI 数据流。
+
+        这是未来推荐入口：底层只开一个 AI task，上层模块都读取同一份数据。
+        第一版不做自动采样率协商，由调用者手动指定全局 channels/rate/samples_per_frame。
+        """
+
+        if not channels:
+            raise ValueError("channels must not be empty")
+        if samples_per_frame < 1:
+            raise ValueError("samples_per_frame must be >= 1")
+        if rate <= 0:
+            raise ValueError("rate must be > 0")
+        if min_val >= max_val:
+            raise ValueError("min_val must be smaller than max_val")
+        if resync_every_frames < 0:
+            raise ValueError("resync_every_frames must be >= 0")
+        if resync_every_frames > 0 and not trigger_enabled:
+            raise ValueError("resync_every_frames requires trigger_enabled=True")
+
+        physical_channels: list[str] = []
+        for channel in channels:
+            physical_channel = self._normalize_ai_channel(channel)
+            if physical_channel not in physical_channels:
+                physical_channels.append(physical_channel)
+
+        self._validate_ai_rate_request(physical_channels, rate)
+
+        physical_trigger_source = None
+        if trigger_enabled:
+            physical_trigger_source = self._normalize_pfi_terminal(trigger_source)
+
+        total_json_samples = len(physical_channels) * samples_per_frame
+        if total_json_samples > AI_FRAME_MAX_JSON_SAMPLES:
+            raise ValueError(
+                f"unified latest_frame would return {total_json_samples} samples as JSON. "
+                "Reduce channel count/samples_per_frame or use stats/buffer/file APIs."
+            )
+
+        frame_duration_seconds = samples_per_frame / rate
+        frame_duration_ms = frame_duration_seconds * 1000.0
+        frame_rate_hz = rate / samples_per_frame
+
+        with self._ai_lock:
+            if self._ai_active_channels or self._ai_running:
+                raise RuntimeError("Stop subscribe_ai/background AI before starting unified AI stream")
+            if self._frame_stream_running:
+                raise RuntimeError("Stop AI frame stream before starting unified AI stream")
+            if self._unified_running:
+                raise RuntimeError("Unified AI stream is already running")
+
+            settings = {
+                "device": self.device_name,
+                "channels": physical_channels,
+                "samples_per_frame": samples_per_frame,
+                "rate_per_channel": rate,
+                "aggregate_rate": rate * len(physical_channels),
+                "terminal_config": terminal_config,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+                "trigger_enabled": trigger_enabled,
+                "trigger_source": physical_trigger_source,
+                "trigger_edge": trigger_edge,
+                "trigger_mode": "periodic_start" if resync_every_frames > 0 else ("start_only" if trigger_enabled else "off"),
+                "resync_every_frames": int(resync_every_frames),
+                "frame_duration_seconds": frame_duration_seconds,
+                "frame_duration_ms": frame_duration_ms,
+                "frame_rate_hz": frame_rate_hz,
+                "buffer_size": self._ai_buffer_size,
+            }
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._unified_ai_stream_worker,
+                args=(settings, stop_event),
+                daemon=True,
+                name="usb6363-unified-ai-stream",
+            )
+            self._unified_stop_event = stop_event
+            self._unified_thread = thread
+            self._unified_settings = dict(settings)
+            self._unified_frame_id = 0
+            self._unified_error = None
+            self._unified_latest_frame = None
+            self._unified_last_update = 0.0
+            self._unified_latest = {}
+            self._unified_buffers = {
+                channel: deque(maxlen=self._ai_buffer_size)
+                for channel in physical_channels
+            }
+            self._unified_sample_counts = {channel: 0 for channel in physical_channels}
+            self._unified_running = True
+            thread.start()
+
+        return self.get_unified_ai_stream_status()
+
+    def stop_unified_ai_stream(self) -> dict[str, Any]:
+        """停止统一 AI 数据流。"""
+
+        self._stop_unified_ai_stream()
+        return self.get_unified_ai_stream_status()
+
+    def get_unified_ai_stream_status(self) -> dict[str, Any]:
+        """查询统一 AI 数据流状态。"""
+
+        with self._ai_lock:
+            settings = dict(self._unified_settings or {})
+            return {
+                "running": self._unified_running,
+                "error": self._unified_error,
+                "frame_id": self._unified_frame_id,
+                "has_frame": self._unified_latest_frame is not None,
+                "last_update": self._unified_last_update,
+                "sample_counts": dict(self._unified_sample_counts),
+                "frame_duration_seconds": settings.get("frame_duration_seconds"),
+                "frame_duration_ms": settings.get("frame_duration_ms"),
+                "frame_rate_hz": settings.get("frame_rate_hz"),
+                "trigger_mode": settings.get("trigger_mode", "off"),
+                "settings": settings,
+            }
+
+    def get_unified_ai_stream_latest_frame(self) -> dict[str, Any]:
+        """返回统一 AI 数据流的最新一帧完整波形。"""
+
+        with self._ai_lock:
+            if self._unified_latest_frame is None:
+                raise RuntimeError("Unified AI stream has no frame yet")
+            return dict(self._unified_latest_frame)
+
+    def get_unified_ai_latest(self, channel: str) -> dict[str, Any]:
+        """读取统一 AI 数据流里某个通道的最近一个点。"""
+
+        physical_channel = self._normalize_ai_channel(channel)
+        with self._ai_lock:
+            if physical_channel not in self._unified_buffers:
+                raise RuntimeError(f"{physical_channel} is not in unified AI stream")
+            if physical_channel not in self._unified_latest:
+                raise RuntimeError(f"{physical_channel} has no unified sampled data yet")
+            settings = dict(self._unified_settings or {})
+            return {
+                "device": self.device_name,
+                "channel": physical_channel,
+                "rate": settings.get("rate_per_channel", 0.0),
+                "value": self._unified_latest[physical_channel],
+                "last_update": self._unified_last_update,
+                "sample_count": self._unified_sample_counts.get(physical_channel, 0),
+                "frame_id": self._unified_frame_id,
+            }
+
+    def get_unified_ai_buffer(self, channel: str, max_samples: int = 1000) -> dict[str, Any]:
+        """读取统一 AI 数据流里某个通道最近的一段缓存。"""
+
+        if max_samples < 1:
+            raise ValueError("max_samples must be >= 1")
+
+        physical_channel = self._normalize_ai_channel(channel)
+        with self._ai_lock:
+            if physical_channel not in self._unified_buffers:
+                raise RuntimeError(f"{physical_channel} is not in unified AI stream")
+            values = list(self._unified_buffers.get(physical_channel, []))[-max_samples:]
+            settings = dict(self._unified_settings or {})
+            return {
+                "device": self.device_name,
+                "channel": physical_channel,
+                "rate": settings.get("rate_per_channel", 0.0),
+                "samples": len(values),
+                "values": values,
+                "last_update": self._unified_last_update,
+                "sample_count": self._unified_sample_counts.get(physical_channel, 0),
+                "frame_id": self._unified_frame_id,
+            }
+
+    def get_unified_ai_stats(self, channel: str, max_samples: int = 10000) -> dict[str, Any]:
+        """返回统一 AI 数据流里某个通道最近缓存的统计量。"""
+
+        if max_samples < 1:
+            raise ValueError("max_samples must be >= 1")
+
+        physical_channel = self._normalize_ai_channel(channel)
+        with self._ai_lock:
+            if physical_channel not in self._unified_buffers:
+                raise RuntimeError(f"{physical_channel} is not in unified AI stream")
+            values = list(self._unified_buffers.get(physical_channel, []))[-max_samples:]
+            settings = dict(self._unified_settings or {})
+            last_update = self._unified_last_update
+            sample_count = self._unified_sample_counts.get(physical_channel, 0)
+            frame_id = self._unified_frame_id
+
+        if not values:
+            raise RuntimeError(f"{physical_channel} has no unified sampled data yet")
+
+        data = np.asarray(values, dtype=np.float64)
+        return {
+            "device": self.device_name,
+            "channel": physical_channel,
+            "rate": settings.get("rate_per_channel", 0.0),
+            "samples": int(data.size),
+            "mean": float(np.mean(data)),
+            "std": float(np.std(data)),
+            "min": float(np.min(data)),
+            "max": float(np.max(data)),
+            "rms": float(np.sqrt(np.mean(np.square(data)))),
+            "last": float(data[-1]),
+            "last_update": last_update,
+            "sample_count": sample_count,
+            "frame_id": frame_id,
+        }
 
     # ---------------------------------------------------------------------
     # AO / PFI
@@ -803,6 +1055,30 @@ class DaqController:
             return AI_SINGLE_CHANNEL_MAX_RATE
         return AI_MULTI_CHANNEL_AGGREGATE_RATE / channel_count
 
+    def _validate_ai_rate_request(self, channels: list[str], rate: float) -> None:
+        """校验手动指定的 AI 采样率是否符合当前项目约定。
+
+        约定是：
+        - 单通道最高 2 MHz。
+        - 多通道总采样率最高 1 MHz，因此每通道 rate * 通道数不能超过 1 MHz。
+        """
+
+        channel_count = len(channels)
+        if channel_count <= 0:
+            raise ValueError("channels must not be empty")
+        if channel_count == 1:
+            if rate > AI_SINGLE_CHANNEL_MAX_RATE:
+                raise ValueError(
+                    f"single-channel rate must be <= {AI_SINGLE_CHANNEL_MAX_RATE:g} Hz"
+                )
+            return
+        aggregate_rate = rate * channel_count
+        if aggregate_rate > AI_MULTI_CHANNEL_AGGREGATE_RATE:
+            raise ValueError(
+                f"multi-channel aggregate rate {aggregate_rate:g} Hz exceeds "
+                f"{AI_MULTI_CHANNEL_AGGREGATE_RATE:g} Hz"
+            )
+
     def _restart_ai_sampling(self) -> None:
         """按当前订阅通道重启后台 AI 连续采样任务。"""
 
@@ -870,6 +1146,120 @@ class DaqController:
                 self._frame_stream_thread = None
                 self._frame_stream_stop_event = None
                 self._frame_stream_running = False
+
+    def _stop_unified_ai_stream(self) -> None:
+        """停止统一 AI 数据流线程。"""
+
+        with self._ai_lock:
+            stop_event = self._unified_stop_event
+            thread = self._unified_thread
+            if stop_event is not None:
+                stop_event.set()
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+
+        with self._ai_lock:
+            if self._unified_thread is thread:
+                self._unified_thread = None
+                self._unified_stop_event = None
+                self._unified_running = False
+
+    def _unified_ai_stream_worker(
+        self,
+        settings: dict[str, Any],
+        stop_event: threading.Event,
+    ) -> None:
+        """统一 AI 数据流线程。
+
+        这个线程和旧 frame_stream 一样按固定点数读帧；
+        额外维护每通道 latest/buffer/sample_count，供慢漂、示波器等模块读取小 JSON。
+        """
+
+        channels = list(settings["channels"])
+        samples_per_frame = int(settings["samples_per_frame"])
+        resync_every_frames = int(settings.get("resync_every_frames", 0))
+        segment_id = 0
+        try:
+            while not stop_event.is_set():
+                segment_id += 1
+                segment_frame_id = 0
+                task = nidaqmx_driver.create_continuous_ai_task(
+                    channels=channels,
+                    rate=float(settings["rate_per_channel"]),
+                    samples_per_read=samples_per_frame,
+                    terminal_config_name=str(settings["terminal_config"]),
+                    min_val=float(settings["min_val"]),
+                    max_val=float(settings["max_val"]),
+                    start_trigger_source=settings["trigger_source"],
+                    start_trigger_edge_name=str(settings["trigger_edge"]),
+                )
+                try:
+                    while not stop_event.is_set():
+                        channel_values = nidaqmx_driver.read_continuous_ai_chunk(
+                            task=task,
+                            samples_per_read=samples_per_frame,
+                            channel_count=len(channels),
+                            timeout=float(settings["timeout"]),
+                        )
+                        now = time.time()
+                        segment_frame_id += 1
+                        with self._ai_lock:
+                            if stop_event.is_set():
+                                break
+                            self._unified_frame_id += 1
+                            frame = {
+                                "device": self.device_name,
+                                "channels": channels,
+                                "channel_count": len(channels),
+                                "samples_per_channel": samples_per_frame,
+                                "rate_per_channel": float(settings["rate_per_channel"]),
+                                "aggregate_rate": float(settings["aggregate_rate"]),
+                                "terminal_config": str(settings["terminal_config"]),
+                                "min_val": float(settings["min_val"]),
+                                "max_val": float(settings["max_val"]),
+                                "trigger_enabled": bool(settings["trigger_enabled"]),
+                                "trigger_source": settings["trigger_source"],
+                                "trigger_edge": str(settings["trigger_edge"]),
+                                "trigger_mode": str(settings["trigger_mode"]),
+                                "resync_every_frames": resync_every_frames,
+                                "segment_id": segment_id,
+                                "segment_frame_id": segment_frame_id,
+                                "frame_duration_seconds": float(settings["frame_duration_seconds"]),
+                                "frame_duration_ms": float(settings["frame_duration_ms"]),
+                                "frame_rate_hz": float(settings["frame_rate_hz"]),
+                                "frame_id": self._unified_frame_id,
+                                "started_at": now,
+                                "finished_at": now,
+                                "values": channel_values,
+                            }
+                            self._unified_latest_frame = frame
+                            for channel, values in zip(channels, channel_values):
+                                if not values:
+                                    continue
+                                self._unified_latest[channel] = values[-1]
+                                self._unified_buffers.setdefault(
+                                    channel,
+                                    deque(maxlen=self._ai_buffer_size),
+                                ).extend(values)
+                                self._unified_sample_counts[channel] = (
+                                    self._unified_sample_counts.get(channel, 0) + len(values)
+                                )
+                            self._unified_last_update = now
+                            self._unified_error = None
+
+                        # 周期重对齐：关闭当前 task，外层循环会新建 task 并重新等待 PFI 边沿。
+                        if resync_every_frames > 0 and segment_frame_id >= resync_every_frames:
+                            break
+                finally:
+                    task.close()
+        except Exception as exc:
+            with self._ai_lock:
+                self._unified_error = str(exc)
+        finally:
+            with self._ai_lock:
+                if self._unified_thread is threading.current_thread():
+                    self._unified_running = False
 
     def _ai_frame_stream_worker(
         self,

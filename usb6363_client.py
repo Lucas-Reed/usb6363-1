@@ -294,6 +294,98 @@ class Usb6363Client:
 
         return self._get("/api/ai/frame_stream/latest")
 
+    def start_unified_ai_stream(
+        self,
+        channels: list[str] | None = None,
+        samples_per_frame: int = 5000,
+        rate: float = 50_000.0,
+        terminal_config: str = "DIFF",
+        min_val: float = -5.0,
+        max_val: float = 5.0,
+        timeout: float = 10.0,
+        trigger_enabled: bool = False,
+        trigger_source: str = "PFI0",
+        trigger_edge: str = "RISING",
+        resync_every_frames: int = 0,
+    ) -> dict[str, Any]:
+        """启动统一 AI 数据流。
+
+        这是未来推荐入口：双峰、慢漂、示波器等模块应尽量读取同一个统一流，
+        避免多个程序各自创建 AI task。
+        """
+
+        return self._post(
+            "/api/ai/unified/start",
+            {
+                "channels": ["ai0", "ai1"] if channels is None else channels,
+                "samples_per_frame": samples_per_frame,
+                "rate": rate,
+                "terminal_config": terminal_config,
+                "min_val": min_val,
+                "max_val": max_val,
+                "timeout": timeout,
+                "trigger_enabled": trigger_enabled,
+                "trigger_source": trigger_source,
+                "trigger_edge": trigger_edge,
+                "resync_every_frames": resync_every_frames,
+            },
+        )
+
+    def stop_unified_ai_stream(self) -> dict[str, Any]:
+        """停止统一 AI 数据流。"""
+
+        return self._post("/api/ai/unified/stop", {})
+
+    def get_unified_ai_stream_status(self) -> dict[str, Any]:
+        """查询统一 AI 数据流状态。"""
+
+        return self._get("/api/ai/unified/status")
+
+    def get_unified_ai_stream_latest_frame(self) -> dict[str, Any]:
+        """读取统一 AI 数据流的最新一帧完整波形。"""
+
+        return self._get("/api/ai/unified/latest_frame")
+
+    def get_unified_ai_latest(self, channel: str = "ai0") -> dict[str, Any]:
+        """读取统一 AI 数据流中某个通道的最近一个点。"""
+
+        return self._get(
+            "/api/ai/unified/latest",
+            {
+                "channel": channel,
+            },
+        )
+
+    def get_unified_ai_buffer(
+        self,
+        channel: str = "ai0",
+        max_samples: int = 1000,
+    ) -> dict[str, Any]:
+        """读取统一 AI 数据流中某个通道最近的一段缓存。"""
+
+        return self._get(
+            "/api/ai/unified/buffer",
+            {
+                "channel": channel,
+                "max_samples": max_samples,
+            },
+        )
+
+    def get_unified_ai_stats(
+        self,
+        channel: str = "ai0",
+        max_samples: int = 10000,
+    ) -> dict[str, Any]:
+        """读取统一 AI 数据流中某个通道最近缓存的统计量。"""
+
+        return self._get(
+            "/api/ai/unified/stats",
+            {
+                "channel": channel,
+                "max_samples": max_samples,
+            },
+        )
+
     def write_ao(
         self,
         channel: str = "ao0",
