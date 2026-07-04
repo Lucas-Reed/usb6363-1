@@ -1,17 +1,29 @@
-# USB-6363 本地 API
+# USB-6363 本地统一采集服务
 
-这个项目的目标是：让整台电脑上只有一个底层服务直接访问 `Dev2`，
-其他 Python 子程序都通过 API 调用它，避免多个程序同时抢 USB-6363。
+这个项目的目标是：整台电脑上只有一个底层服务直接访问 NI USB-6363，其他 Python 程序和 WebUI 都通过 HTTP API 调用它，避免多个程序同时抢 AI 采集硬件。
 
-## 1. 快速检查硬件
+当前推荐主线是 **unified AI stream**：
+
+```text
+usb6363_server.py
+    直接管理 USB-6363
+
+ai_stream_console.py
+    启动/停止统一 AI 流，决定底层真实采哪些 AI 通道
+
+two_peak_viewer.py / power_drift_webui.py / 其他子程序
+    只读取统一 AI 流，不自己打开新的 AI task
+```
+
+## 正常启动顺序
+
+1. 检查硬件是否能被 NI-DAQmx 看到：
 
 ```powershell
 python minimal_dev2_check.py
 ```
 
-## 2. 启动底层 API 服务
-
-保持这个窗口一直运行：
+2. 启动底层 API 服务：
 
 ```powershell
 python usb6363_server.py
@@ -23,9 +35,33 @@ python usb6363_server.py
 http://127.0.0.1:8765
 ```
 
-## 3. 启动双峰波形查看器
+3. 启动统一 AI 控制台：
 
-再打开一个新的 PowerShell 窗口运行：
+```powershell
+python ai_stream_console.py
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8768
+```
+
+在这里设置：
+
+```text
+channels = ai0,ai1,ai2
+rate
+samples_per_frame
+terminal_config
+min_val / max_val
+PFI trigger
+resync_every_frames
+```
+
+然后启动 unified stream。
+
+4. 启动双峰波形查看器：
 
 ```powershell
 python two_peak_viewer.py
@@ -37,36 +73,116 @@ python two_peak_viewer.py
 http://127.0.0.1:8766
 ```
 
-这个查看器只通过 `usb6363_client.py` 调用底层 API，不直接访问 NI-DAQmx。
-当前它只用于采集一帧波形、手动选 P1/P2、测峰和保存样本；还不做闭环 AO 输出。
-如果勾选“PFI 硬件触发”，采集卡会等待指定 PFI 边沿后才开始采这一帧。
-查看器也支持第一版连续采集：浏览器按设定间隔反复请求一帧，
-如果启用了 PFI 触发，则每一帧都会等待一次 PFI 边沿。
+双峰查看器现在只读取 unified stream。它里面的 `channels` 输入框只表示“显示/分析哪些通道”，不会改变底层统一流真实采集的通道。
 
-## 4. 检查 PFI 上升沿
+5. 启动功率慢漂 WebUI：
 
-如果要确认信号源同步输出接到 PFI 后能不能被 USB-6363 看到，
-先保持底层 API 服务运行，然后执行：
+```powershell
+python power_drift_webui.py
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8767
+```
+
+功率慢漂默认使用 `unified_stream`。如果统一流包含 `ai2`，功率慢漂就可以读取 `ai2` 的统计量并写 CSV。
+
+## 子程序推荐调用方式
+
+新写的 Python 子程序应该只消费 unified stream：
+
+```python
+from usb6363_client import Usb6363Client
+
+daq = Usb6363Client()
+
+status = daq.get_unified_ai_stream_status()
+if not status["running"]:
+    raise RuntimeError("请先用 ai_stream_console.py 启动统一 AI 流")
+
+latest = daq.get_unified_ai_latest("ai0")
+stats = daq.get_unified_ai_stats("ai1", max_samples=1000)
+buffer = daq.get_unified_ai_buffer("ai2", max_samples=100)
+```
+
+完整示例见：
+
+```text
+example_child_program.py
+```
+
+## 推荐 AI API
+
+```text
+POST /api/ai/unified/start
+POST /api/ai/unified/stop
+GET  /api/ai/unified/status
+GET  /api/ai/unified/latest_frame
+GET  /api/ai/unified/latest?channel=ai0
+GET  /api/ai/unified/buffer?channel=ai0&max_samples=1000
+GET  /api/ai/unified/stats?channel=ai0&max_samples=10000
+```
+
+重要边界：
+
+```text
+只有统一 AI 控制台等底层控制入口应该启动/停止 unified stream。
+双峰、功率慢漂、普通子程序只读取 unified stream。
+```
+
+## Legacy AI API
+
+下面这些旧接口暂时保留，只用于旧脚本兼容、单独调试和逐步迁移：
+
+```text
+GET  /api/ai/read
+GET  /api/ai/status
+GET  /api/ai/latest
+GET  /api/ai/buffer
+GET  /api/ai/stats
+POST /api/ai/subscribe
+POST /api/ai/unsubscribe
+POST /api/ai/set_channels
+POST /api/ai/clear
+POST /api/ai/record_to_file
+POST /api/ai/capture_frame
+POST /api/ai/frame_stream/start
+POST /api/ai/frame_stream/stop
+GET  /api/ai/frame_stream/status
+GET  /api/ai/frame_stream/latest
+```
+
+这些接口可能直接或间接打开旧 AI task。新功能不要再基于它们开发。
+
+## AO 和 PFI
+
+AO/PFI 不属于 AI 采集 task，可以继续通过底层 API 使用：
+
+```text
+POST /api/ao/write
+GET  /api/pfi/read?line=PFI0
+POST /api/pfi/write
+GET  /api/pfi/count?line=PFI0&counter=ctr0&seconds=1.0&edge=RISING
+```
+
+检查 PFI 上升沿：
 
 ```powershell
 python pfi_rising_counter.py --line PFI0 --counter ctr0 --seconds 1
 ```
 
-它会每 1 秒打印一次 PFI0 上升沿计数和估算频率。
-如果要换端子或计数器，例如：
-
-```powershell
-python pfi_rising_counter.py --line PFI1 --counter ctr1 --seconds 0.5
-```
+注意：AO/PFI 写操作会真实改变硬件端子电压/电平，接外部设备时请先确认安全。
 
 ## 代码结构
 
 ```text
-usb6363_core.py
-    主逻辑。包含设备信息、通道校验、AI 采样管理、AO、PFI、文件记录。
-
 usb6363/nidaqmx_driver.py
     唯一直接 import / 调用 NI-DAQmx 的内部驱动层。
+
+usb6363_core.py
+    设备信息、通道校验、统一 AI 流、AO、PFI 等核心逻辑。
 
 usb6363_server.py
     HTTP API 服务。
@@ -74,193 +190,15 @@ usb6363_server.py
 usb6363_client.py
     给其他 Python 子程序调用的客户端。
 
+ai_stream_console.py
+    统一 AI 流控制台，负责启动/停止 unified stream。
+
 two_peak/
-    双峰锁定的新实现。这里不直接调用 NI-DAQmx，只处理参数、信号和 PI 算法。
-    viewer_state.py 保存查看器状态。
-    viewer_capture.py 处理采集、测峰、保存样本。
-    viewer_server.py 处理查看器 HTTP 路由。
-    static/viewer.html 是查看器前端页面。
+    双峰波形查看器和后续锁定算法。现在只读取 unified stream。
+
+power_drift_monitor.py / power_drift_webui.py
+    光电探测器功率慢漂监测。默认读取 unified stream。
 
 legacy/
-    旧版双峰锁定程序参考快照。只作为需求和算法参考，不建议继续直接修改。
-
-two_peak_viewer.py
-    最小双峰波形查看器。用于看真实 AI 波形、手动选峰、保存样本。
-
-pfi_rising_counter.py
-    最小 PFI 上升沿计数脚本。用于检查信号源同步输出是否能被 PFI 看到。
+    旧双峰程序参考快照，只作需求和算法参考。
 ```
-
-## 5. 其他 Python 程序这样调用
-
-```python
-from usb6363_client import Usb6363Client
-
-daq = Usb6363Client()
-
-# 读取模拟输入 ai0。
-ai0 = daq.read_ai(channel="ai0")
-print(ai0["values"])
-
-# 连续采样：只采 ai0，此时 ai0 会按单通道最大 2 MHz 运行。
-daq.set_ai_channels(["ai0"])
-print(daq.get_ai_status())
-print(daq.get_ai_latest("ai0"))
-print(daq.get_ai_stats("ai0"))
-
-# 保存完整高速原始数据：接下来 0.1 秒的数据写入 .npy 文件。
-# 返回值只包含文件路径和元数据，不会把大数组塞进 JSON。
-capture = daq.record_ai_to_file(seconds=0.1)
-print(capture["npy_file"])
-
-# 同步读取 ai0/ai1 的一帧数据，适合双峰锁定这类“同一帧波形”场景。
-# 注意：这个接口会把波形放进 JSON，只适合一帧，不适合长时间高速记录。
-frame = daq.capture_ai_frame(
-    channels=["ai0", "ai1"],
-    samples=5000,
-    rate=50000,
-    terminal_config="DIFF",
-    min_val=-5.0,
-    max_val=5.0,
-)
-ai0 = frame["values"][0]
-ai1 = frame["values"][1]
-
-# 连续采样：采 ai0 和 ai1，此时每个通道 500 kHz。
-daq.set_ai_channels(["ai0", "ai1"])
-print(daq.get_ai_status())
-
-# 停止所有后台 AI 连续采样。
-daq.clear_ai_channels()
-
-# 输出模拟电压到 ao0。
-daq.write_ao(channel="ao0", value=1.23)
-
-# 读取 PFI0 的数字高低电平。
-pfi0 = daq.read_pfi(line="PFI0")
-print(pfi0["value"])
-
-# 统计 PFI0 在 1 秒内的上升沿数量。
-count = daq.count_pfi_edges(line="PFI0", counter="ctr0", seconds=1.0)
-print(count["count"])
-```
-
-## API 路由
-
-```text
-GET  /health
-GET  /api/devices
-GET  /api/device
-GET  /api/terminals
-GET  /api/ai/read?channel=ai0&samples=1&rate=1000
-GET  /api/ai/status
-GET  /api/ai/latest?channel=ai0
-GET  /api/ai/buffer?channel=ai0&max_samples=1000
-GET  /api/ai/stats?channel=ai0&max_samples=10000
-GET  /api/pfi/read?line=PFI0
-GET  /api/pfi/count?line=PFI0&counter=ctr0&seconds=1.0&edge=RISING
-POST /api/ai/subscribe
-POST /api/ai/unsubscribe
-POST /api/ai/set_channels
-POST /api/ai/clear
-POST /api/ai/record_to_file
-POST /api/ai/capture_frame
-POST /api/ao/write
-POST /api/pfi/write
-```
-
-后台 AI 连续采样的采样率规则：
-
-```text
-0 个通道：不采样
-1 个通道：每通道 2,000,000 samples/s
-N 个通道：每通道 1,000,000 / N samples/s
-```
-
-设置 AI 连续采样通道的 JSON 例子：
-
-```json
-{
-  "channels": ["ai0", "ai1"]
-}
-```
-
-数据返回方式建议：
-
-```text
-实时状态、最近值、统计量、少量缓存：
-    走 JSON，例如 get_ai_latest / get_ai_stats / get_ai_buffer。
-
-完整高速原始波形：
-    走文件，例如 record_ai_to_file，保存为 .npy。
-
-同步多通道短波形：
-    走 capture_ai_frame，例如一次读取 ai0/ai1 各 5000 点。
-    如果需要更长时间或更高数据量，仍然应该走 record_ai_to_file。
-```
-
-记录当前 AI 采样流到文件的 JSON 例子：
-
-```json
-{
-  "seconds": 1.0,
-  "output_dir": "data",
-  "prefix": "experiment_001"
-}
-```
-
-`.npy` 文件的数据形状为：
-
-```text
-(通道数, 每通道采样点数)
-```
-
-例如只采 `ai0`，2 MHz，记录 1 秒：
-
-```text
-shape = (1, 2000000)
-```
-
-同步读取一帧 AI 的 JSON 例子：
-
-```json
-{
-  "channels": ["ai0", "ai1"],
-  "samples": 5000,
-  "rate": 50000,
-  "terminal_config": "DIFF",
-  "min_val": -5.0,
-  "max_val": 5.0,
-  "trigger_enabled": true,
-  "trigger_source": "PFI0",
-  "trigger_edge": "RISING"
-}
-```
-
-注意：调用 `capture_ai_frame` 前，后台连续采样必须是停止状态。
-如果已经调用过 `set_ai_channels`，请先调用 `clear_ai_channels`。
-如果 `trigger_enabled=true`，采集会等待触发边沿；触发信号没来时会直到超时报错。
-
-AO 输出 JSON 例子：
-
-```json
-{
-  "channel": "ao0",
-  "value": 1.23
-}
-```
-
-PFI 输出 JSON 例子：
-
-```json
-{
-  "line": "PFI0",
-  "value": true
-}
-```
-
-注意：AO 输出和 PFI 输出都会真实改变硬件端子电压/电平。
-如果端子接了外部设备，请确认安全后再运行。
-
-所有硬件操作都被 `usb6363_core.py` 里的锁保护。
-HTTP 服务可以同时接收多个请求，但真正访问 USB-6363 时会排队执行。

@@ -27,7 +27,7 @@ class Usb6363Client:
 
         from usb6363_client import Usb6363Client
         daq = Usb6363Client()
-        value = daq.read_ai("ai0")
+        value = daq.get_unified_ai_latest("ai0")
     """
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, timeout: float = 10.0) -> None:
@@ -60,6 +60,13 @@ class Usb6363Client:
 
         return self._get("/api/terminals")
 
+    # ------------------------------------------------------------------
+    # LEGACY AI API
+    # ------------------------------------------------------------------
+    # 下面这一组 read_ai / subscribe_ai / frame_stream 接口会直接或间接创建旧 AI task。
+    # 新程序请优先使用 unified AI stream，也就是 start_unified_ai_stream /
+    # get_unified_ai_stream_latest_frame / get_unified_ai_stats 等方法。
+    # 这些旧方法暂时保留，只用于旧脚本兼容、单独调试和逐步迁移。
     def read_ai(
         self,
         channel: str = "ai0",
@@ -294,6 +301,10 @@ class Usb6363Client:
 
         return self._get("/api/ai/frame_stream/latest")
 
+    # ------------------------------------------------------------------
+    # RECOMMENDED AI API
+    # ------------------------------------------------------------------
+    # 新的上层模块应当共享这一条统一 AI 流，避免多个程序各自打开 AI task 抢硬件。
     def start_unified_ai_stream(
         self,
         channels: list[str] | None = None,

@@ -1,10 +1,16 @@
-"""子程序调用 USB-6363 API 的示例。
+"""子 Python 程序调用 USB-6363 的推荐示例。
 
-运行这个脚本前，请先在另一个终端启动：
-    python usb6363_server.py
+运行这个脚本前，请先启动：
+    1. python usb6363_server.py
+    2. python ai_stream_console.py
 
-这个文件模拟“未来你的其他 Python 子程序”应该怎样访问 USB-6363。
-重点：它只 import usb6363_client，不直接 import nidaqmx。
+然后在统一 AI 控制台里启动 unified stream，例如 channels=ai0,ai1,ai2。
+
+重点：
+- 子程序只 import usb6363_client。
+- 子程序不 import nidaqmx。
+- 子程序不自己启动新的 AI task。
+- 子程序只读取已经运行的 unified AI stream，避免和双峰、功率慢漂互相抢 USB-6363。
 """
 
 from __future__ import annotations
@@ -13,66 +19,48 @@ from usb6363_client import Usb6363Client
 
 
 def main() -> int:
-    # 创建客户端。默认连接 http://127.0.0.1:8765。
+    """演示一个普通子程序应该怎样读取统一 AI 流。"""
+
     daq = Usb6363Client()
 
-    # 查询当前 server 管理的是哪块设备。
-    print(daq.get_device())
+    # 先确认底层 API 服务在线，并查看目标设备。
+    print("device:", daq.get_device())
 
-    # 读取 Dev2/ai0 的一个电压值。
-    ai_result = daq.read_ai(channel="ai0")
-    print(f"ai0 = {ai_result['values']:.6f} V")
+    # 查询统一 AI 流状态。
+    status = daq.get_unified_ai_stream_status()
+    print("unified running:", status.get("running"))
+    print("unified channels:", (status.get("settings") or {}).get("channels"))
 
-    # 后台连续采样示例 1：
-    # 只采 ai0 时，server 会自动把 ai0 的采样率设为 2 MHz。
-    status = daq.set_ai_channels(["ai0"])
-    print(f"AI status with ai0 only: {status}")
+    if not status.get("running"):
+        raise RuntimeError(
+            "统一 AI 流没有运行。请先打开 ai_stream_console.py，设置 channels 并启动统一流。"
+        )
 
-    # 从后台缓存里读取 ai0 的最近一个值。
-    # 刚启动连续采样后可能需要很短时间才有数据；正式程序可稍等几十毫秒再读。
-    try:
-        latest_ai0 = daq.get_ai_latest("ai0")
-        print(f"latest ai0 = {latest_ai0['value']:.6f} V")
-    except RuntimeError as exc:
-        print(f"latest ai0 is not ready yet: {exc}")
+    # 读取某个通道最近一个点。这个请求很小，适合实时状态显示。
+    latest_ai0 = daq.get_unified_ai_latest("ai0")
+    print(f"latest ai0 = {latest_ai0['value']:.6f} V")
 
-    # 实时反馈建议用统计量，而不是把大量原始数据塞进 JSON。
-    # 这里返回最近缓存数据的 mean/min/max/rms 等小结果。
-    try:
-        stats_ai0 = daq.get_ai_stats("ai0")
-        print(f"ai0 stats = {stats_ai0}")
-    except RuntimeError as exc:
-        print(f"ai0 stats are not ready yet: {exc}")
+    # 读取某个通道最近一段缓存的统计量。这个比返回大数组更适合长期监测和反馈。
+    stats_ai1 = daq.get_unified_ai_stats("ai1", max_samples=1000)
+    print(
+        "ai1 stats:",
+        f"mean={stats_ai1['mean']:.6e}",
+        f"std={stats_ai1['std']:.6e}",
+        f"samples={stats_ai1['samples']}",
+    )
 
-    # 完整高速原始数据建议写文件。
-    # 下面会把“接下来 0.05 秒”的 ai0 原始数据保存成 .npy 文件。
-    # 注意：这不会通过 JSON 返回大数组，只返回文件路径和元数据。
-    capture = daq.record_ai_to_file(seconds=0.05, prefix="example_ai0")
-    print(f"capture file = {capture['npy_file']}")
+    # 如果确实需要小段原始数据，可以读取有限长度的 buffer。
+    # 不要把高速长时间数据塞进 JSON；那类数据以后应走专门的文件记录模式。
+    buffer_ai2 = daq.get_unified_ai_buffer("ai2", max_samples=20)
+    print("ai2 recent values:", buffer_ai2["values"])
 
-    # 后台连续采样示例 2：
-    # 同时采 ai0 和 ai1 时，多通道总采样率按 1 MHz 均分，
-    # 所以每个通道会变成 500 kHz。
-    status = daq.set_ai_channels(["ai0", "ai1"])
-    print(f"AI status with ai0 + ai1: {status}")
-
-    # 停止所有后台 AI 连续采样。
-    daq.clear_ai_channels()
-
-    # 读取 PFI0 的数字高低电平。
-    # True 表示高电平，False 表示低电平。
-    pfi_result = daq.read_pfi(line="PFI0")
-    print(f"PFI0 = {pfi_result['value']}")
-
-    # 用 ctr0 统计 PFI0 在 0.1 秒内出现了多少个上升沿。
-    # 如果 PFI0 没有接外部脉冲信号，通常会读到 0。
-    count_result = daq.count_pfi_edges(line="PFI0", counter="ctr0", seconds=0.1)
-    print(f"PFI0 rising edges = {count_result['count']}")
-
-    # 把 Dev2/ao0 设置为 0V。
-    # 注意：这会真实改变 ao0 的输出。如果 ao0 接了外部设备，请确认安全后再运行。
+    # AO/PFI 不属于 AI task，本例保留一个 AO 和 PFI 示例。
+    # 注意：写 AO 会真实改变输出电压，请确认接线安全。
     ao_result = daq.write_ao(channel="ao0", value=0.0)
     print(f"Set {ao_result['channel']} to {ao_result['value']:.3f} V")
+
+    pfi_result = daq.read_pfi(line="PFI0")
+    print(f"PFI0 = {pfi_result['value']}")
 
     return 0
 

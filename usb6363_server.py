@@ -61,6 +61,8 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/terminals":
                     # 查询 PFI、数字线、计数器等端子列表。
                     self._send_json(controller.list_signal_terminals())
+                # LEGACY AI routes: 下面这些 /api/ai/read/status/latest/buffer/stats
+                # 属于旧后台 AI 订阅/直接读取模型。新程序优先使用 /api/ai/unified/*。
                 elif parsed.path == "/api/ai/read":
                     # 读取模拟输入。URL 参数会被 _ai_args 转成 Python 参数。
                     self._send_json(controller.read_ai_voltage(**_ai_args(query)))
@@ -76,6 +78,7 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/stats":
                     # 返回某个通道最近缓存数据的统计量，用于实时监测反馈。
                     self._send_json(controller.get_ai_stats(**_ai_stats_args(query)))
+                # RECOMMENDED AI routes: 统一 AI 流。双峰、功率慢漂、示波器等应共享这里。
                 elif parsed.path == "/api/ai/unified/status":
                     # 查询统一 AI 数据流状态。
                     self._send_json(controller.get_unified_ai_stream_status())
@@ -91,6 +94,7 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/unified/stats":
                     # 读取统一 AI 数据流中某个通道最近缓存的统计量。
                     self._send_json(controller.get_unified_ai_stats(**_ai_stats_args(query)))
+                # LEGACY frame_stream routes: 旧双峰连续采集模型，仅保留兼容。
                 elif parsed.path == "/api/ai/frame_stream/status":
                     # 查询固定点数分帧连续采集状态。
                     self._send_json(controller.get_ai_frame_stream_status())
@@ -122,6 +126,7 @@ def make_handler(controller: DaqController):
                 if parsed.path == "/api/ao/write":
                     # 写模拟输出。请求体 body 是 JSON，例如 {"channel": "ao0", "value": 1.23}。
                     self._send_json(controller.write_ao_voltage(**_ao_args(body)))
+                # LEGACY AI routes: 旧后台 AI 订阅/记录/同步采帧模型，仅保留兼容和调试。
                 elif parsed.path == "/api/ai/subscribe":
                     # 订阅一个 AI 通道，后台会自动按通道数重算采样率。
                     self._send_json(controller.subscribe_ai_channel(**_ai_channel_body(body)))
@@ -140,12 +145,14 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/capture_frame":
                     # 同步读取多路 AI 的一帧数据，例如双峰锁定里的 ai0/ai1。
                     self._send_json(controller.capture_ai_frame(**_ai_capture_frame_body(body)))
+                # RECOMMENDED AI routes: 只有统一 AI 控制台等底层控制入口应该启动/停止统一流。
                 elif parsed.path == "/api/ai/unified/start":
                     # 启动统一 AI 数据流。
                     self._send_json(controller.start_unified_ai_stream(**_ai_frame_stream_body(body)))
                 elif parsed.path == "/api/ai/unified/stop":
                     # 停止统一 AI 数据流。
                     self._send_json(controller.stop_unified_ai_stream())
+                # LEGACY frame_stream routes: 旧双峰连续采集模型，仅保留兼容。
                 elif parsed.path == "/api/ai/frame_stream/start":
                     # 启动固定点数分帧连续采集。
                     self._send_json(controller.start_ai_frame_stream(**_ai_frame_stream_body(body)))
