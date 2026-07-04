@@ -804,7 +804,8 @@ async function stopAreaTrend() {
 async function pollBackendStreamLatest() {
   if (!streamRunning) return;
   try {
-    const response = await fetch('/api/stream/latest');
+    const selectedChannels = encodeURIComponent(document.getElementById('channels').value);
+    const response = await fetch(`/api/stream/latest?channels=${selectedChannels}`);
     const frame = await response.json();
     if (!response.ok || frame.ok === false) {
       const statusResponse = await fetch('/api/stream/status');

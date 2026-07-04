@@ -7,6 +7,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
+from urllib.parse import urlparse
 
 from two_peak.viewer_capture import (
     capture_frame,
@@ -45,11 +47,14 @@ def make_handler(state: ViewerState):
             """处理页面和只读 API。"""
 
             try:
-                if self.path == "/" or self.path.startswith("/?"):
+                parsed = urlparse(self.path)
+                path = parsed.path
+                query = parse_qs(parsed.query)
+                if path == "/":
                     self._send_html(load_viewer_html())
-                elif self.path == "/api/defaults":
+                elif path == "/api/defaults":
                     self._send_json(state.active_web_defaults())
-                elif self.path == "/api/latest":
+                elif path == "/api/latest":
                     self._send_json(
                         {
                             "has_frame": state.latest_frame is not None,
@@ -57,13 +62,20 @@ def make_handler(state: ViewerState):
                             "measurement": state.latest_measurement,
                         }
                     )
-                elif self.path == "/api/stream/status":
+                elif path == "/api/stream/status":
                     self._send_json(get_frame_stream_status(state))
-                elif self.path == "/api/stream/latest":
-                    self._send_json(get_frame_stream_latest(state))
-                elif self.path == "/api/trend/status":
+                elif path == "/api/stream/latest":
+                    self._send_json(
+                        get_frame_stream_latest(
+                            state,
+                            {
+                                "channels": query.get("channels", [""])[0],
+                            },
+                        )
+                    )
+                elif path == "/api/trend/status":
                     self._send_json(get_area_trend_status(state))
-                elif self.path == "/api/samples":
+                elif path == "/api/samples":
                     self._send_json(list_saved_frames(state))
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")

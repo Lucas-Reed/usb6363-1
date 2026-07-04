@@ -79,6 +79,57 @@ def _status_with_source(status: dict[str, Any], source: str) -> dict[str, Any]:
     return result
 
 
+def _channel_short_name(channel: str) -> str:
+    """把 Dev2/ai1、ai1 这两种写法统一成 ai1，方便比较。"""
+
+    return str(channel).strip().split("/")[-1].lower()
+
+
+def _filter_frame_channels(frame: dict[str, Any], requested_channels: list[str]) -> dict[str, Any]:
+    """只保留查看器当前选择的通道。
+
+    unified stream 可能全局采了 ai0/ai1/ai2，但双峰查看器当前只想看 ai1。
+    如果不在后端过滤，前端虽然可以少画几条线，但测峰和保存样本仍会拿到完整帧，
+    容易把 analysis_channel_index=0 错当成 ai0。这里直接把帧裁成查看器需要的通道。
+    """
+
+    if not requested_channels:
+        return frame
+
+    channels = [str(channel) for channel in frame.get("channels", [])]
+    values = frame.get("values", [])
+    if len(channels) != len(values):
+        raise RuntimeError("latest frame channels and values length do not match")
+
+    filtered_channels: list[str] = []
+    filtered_values: list[Any] = []
+    used_indices: set[int] = set()
+    for requested in requested_channels:
+        requested_key = _channel_short_name(requested)
+        match_index = None
+        for index, channel in enumerate(channels):
+            if index in used_indices:
+                continue
+            if str(channel) == requested or _channel_short_name(channel) == requested_key:
+                match_index = index
+                break
+        if match_index is None:
+            raise RuntimeError(
+                f"latest frame does not contain requested channel {requested}; "
+                f"available channels are {channels}"
+            )
+        used_indices.add(match_index)
+        filtered_channels.append(channels[match_index])
+        filtered_values.append(values[match_index])
+
+    filtered = dict(frame)
+    filtered["source_channels"] = channels
+    filtered["channels"] = filtered_channels
+    filtered["values"] = filtered_values
+    filtered["channel_count"] = len(filtered_channels)
+    return filtered
+
+
 def capture_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
     """调用底层 API 同步采集一帧。"""
 
@@ -162,7 +213,7 @@ def get_frame_stream_status(state: ViewerState) -> dict[str, Any]:
     return _status_with_source(frame_status, "frame_stream")
 
 
-def get_frame_stream_latest(state: ViewerState) -> dict[str, Any]:
+def get_frame_stream_latest(state: ViewerState, body: dict[str, Any] | None = None) -> dict[str, Any]:
     """通过底层 API 获取最新帧，并同步到查看器状态。"""
 
     status = get_frame_stream_status(state)
@@ -172,6 +223,10 @@ def get_frame_stream_latest(state: ViewerState) -> dict[str, Any]:
     else:
         frame = state.daq.get_ai_frame_stream_latest()
         frame["captured_by"] = "usb6363_frame_stream"
+
+    if body and body.get("channels") not in (None, ""):
+        frame = _filter_frame_channels(frame, parse_channels(body.get("channels")))
+
     frame["viewer_received_at"] = time.time()
     state.latest_frame = frame
     state.latest_measurement = None
