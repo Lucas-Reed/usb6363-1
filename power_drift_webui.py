@@ -323,6 +323,7 @@ def _settings_from_body(body: dict[str, Any]) -> PowerDriftSettings:
 
     settings = PowerDriftSettings(
         channel=str(body.get("channel", "ai2")),
+        data_source=str(body.get("data_source", "direct_read")),
         interval=float(body.get("interval", 1.0)),
         samples=int(body.get("samples", 1000)),
         rate=float(body.get("rate", 1000.0)),
@@ -356,6 +357,8 @@ def _validate_settings(settings: PowerDriftSettings) -> None:
         raise ValueError("duration must be > 0")
     if settings.terminal_config not in ("RSE", "DIFF", "NRSE"):
         raise ValueError("terminal_config must be RSE, DIFF, or NRSE")
+    if settings.data_source not in ("direct_read", "unified_stream"):
+        raise ValueError("data_source must be direct_read or unified_stream")
 
 
 def _optional_float(value: Any) -> float | None:
@@ -561,6 +564,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <h1>功率慢漂监测</h1>
 
   <h2>采集</h2>
+  <label>数据来源</label>
+  <select id="data_source">
+    <option value="direct_read">direct_read：单独慢漂监测，独占读取 AI</option>
+    <option value="unified_stream">unified_stream：读取已经运行的统一 AI 流</option>
+  </select>
   <div class="grid2">
     <div>
       <label>AI 通道</label>
@@ -664,6 +672,7 @@ let pollTimer = null;
 function getSettings() {
   return {
     channel: document.getElementById('channel').value,
+    data_source: document.getElementById('data_source').value,
     interval: Number(document.getElementById('interval').value),
     samples: Number(document.getElementById('samples').value),
     rate: Number(document.getElementById('rate').value),

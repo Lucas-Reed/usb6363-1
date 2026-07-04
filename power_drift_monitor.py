@@ -58,6 +58,7 @@ class PowerDriftSettings:
     """
 
     channel: str
+    data_source: str
     interval: float
     samples: int
     rate: float
@@ -117,6 +118,29 @@ class PowerDriftMonitor:
         这里故意保守：如果双峰 frame_stream 或后台 AI 采样正在运行，就先报错。
         这样新模块不会悄悄打断别的实验，也不会读到别的程序留下来的缓存。
         """
+
+        if self.settings.data_source == "unified_stream":
+            unified_status = self.daq.get_unified_ai_stream_status()
+            if not unified_status.get("running"):
+                raise RuntimeError("统一 AI 流没有运行。请先用 ai_stream_console.py 启动统一 AI 流。")
+
+            settings = unified_status.get("settings") or {}
+            channels = settings.get("channels") or unified_status.get("channels") or []
+            requested = self.settings.channel
+            requested_full = requested if "/" in requested else f"Dev2/{requested}"
+            if channels and requested not in channels and requested_full not in channels:
+                raise RuntimeError(
+                    f"统一 AI 流正在运行，但没有包含功率通道 {requested}。"
+                    f"当前统一流通道为：{channels}"
+                )
+            return
+
+        unified_status = self.daq.get_unified_ai_stream_status()
+        if unified_status.get("running"):
+            raise RuntimeError(
+                "统一 AI 流正在运行。direct_read 会重新打开 AI task，容易抢硬件；"
+                "请停止统一流，或者把数据来源改成 unified_stream。"
+            )
 
         frame_stream = self.daq.get_ai_frame_stream_status()
         if frame_stream.get("running"):
@@ -200,6 +224,9 @@ class PowerDriftMonitor:
     def read_one_point(self, row_index: int, start_time: float) -> PowerDriftPoint:
         """读取一次小段 AI 数据，并计算这一行 CSV 的统计量。"""
 
+        if self.settings.data_source == "unified_stream":
+            return self._read_one_point_from_unified_stream(row_index=row_index, start_time=start_time)
+
         result = self.daq.read_ai(
             channel=self.settings.channel,
             samples=self.settings.samples,
@@ -231,6 +258,48 @@ class PowerDriftMonitor:
             channel=str(result.get("channel", self.settings.channel)),
             samples=len(values),
             rate_hz=float(result.get("rate", self.settings.rate)),
+            mean_v=mean_v,
+            std_v=std_v,
+            rel_std_percent=rel_std_percent,
+            min_v=min_v,
+            max_v=max_v,
+            peak_to_peak_v=max_v - min_v,
+            rms_v=rms_v,
+            power_estimate=power_estimate,
+        )
+
+    def _read_one_point_from_unified_stream(self, row_index: int, start_time: float) -> PowerDriftPoint:
+        """从统一 AI 流读取统计量。
+
+        这里不会打开新的 NI-DAQmx AI task，只读取 usb6363_core.py 已经采到的缓存。
+        因此它可以和双峰查看器同时运行，前提是二者读取的是同一个统一 AI 流。
+        """
+
+        stats = self.daq.get_unified_ai_stats(
+            channel=self.settings.channel,
+            max_samples=self.settings.samples,
+        )
+        samples = int(stats.get("samples", 0))
+        if samples < 1:
+            raise RuntimeError("统一 AI 流还没有足够的缓存数据")
+
+        mean_v = float(stats["mean"])
+        std_v = float(stats["std"])
+        min_v = float(stats["min"])
+        max_v = float(stats["max"])
+        rms_v = float(stats["rms"])
+        rel_std_percent = None if abs(mean_v) < 1e-30 else std_v / abs(mean_v) * 100.0
+        power_estimate = (mean_v - self.settings.zero_voltage) * self.settings.power_per_volt
+        timestamp = time.time()
+
+        return PowerDriftPoint(
+            iso_time=datetime.fromtimestamp(timestamp).isoformat(timespec="seconds"),
+            unix_time=timestamp,
+            elapsed_s=timestamp - start_time,
+            index=row_index,
+            channel=str(stats.get("channel", self.settings.channel)),
+            samples=samples,
+            rate_hz=float(stats.get("rate", self.settings.rate)),
             mean_v=mean_v,
             std_v=std_v,
             rel_std_percent=rel_std_percent,
@@ -281,6 +350,12 @@ def parse_args() -> PowerDriftSettings:
 
     parser = argparse.ArgumentParser(description="Slowly monitor photodetector power drift via USB-6363 AI.")
     parser.add_argument("--channel", default="ai2", help="光电探测器接到的 AI 通道，默认 ai2。")
+    parser.add_argument(
+        "--data-source",
+        default="direct_read",
+        choices=["direct_read", "unified_stream"],
+        help="数据来源：direct_read 会独占读取 AI；unified_stream 读取已经运行的统一 AI 流。",
+    )
     parser.add_argument("--interval", type=float, default=1.0, help="CSV 记录间隔，单位秒，默认 1。")
     parser.add_argument("--samples", type=int, default=1000, help="每次记录读取多少个点，默认 1000。")
     parser.add_argument("--rate", type=float, default=1000.0, help="每次小段采集的采样率 Hz，默认 1000。")
@@ -320,6 +395,7 @@ def parse_args() -> PowerDriftSettings:
 
     return PowerDriftSettings(
         channel=args.channel,
+        data_source=args.data_source,
         interval=args.interval,
         samples=args.samples,
         rate=args.rate,
