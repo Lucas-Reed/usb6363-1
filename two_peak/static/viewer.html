@@ -428,6 +428,8 @@ let plotCanvases = [];
 let streamRunning = false;
 let streamTimer = null;
 let streamLastFrameId = 0;
+let streamPollInFlight = false;
+let streamConsecutiveErrors = 0;
 let trendTimer = null;
 let xViewStart = null;
 let xViewEnd = null;
@@ -671,6 +673,8 @@ async function startBackendStream() {
     const status = await postJson('/api/stream/start', params);
     streamRunning = true;
     streamLastFrameId = 0;
+    streamConsecutiveErrors = 0;
+    streamPollInFlight = false;
     document.getElementById('streamStartBtn').disabled = true;
     document.getElementById('streamStopBtn').disabled = false;
     document.getElementById('captureBtn').disabled = true;
@@ -703,6 +707,7 @@ async function stopBackendStream() {
 
 function stopBackendStreamUiOnly() {
   streamRunning = false;
+  streamPollInFlight = false;
   if (streamTimer !== null) {
     clearInterval(streamTimer);
     streamTimer = null;
@@ -837,6 +842,8 @@ async function stopAreaTrend() {
 
 async function pollBackendStreamLatest() {
   if (!streamRunning) return;
+  if (streamPollInFlight) return;
+  streamPollInFlight = true;
   try {
     const selectedChannels = encodeURIComponent(document.getElementById('channels').value);
     const response = await fetch(`/api/stream/latest?stream_source=unified_stream&channels=${selectedChannels}`);
@@ -850,6 +857,7 @@ async function pollBackendStreamLatest() {
       return;
     }
     if (frame.frame_id === streamLastFrameId) return;
+    streamConsecutiveErrors = 0;
     streamLastFrameId = frame.frame_id;
     latestFrame = frame;
     latestMeasurement = null;
@@ -865,8 +873,14 @@ async function pollBackendStreamLatest() {
     await measurePeaks();
     setStatus(`连续采集中，最新帧 #${streamLastFrameId}。`, 'ok');
   } catch (err) {
-    setStatus(String(err.message || err), 'error');
-    stopBackendStreamUiOnly();
+    streamConsecutiveErrors += 1;
+    const message = String(err.message || err);
+    setStatus(`显示轮询暂时失败 ${streamConsecutiveErrors}/50：${message}`, 'error');
+    if (streamConsecutiveErrors >= 50) {
+      stopBackendStreamUiOnly();
+    }
+  } finally {
+    streamPollInFlight = false;
   }
 }
 
