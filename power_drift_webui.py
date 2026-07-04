@@ -323,7 +323,7 @@ def _settings_from_body(body: dict[str, Any]) -> PowerDriftSettings:
 
     settings = PowerDriftSettings(
         channel=str(body.get("channel", "ai2")),
-        data_source=str(body.get("data_source", "direct_read")),
+        data_source=str(body.get("data_source", "unified_stream")),
         interval=float(body.get("interval", 1.0)),
         samples=int(body.get("samples", 1000)),
         rate=float(body.get("rate", 1000.0)),
@@ -566,8 +566,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <h2>采集</h2>
   <label>数据来源</label>
   <select id="data_source">
+    <option value="unified_stream" selected>unified_stream：读取已经运行的统一 AI 流</option>
     <option value="direct_read">direct_read：单独慢漂监测，独占读取 AI</option>
-    <option value="unified_stream">unified_stream：读取已经运行的统一 AI 流</option>
   </select>
   <div class="grid2">
     <div>
