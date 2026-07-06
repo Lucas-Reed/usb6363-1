@@ -117,6 +117,9 @@ def make_handler(state: ViewerState):
                     )
                 elif self.path == "/api/ao_scan/stop":
                     self._send_json(state.ao_scan_calibrator.stop())
+                elif self.path == "/api/power_lock/write_initial_ao":
+                    body = self._read_json()
+                    self._send_json(_write_power_lock_initial_ao(state, body))
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)
@@ -193,3 +196,59 @@ def _optional_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _write_power_lock_initial_ao(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
+    """把双路功率锁定的初始 AO 电压写到硬件。
+
+    这里只负责“手动写初值”，不启动 PID。
+    这样做是为了先确认 AOM/EOM 的安全电压范围和工作点，避免一上来闭环。
+    """
+
+    controllers = body.get("controllers", [])
+    if not isinstance(controllers, list) or not controllers:
+        raise ValueError("controllers must be a non-empty list")
+
+    written: list[dict[str, Any]] = []
+    for controller in controllers:
+        if not isinstance(controller, dict):
+            raise ValueError("each controller must be an object")
+        if controller.get("enabled", True) is False:
+            continue
+
+        name = str(controller.get("name", ""))
+        channel = str(controller.get("channel", "")).strip()
+        initial_voltage = float(controller.get("initial_voltage"))
+        min_voltage = float(controller.get("min_voltage"))
+        max_voltage = float(controller.get("max_voltage"))
+
+        if not channel:
+            raise ValueError(f"{name or 'controller'} channel is empty")
+        if min_voltage >= max_voltage:
+            raise ValueError(f"{name or channel} min_voltage must be smaller than max_voltage")
+        if initial_voltage < min_voltage or initial_voltage > max_voltage:
+            raise ValueError(
+                f"{name or channel} initial_voltage {initial_voltage} is outside "
+                f"[{min_voltage}, {max_voltage}]"
+            )
+
+        result = state.daq.write_ao(
+            channel=channel,
+            value=initial_voltage,
+            min_val=min_voltage,
+            max_val=max_voltage,
+        )
+        written.append(
+            {
+                "name": name,
+                "channel": channel,
+                "initial_voltage": initial_voltage,
+                "min_voltage": min_voltage,
+                "max_voltage": max_voltage,
+                "result": result,
+            }
+        )
+
+    if not written:
+        raise ValueError("no enabled controller to write")
+    return {"ok": True, "written": written}

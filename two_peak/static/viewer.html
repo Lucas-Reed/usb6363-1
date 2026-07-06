@@ -509,6 +509,127 @@
     <button class="green" id="aoScanStartBtn" onclick="startAoScan()">开始 AO 扫描</button>
     <button class="secondary" id="aoScanStopBtn" onclick="stopAoScan()" disabled>停止 AO 扫描</button>
   </div>
+
+  <h2>双路功率锁定参数</h2>
+  <div class="grid2">
+    <div>
+      <label>EOM AO 通道</label>
+      <input id="lock_eom_channel" value="ao0">
+    </div>
+    <div>
+      <label>EOM 反馈字段</label>
+      <select id="lock_eom_feedback">
+        <option value="area_ema" selected>area_ema</option>
+        <option value="area_mean">area_mean</option>
+      </select>
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>EOM 目标面积</label>
+      <input id="lock_eom_target" type="number" value="4.7" step="0.01">
+    </div>
+    <div>
+      <label>EOM 初始电压 / V</label>
+      <input id="lock_eom_initial" type="number" value="2.0" step="0.01">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>EOM 最小电压 / V</label>
+      <input id="lock_eom_min" type="number" value="1.0" step="0.01">
+    </div>
+    <div>
+      <label>EOM 最大电压 / V</label>
+      <input id="lock_eom_max" type="number" value="3.5" step="0.01">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>EOM 控制方向</label>
+      <select id="lock_eom_direction">
+        <option value="-1" selected>电压增大，功率降低</option>
+        <option value="1">电压增大，功率升高</option>
+      </select>
+    </div>
+    <div>
+      <label>EOM 单步限幅 / V</label>
+      <input id="lock_eom_max_step" type="number" value="0.01" min="0" step="0.001">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>EOM Kp</label>
+      <input id="lock_eom_kp" type="number" value="0" step="0.001">
+    </div>
+    <div>
+      <label>EOM Ki</label>
+      <input id="lock_eom_ki" type="number" value="0" step="0.001">
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div>
+      <label>AOM AO 通道</label>
+      <input id="lock_aom_channel" value="ao1">
+    </div>
+    <div>
+      <label>AOM 反馈字段</label>
+      <select id="lock_aom_feedback">
+        <option value="area2_ema" selected>area2_ema</option>
+        <option value="area2_mean">area2_mean</option>
+      </select>
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AOM 目标面积</label>
+      <input id="lock_aom_target" type="number" value="4.7" step="0.01">
+    </div>
+    <div>
+      <label>AOM 初始电压 / V</label>
+      <input id="lock_aom_initial" type="number" value="2.0" step="0.01">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AOM 最小电压 / V</label>
+      <input id="lock_aom_min" type="number" value="0.0" step="0.01">
+    </div>
+    <div>
+      <label>AOM 最大电压 / V</label>
+      <input id="lock_aom_max" type="number" value="2.5" step="0.01">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AOM 控制方向</label>
+      <select id="lock_aom_direction">
+        <option value="1" selected>电压增大，功率升高</option>
+        <option value="-1">电压增大，功率降低</option>
+      </select>
+    </div>
+    <div>
+      <label>AOM 单步限幅 / V</label>
+      <input id="lock_aom_max_step" type="number" value="0.01" min="0" step="0.001">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AOM Kp</label>
+      <input id="lock_aom_kp" type="number" value="0" step="0.001">
+    </div>
+    <div>
+      <label>AOM Ki</label>
+      <input id="lock_aom_ki" type="number" value="0" step="0.001">
+    </div>
+  </div>
+  <label>锁定更新周期 / s</label>
+  <input id="lock_update_s" type="number" value="1.0" min="0.1" step="0.1">
+  <div class="actions">
+    <button class="secondary" onclick="writePowerLockInitialAo()">写入初始 AO 电压</button>
+    <button class="secondary" disabled>启动锁定（下一步）</button>
+  </div>
 </aside>
 
 <main>
@@ -609,6 +730,32 @@ function getAoScanParams() {
   };
 }
 
+function getPowerLockParams() {
+  return {
+    lock_update_s: Number(document.getElementById('lock_update_s').value),
+    lock_eom_channel: document.getElementById('lock_eom_channel').value,
+    lock_eom_feedback: document.getElementById('lock_eom_feedback').value,
+    lock_eom_target: Number(document.getElementById('lock_eom_target').value),
+    lock_eom_initial: Number(document.getElementById('lock_eom_initial').value),
+    lock_eom_min: Number(document.getElementById('lock_eom_min').value),
+    lock_eom_max: Number(document.getElementById('lock_eom_max').value),
+    lock_eom_direction: Number(document.getElementById('lock_eom_direction').value),
+    lock_eom_max_step: Number(document.getElementById('lock_eom_max_step').value),
+    lock_eom_kp: Number(document.getElementById('lock_eom_kp').value),
+    lock_eom_ki: Number(document.getElementById('lock_eom_ki').value),
+    lock_aom_channel: document.getElementById('lock_aom_channel').value,
+    lock_aom_feedback: document.getElementById('lock_aom_feedback').value,
+    lock_aom_target: Number(document.getElementById('lock_aom_target').value),
+    lock_aom_initial: Number(document.getElementById('lock_aom_initial').value),
+    lock_aom_min: Number(document.getElementById('lock_aom_min').value),
+    lock_aom_max: Number(document.getElementById('lock_aom_max').value),
+    lock_aom_direction: Number(document.getElementById('lock_aom_direction').value),
+    lock_aom_max_step: Number(document.getElementById('lock_aom_max_step').value),
+    lock_aom_kp: Number(document.getElementById('lock_aom_kp').value),
+    lock_aom_ki: Number(document.getElementById('lock_aom_ki').value),
+  };
+}
+
 function getAllUiParameters() {
   return {
     ...getCaptureParams(),
@@ -616,6 +763,7 @@ function getAllUiParameters() {
     ...getViewParams(),
     ...getTrendParams(),
     ...getAoScanParams(),
+    ...getPowerLockParams(),
   };
 }
 
@@ -685,6 +833,27 @@ function applyDefaultsToUi(defaults) {
   setInputValue('ao_scan_dwell_s', firstDefined(defaults.dwell_s, defaults.ao_scan_dwell_s));
   setInputValue('ao_scan_measure_field', firstDefined(defaults.measure_field, defaults.ao_scan_measure_field));
   setInputValue('ao_scan_restore_voltage', firstDefined(defaults.restore_voltage, defaults.ao_scan_restore_voltage));
+  setInputValue('lock_update_s', firstDefined(defaults.lock_update_s, 1.0));
+  setInputValue('lock_eom_channel', firstDefined(defaults.lock_eom_channel, 'ao0'));
+  setInputValue('lock_eom_feedback', firstDefined(defaults.lock_eom_feedback, 'area_ema'));
+  setInputValue('lock_eom_target', firstDefined(defaults.lock_eom_target, 4.7));
+  setInputValue('lock_eom_initial', firstDefined(defaults.lock_eom_initial, 2.0));
+  setInputValue('lock_eom_min', firstDefined(defaults.lock_eom_min, 1.0));
+  setInputValue('lock_eom_max', firstDefined(defaults.lock_eom_max, 3.5));
+  setInputValue('lock_eom_direction', firstDefined(defaults.lock_eom_direction, -1));
+  setInputValue('lock_eom_max_step', firstDefined(defaults.lock_eom_max_step, 0.01));
+  setInputValue('lock_eom_kp', firstDefined(defaults.lock_eom_kp, 0));
+  setInputValue('lock_eom_ki', firstDefined(defaults.lock_eom_ki, 0));
+  setInputValue('lock_aom_channel', firstDefined(defaults.lock_aom_channel, 'ao1'));
+  setInputValue('lock_aom_feedback', firstDefined(defaults.lock_aom_feedback, 'area2_ema'));
+  setInputValue('lock_aom_target', firstDefined(defaults.lock_aom_target, 4.7));
+  setInputValue('lock_aom_initial', firstDefined(defaults.lock_aom_initial, 2.0));
+  setInputValue('lock_aom_min', firstDefined(defaults.lock_aom_min, 0.0));
+  setInputValue('lock_aom_max', firstDefined(defaults.lock_aom_max, 2.5));
+  setInputValue('lock_aom_direction', firstDefined(defaults.lock_aom_direction, 1));
+  setInputValue('lock_aom_max_step', firstDefined(defaults.lock_aom_max_step, 0.01));
+  setInputValue('lock_aom_kp', firstDefined(defaults.lock_aom_kp, 0));
+  setInputValue('lock_aom_ki', firstDefined(defaults.lock_aom_ki, 0));
   updateDerivedTimingFromInputs();
   applyXView(false);
 }
@@ -1265,6 +1434,83 @@ async function stopAoScan() {
     const status = await postJson('/api/ao_scan/stop', {});
     updateAoScanStatus(status);
     setStatus('AO 扫描标定已停止。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+function buildPowerLockControllers() {
+  const params = getPowerLockParams();
+  return [
+    {
+      name: 'EOM',
+      role: 'area_a',
+      channel: params.lock_eom_channel,
+      feedback_field: params.lock_eom_feedback,
+      target: params.lock_eom_target,
+      initial_voltage: params.lock_eom_initial,
+      min_voltage: params.lock_eom_min,
+      max_voltage: params.lock_eom_max,
+      direction: params.lock_eom_direction,
+      max_step_v: params.lock_eom_max_step,
+      kp: params.lock_eom_kp,
+      ki: params.lock_eom_ki,
+      enabled: true,
+    },
+    {
+      name: 'AOM',
+      role: 'area_b',
+      channel: params.lock_aom_channel,
+      feedback_field: params.lock_aom_feedback,
+      target: params.lock_aom_target,
+      initial_voltage: params.lock_aom_initial,
+      min_voltage: params.lock_aom_min,
+      max_voltage: params.lock_aom_max,
+      direction: params.lock_aom_direction,
+      max_step_v: params.lock_aom_max_step,
+      kp: params.lock_aom_kp,
+      ki: params.lock_aom_ki,
+      enabled: true,
+    },
+  ];
+}
+
+function validatePowerLockController(controller) {
+  if (!controller.channel.trim()) {
+    throw new Error(`${controller.name} AO 通道不能为空。`);
+  }
+  for (const key of ['target', 'initial_voltage', 'min_voltage', 'max_voltage', 'direction', 'max_step_v', 'kp', 'ki']) {
+    if (!Number.isFinite(Number(controller[key]))) {
+      throw new Error(`${controller.name} 的 ${key} 必须是数字。`);
+    }
+  }
+  if (controller.min_voltage >= controller.max_voltage) {
+    throw new Error(`${controller.name} 最小电压必须小于最大电压。`);
+  }
+  if (controller.initial_voltage < controller.min_voltage || controller.initial_voltage > controller.max_voltage) {
+    throw new Error(`${controller.name} 初始电压必须在安全范围内。`);
+  }
+  if (controller.max_step_v < 0) {
+    throw new Error(`${controller.name} 单步限幅必须 >= 0。`);
+  }
+  if (![1, -1].includes(Number(controller.direction))) {
+    throw new Error(`${controller.name} 控制方向只能是 +1 或 -1。`);
+  }
+}
+
+async function writePowerLockInitialAo() {
+  try {
+    const controllers = buildPowerLockControllers();
+    controllers.forEach(validatePowerLockController);
+    const updateS = Number(document.getElementById('lock_update_s').value);
+    if (!Number.isFinite(updateS) || updateS <= 0) {
+      throw new Error('锁定更新周期必须 > 0。');
+    }
+    const result = await postJson('/api/power_lock/write_initial_ao', {controllers});
+    const text = result.written
+      .map(item => `${item.name || item.channel}:${formatNumber(item.initial_voltage, 4)} V`)
+      .join('  ');
+    setStatus(`已写入初始 AO 电压：${text}`, 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }
