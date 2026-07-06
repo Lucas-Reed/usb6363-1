@@ -12,21 +12,58 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import nidaqmx
-from nidaqmx.constants import AcquisitionType, Edge, TerminalConfiguration
-from nidaqmx.system import System
+# 注意：这里故意不在文件顶部 import nidaqmx。
+# 原因是 NI-DAQmx 在某些状态下 import/初始化可能会比较慢，甚至卡住。
+# 如果 server 启动阶段就 import nidaqmx，那么 8765 端口会开不出来，
+# 其他 WebUI 也会显示“目标计算机积极拒绝”。
+# 所以这里采用懒加载：只有真正访问硬件时才导入 NI-DAQmx。
+_NIDAQMX: Any | None = None
+_ACQUISITION_TYPE: Any | None = None
+_EDGE: Any | None = None
+_TERMINAL_CONFIGURATION: Any | None = None
+_SYSTEM: Any | None = None
+
+
+def _load_nidaqmx() -> tuple[Any, Any, Any, Any, Any]:
+    """按需导入 NI-DAQmx，并缓存导入结果。"""
+
+    global _NIDAQMX
+    global _ACQUISITION_TYPE
+    global _EDGE
+    global _TERMINAL_CONFIGURATION
+    global _SYSTEM
+
+    if _NIDAQMX is None:
+        import nidaqmx
+        from nidaqmx.constants import AcquisitionType, Edge, TerminalConfiguration
+        from nidaqmx.system import System
+
+        _NIDAQMX = nidaqmx
+        _ACQUISITION_TYPE = AcquisitionType
+        _EDGE = Edge
+        _TERMINAL_CONFIGURATION = TerminalConfiguration
+        _SYSTEM = System
+
+    return (
+        _NIDAQMX,
+        _ACQUISITION_TYPE,
+        _EDGE,
+        _TERMINAL_CONFIGURATION,
+        _SYSTEM,
+    )
 
 
 def list_devices() -> list[dict[str, str]]:
     """列出当前 NI-DAQmx 能看到的设备。"""
 
+    _, _, _, _, system_class = _load_nidaqmx()
     return [
         {
             "name": device.name,
             "product_type": device.product_type,
             "serial_num": str(device.serial_num),
         }
-        for device in System.local().devices
+        for device in system_class.local().devices
     ]
 
 
@@ -73,7 +110,8 @@ def read_ai_voltage(
     _get_device(device_name)
     config = _terminal_config(terminal_config_name)
 
-    with nidaqmx.Task() as task:
+    nidaqmx_module, acquisition_type, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
         task.ai_channels.add_ai_voltage_chan(
             physical_channel,
             terminal_config=config,
@@ -85,7 +123,7 @@ def read_ai_voltage(
 
         task.timing.cfg_samp_clk_timing(
             rate=rate,
-            sample_mode=AcquisitionType.FINITE,
+            sample_mode=acquisition_type.FINITE,
             samps_per_chan=samples,
         )
         raw_values = task.read(
@@ -123,7 +161,8 @@ def capture_ai_frame(
 
     config = _terminal_config(terminal_config_name)
 
-    with nidaqmx.Task() as task:
+    nidaqmx_module, acquisition_type, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
         for physical_channel in physical_channels:
             task.ai_channels.add_ai_voltage_chan(
                 physical_channel,
@@ -134,7 +173,7 @@ def capture_ai_frame(
 
         task.timing.cfg_samp_clk_timing(
             rate=rate,
-            sample_mode=AcquisitionType.FINITE,
+            sample_mode=acquisition_type.FINITE,
             samps_per_chan=samples,
         )
         if trigger_source is not None:
@@ -186,7 +225,8 @@ def create_continuous_ai_task(
     """
 
     config = _terminal_config(terminal_config_name)
-    task = nidaqmx.Task()
+    nidaqmx_module, acquisition_type, _, _, _ = _load_nidaqmx()
+    task = nidaqmx_module.Task()
     try:
         for channel in channels:
             task.ai_channels.add_ai_voltage_chan(
@@ -197,7 +237,7 @@ def create_continuous_ai_task(
             )
         task.timing.cfg_samp_clk_timing(
             rate=rate,
-            sample_mode=AcquisitionType.CONTINUOUS,
+            sample_mode=acquisition_type.CONTINUOUS,
             samps_per_chan=samples_per_read * 10,
         )
         if start_trigger_source is not None:
@@ -223,7 +263,8 @@ def write_ao_voltage(
     """输出 AO 静态电压。"""
 
     _get_device(device_name)
-    with nidaqmx.Task() as task:
+    nidaqmx_module, _, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
         task.ao_channels.add_ao_voltage_chan(
             physical_channel,
             min_val=min_val,
@@ -236,7 +277,8 @@ def read_digital_line(device_name: str, physical_line: str, timeout: float) -> b
     """读取数字线或 PFI 电平。"""
 
     _get_device(device_name)
-    with nidaqmx.Task() as task:
+    nidaqmx_module, _, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
         task.di_channels.add_di_chan(physical_line)
         return bool(task.read(timeout=timeout))
 
@@ -250,7 +292,8 @@ def write_digital_line(
     """写数字线或 PFI 电平。"""
 
     _get_device(device_name)
-    with nidaqmx.Task() as task:
+    nidaqmx_module, _, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
         task.do_channels.add_do_chan(physical_line)
         task.write(bool(value), auto_start=True, timeout=timeout)
 
@@ -267,7 +310,8 @@ def count_pfi_edges(
 
     _get_device(device_name)
     edge_value = _edge(edge_name)
-    with nidaqmx.Task() as task:
+    nidaqmx_module, _, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
         channel = task.ci_channels.add_ci_count_edges_chan(
             physical_counter,
             edge=edge_value,
@@ -301,7 +345,8 @@ def split_ai_read_values(raw_values: Any, channel_count: int) -> list[list[float
 def _get_device(device_name: str) -> Any:
     """确认目标设备存在，并返回 NI-DAQmx 设备对象。"""
 
-    system = System.local()
+    _, _, _, _, system_class = _load_nidaqmx()
+    system = system_class.local()
     device_names = [device.name for device in system.devices]
     if device_name not in device_names:
         raise RuntimeError(
@@ -314,20 +359,22 @@ def _get_device(device_name: str) -> Any:
 def _terminal_config(name: str) -> TerminalConfiguration:
     """把 RSE/NRSE/DIFF 等字符串转换成 NI-DAQmx 枚举。"""
 
+    _, _, _, terminal_configuration, _ = _load_nidaqmx()
     key = name.strip().upper()
     try:
-        return TerminalConfiguration[key]
+        return terminal_configuration[key]
     except KeyError as exc:
-        valid = ", ".join(config.name for config in TerminalConfiguration)
+        valid = ", ".join(config.name for config in terminal_configuration)
         raise ValueError(f"terminal_config must be one of: {valid}") from exc
 
 
 def _edge(name: str) -> Edge:
     """把 RISING/FALLING 字符串转换成 NI-DAQmx 枚举。"""
 
+    _, _, edge_enum, _, _ = _load_nidaqmx()
     key = name.strip().upper()
     try:
-        return Edge[key]
+        return edge_enum[key]
     except KeyError as exc:
-        valid = ", ".join(edge_value.name for edge_value in Edge)
+        valid = ", ".join(edge_value.name for edge_value in edge_enum)
         raise ValueError(f"edge must be one of: {valid}") from exc

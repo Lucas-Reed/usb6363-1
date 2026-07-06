@@ -405,10 +405,9 @@ def main() -> int:
     handler = make_handler(controller)
     server = ThreadingHTTPServer((args.host, args.port), handler)
 
-    # 启动前先读一次设备信息。如果 Dev2 不存在，这里会直接报错，避免服务假启动。
-    info = controller.get_device_info()
     print(f"USB-6363 API server running at http://{args.host}:{args.port}")
-    print(f"Using {info.name}: {info.product_type}, serial={info.serial_num}")
+    print(f"Target device: {args.device}")
+    print("Device info will be read when an API route actually needs hardware.")
     print("Press Ctrl+C to stop.")
 
     try:
