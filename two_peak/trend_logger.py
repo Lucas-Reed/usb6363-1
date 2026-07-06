@@ -57,6 +57,7 @@ class AreaTrendLogger:
         self._records_written = 0
         self._last_frame_id = 0
         self._latest_stats: dict[str, Any] | None = None
+        self._recent_stats: deque[dict[str, Any]] = deque(maxlen=1000)
 
     def start(
         self,
@@ -67,6 +68,7 @@ class AreaTrendLogger:
         area2_right: int | None = None,
         window_frames: int = 200,
         record_hz: float = 1.0,
+        ema_alpha: float = 0.02,
         poll_interval: float = 0.05,
         stream_source: str = "unified_stream",
         channels: list[str] | None = None,
@@ -86,6 +88,8 @@ class AreaTrendLogger:
             raise ValueError("window_frames must be >= 2")
         if record_hz <= 0:
             raise ValueError("record_hz must be > 0")
+        if ema_alpha < 0 or ema_alpha > 1:
+            raise ValueError("ema_alpha must be between 0 and 1")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
 
@@ -105,6 +109,7 @@ class AreaTrendLogger:
                 "area2_right": None if area2_right is None else int(area2_right),
                 "window_frames": int(window_frames),
                 "record_hz": float(record_hz),
+                "ema_alpha": float(ema_alpha),
                 "poll_interval": float(poll_interval),
                 "stream_source": str(stream_source),
                 "channels": list(channels or []),
@@ -127,6 +132,7 @@ class AreaTrendLogger:
             self._records_written = 0
             self._last_frame_id = 0
             self._latest_stats = None
+            self._recent_stats.clear()
             thread.start()
 
         return self.status()
@@ -164,6 +170,7 @@ class AreaTrendLogger:
                 "records_written": self._records_written,
                 "last_frame_id": self._last_frame_id,
                 "latest_stats": dict(self._latest_stats or {}),
+                "recent_stats": [dict(row) for row in self._recent_stats],
             }
 
     def _worker(
@@ -179,6 +186,8 @@ class AreaTrendLogger:
         last_recorded_frame_id = 0
         next_record_time = time.time()
         record_period = 1.0 / float(settings["record_hz"])
+        ema_alpha = float(settings.get("ema_alpha", 0.02))
+        area_sum_ema: float | None = None
 
         try:
             with csv_path.open("w", newline="", encoding="utf-8") as file:
@@ -209,12 +218,21 @@ class AreaTrendLogger:
                         # 如果连续采集意外停住，这里不会把同一批旧数据反复写很多行。
                         if now >= next_record_time and samples and last_seen_frame_id > last_recorded_frame_id:
                             row = self._build_csv_row(samples, settings)
+                            area_sum_mean = row.get("area_sum_mean")
+                            if ema_alpha > 0 and area_sum_mean is not None:
+                                raw_value = float(area_sum_mean)
+                                area_sum_ema = raw_value if area_sum_ema is None else (
+                                    ema_alpha * raw_value + (1.0 - ema_alpha) * area_sum_ema
+                                )
+                            row["area_sum_ema_alpha"] = ema_alpha
+                            row["area_sum_ema"] = area_sum_ema
                             writer.writerow(row)
                             file.flush()
                             last_recorded_frame_id = last_seen_frame_id
                             with self._lock:
                                 self._records_written += 1
                                 self._latest_stats = dict(row)
+                                self._recent_stats.append(dict(row))
                             next_record_time = now + record_period
 
                     except Exception as exc:
@@ -288,12 +306,18 @@ class AreaTrendLogger:
         recent = list(samples)[-window_frames:]
         areas = np.asarray([sample.area for sample in recent], dtype=float)
         area2_values = [sample.area2 for sample in recent if sample.area2 is not None]
+        area_sums = np.asarray(
+            [sample.area + (0.0 if sample.area2 is None else sample.area2) for sample in recent],
+            dtype=float,
+        )
         frame_ids = [sample.frame_id for sample in recent]
 
         area_stats = _area_stats(areas)
         area2_stats = _area_stats(np.asarray(area2_values, dtype=float)) if area2_values else {}
+        area_sum_stats = _area_stats(area_sums)
 
         latest = recent[-1]
+        latest_area_sum = latest.area + (0.0 if latest.area2 is None else latest.area2)
         return {
             "iso_time": datetime.fromtimestamp(latest.timestamp).isoformat(timespec="seconds"),
             "unix_time": latest.timestamp,
@@ -315,10 +339,20 @@ class AreaTrendLogger:
             "area2_mean": area2_stats.get("mean"),
             "area2_std": area2_stats.get("std"),
             "area2_rel_std_percent": area2_stats.get("rel_std_percent"),
+            "area_sum_current": latest_area_sum,
+            "area_sum_mean": area_sum_stats["mean"],
+            "area_sum_std": area_sum_stats["std"],
+            "area_sum_rel_std_percent": area_sum_stats["rel_std_percent"],
+            "area_sum_ema_alpha": float(settings.get("ema_alpha", 0.02)),
+            "area_sum_ema": None,
             "shot2shot_last_delta": area_stats["last_delta"],
             "shot2shot_last_delta_rel_percent": area_stats["last_delta_rel_percent"],
             "shot2shot_std": area_stats["shot2shot_std"],
             "shot2shot_rel_std_percent": area_stats["shot2shot_rel_std_percent"],
+            "area_sum_shot2shot_last_delta": area_sum_stats["last_delta"],
+            "area_sum_shot2shot_last_delta_rel_percent": area_sum_stats["last_delta_rel_percent"],
+            "area_sum_shot2shot_std": area_sum_stats["shot2shot_std"],
+            "area_sum_shot2shot_rel_std_percent": area_sum_stats["shot2shot_rel_std_percent"],
             "area2_shot2shot_last_delta": area2_stats.get("last_delta"),
             "area2_shot2shot_last_delta_rel_percent": area2_stats.get("last_delta_rel_percent"),
             "area2_shot2shot_std": area2_stats.get("shot2shot_std"),
@@ -452,10 +486,20 @@ def _csv_fieldnames() -> list[str]:
         "area2_mean",
         "area2_std",
         "area2_rel_std_percent",
+        "area_sum_current",
+        "area_sum_mean",
+        "area_sum_std",
+        "area_sum_rel_std_percent",
+        "area_sum_ema_alpha",
+        "area_sum_ema",
         "shot2shot_last_delta",
         "shot2shot_last_delta_rel_percent",
         "shot2shot_std",
         "shot2shot_rel_std_percent",
+        "area_sum_shot2shot_last_delta",
+        "area_sum_shot2shot_last_delta_rel_percent",
+        "area_sum_shot2shot_std",
+        "area_sum_shot2shot_rel_std_percent",
         "area2_shot2shot_last_delta",
         "area2_shot2shot_last_delta_rel_percent",
         "area2_shot2shot_std",

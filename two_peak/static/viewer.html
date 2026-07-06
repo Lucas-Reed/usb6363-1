@@ -392,6 +392,8 @@
       <input id="trend_record_hz" type="number" value="1" min="0.01" step="0.5">
     </div>
   </div>
+  <label>面积和 EMA alpha，0 表示关闭滤波</label>
+  <input id="trend_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.005">
   <div class="grid2">
     <div>
       <label>记录状态</label>
@@ -406,6 +408,9 @@
   <input id="trend_file" value="" readonly>
   <label>最新统计</label>
   <input id="trend_latest" value="--" readonly>
+  <div class="plot" style="height:160px; margin-top:8px;">
+    <canvas id="areaTrendCanvas"></canvas>
+  </div>
   <div class="actions">
     <button class="green" id="trendStartBtn" onclick="startAreaTrend()">开始慢漂记录</button>
     <button class="secondary" id="trendStopBtn" onclick="stopAreaTrend()" disabled>停止慢漂记录</button>
@@ -487,6 +492,7 @@ function getTrendParams() {
     area2_right: document.getElementById('manual_area2_right').value,
     window_frames: Number(document.getElementById('trend_window_frames').value),
     record_hz: Number(document.getElementById('trend_record_hz').value),
+    ema_alpha: Number(document.getElementById('trend_ema_alpha').value),
   };
 }
 
@@ -541,6 +547,10 @@ function applyDefaultsToUi(defaults) {
   setInputValue('x_end', defaults.x_end);
   setInputValue('trend_window_frames', defaults.window_frames || defaults.trend_window_frames);
   setInputValue('trend_record_hz', defaults.record_hz || defaults.trend_record_hz);
+  setInputValue(
+    'trend_ema_alpha',
+    defaults.ema_alpha !== undefined ? defaults.ema_alpha : defaults.trend_ema_alpha,
+  );
   updateDerivedTimingFromInputs();
   applyXView(false);
 }
@@ -758,21 +768,22 @@ function updateTrendStatus(status) {
     : 0;
   document.getElementById('trend_file').value = status && status.csv_file ? status.csv_file : '';
 
-  if (latest.area_mean !== undefined) {
-    const rel = latest.area_rel_std_percent === null || latest.area_rel_std_percent === undefined
+  if (latest.area_sum_mean !== undefined) {
+    const rel = latest.area_sum_rel_std_percent === null || latest.area_sum_rel_std_percent === undefined
       ? '--'
-      : `${formatNumber(latest.area_rel_std_percent, 3)}%`;
-    const shot = latest.shot2shot_rel_std_percent === null || latest.shot2shot_rel_std_percent === undefined
+      : `${formatNumber(latest.area_sum_rel_std_percent, 3)}%`;
+    const shot = latest.area_sum_shot2shot_rel_std_percent === null || latest.area_sum_shot2shot_rel_std_percent === undefined
       ? '--'
-      : `${formatNumber(latest.shot2shot_rel_std_percent, 3)}%`;
-    const area2Text = latest.area2_mean === null || latest.area2_mean === undefined
-      ? ''
-      : `  B=${Number(latest.area2_mean).toExponential(6)}`;
+      : `${formatNumber(latest.area_sum_shot2shot_rel_std_percent, 3)}%`;
+    const emaText = latest.area_sum_ema === null || latest.area_sum_ema === undefined
+      ? 'EMA=--'
+      : `EMA=${Number(latest.area_sum_ema).toExponential(6)}`;
     document.getElementById('trend_latest').value =
-      `A=${Number(latest.area_mean).toExponential(6)}${area2Text}  A_std=${rel}  A_shot=${shot}`;
+      `SUM=${Number(latest.area_sum_mean).toExponential(6)}  ${emaText}  std=${rel}  shot=${shot}`;
   } else {
     document.getElementById('trend_latest').value = '--';
   }
+  drawAreaTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
 
   document.getElementById('trendStartBtn').disabled = running;
   document.getElementById('trendStopBtn').disabled = !running;
@@ -783,6 +794,93 @@ function updateTrendStatus(status) {
     clearInterval(trendTimer);
     trendTimer = null;
   }
+}
+
+function drawAreaTrend(rows) {
+  const canvas = document.getElementById('areaTrendCanvas');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const devicePixelRatio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(rect.width * devicePixelRatio));
+  canvas.height = Math.max(1, Math.floor(rect.height * devicePixelRatio));
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const points = (rows || [])
+    .filter(row => row.area_sum_mean !== null && row.area_sum_mean !== undefined)
+    .slice(-300);
+  if (points.length < 2) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
+    ctx.fillText('等待面积记录...', 10 * devicePixelRatio, 24 * devicePixelRatio);
+    return;
+  }
+
+  const rawValues = points.map(row => Number(row.area_sum_mean));
+  const emaValues = points
+    .map(row => row.area_sum_ema === null || row.area_sum_ema === undefined ? NaN : Number(row.area_sum_ema))
+    .filter(value => Number.isFinite(value));
+  const allValues = rawValues.concat(emaValues);
+  let min = Math.min(...allValues);
+  let max = Math.max(...allValues);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return;
+  if (max === min) {
+    max += 1;
+    min -= 1;
+  }
+
+  const padL = 42 * devicePixelRatio;
+  const padR = 10 * devicePixelRatio;
+  const padT = 16 * devicePixelRatio;
+  const padB = 24 * devicePixelRatio;
+  const plotW = canvas.width - padL - padR;
+  const plotH = canvas.height - padT - padB;
+  const xFor = index => padL + (index / Math.max(1, points.length - 1)) * plotW;
+  const yFor = value => padT + (1 - (value - min) / (max - min)) * plotH;
+
+  ctx.strokeStyle = '#d1d5db';
+  ctx.lineWidth = 1 * devicePixelRatio;
+  ctx.strokeRect(padL, padT, plotW, plotH);
+  ctx.fillStyle = '#6b7280';
+  ctx.font = `${10 * devicePixelRatio}px Segoe UI`;
+  ctx.fillText(max.toExponential(2), 4 * devicePixelRatio, padT + 8 * devicePixelRatio);
+  ctx.fillText(min.toExponential(2), 4 * devicePixelRatio, padT + plotH);
+
+  drawTrendLine(ctx, rawValues, xFor, yFor, '#2563eb', devicePixelRatio);
+  drawTrendLine(
+    ctx,
+    points.map(row => row.area_sum_ema === null || row.area_sum_ema === undefined ? NaN : Number(row.area_sum_ema)),
+    xFor,
+    yFor,
+    '#dc2626',
+    devicePixelRatio,
+  );
+
+  ctx.fillStyle = '#2563eb';
+  ctx.fillText('SUM raw', padL, canvas.height - 8 * devicePixelRatio);
+  ctx.fillStyle = '#dc2626';
+  ctx.fillText('EMA', padL + 76 * devicePixelRatio, canvas.height - 8 * devicePixelRatio);
+}
+
+function drawTrendLine(ctx, values, xFor, yFor, color, devicePixelRatio) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.4 * devicePixelRatio;
+  ctx.beginPath();
+  let started = false;
+  values.forEach((value, index) => {
+    if (!Number.isFinite(value)) return;
+    const x = xFor(index);
+    const y = yFor(value);
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  if (started) ctx.stroke();
 }
 
 async function refreshTrendStatus(showStatus = false) {
@@ -814,6 +912,10 @@ async function startAreaTrend() {
   }
   if ((params.area2_left === '') !== (params.area2_right === '')) {
     setStatus('面积 B 的左右零点需要同时设置，或者同时留空。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.ema_alpha) || params.ema_alpha < 0 || params.ema_alpha > 1) {
+    setStatus('EMA alpha 需要在 0 到 1 之间。', 'error');
     return;
   }
   if (!streamRunning) {
