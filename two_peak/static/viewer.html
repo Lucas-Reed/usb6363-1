@@ -626,9 +626,24 @@
   </div>
   <label>锁定更新周期 / s</label>
   <input id="lock_update_s" type="number" value="1.0" min="0.1" step="0.1">
+  <div class="grid2">
+    <div>
+      <label>锁定状态</label>
+      <input id="power_lock_status" value="停止" readonly>
+    </div>
+    <div>
+      <label>更新次数</label>
+      <input id="power_lock_iterations" value="0" readonly>
+    </div>
+  </div>
+  <label>EOM 状态</label>
+  <input id="power_lock_eom_status" value="--" readonly>
+  <label>AOM 状态</label>
+  <input id="power_lock_aom_status" value="--" readonly>
   <div class="actions">
     <button class="secondary" onclick="writePowerLockInitialAo()">写入初始 AO 电压</button>
-    <button class="secondary" disabled>启动锁定（下一步）</button>
+    <button class="green" id="powerLockStartBtn" onclick="startPowerLock()">启动锁定</button>
+    <button class="secondary" id="powerLockStopBtn" onclick="stopPowerLock()" disabled>停止锁定</button>
   </div>
 </aside>
 
@@ -652,6 +667,7 @@ let streamPollInFlight = false;
 let streamConsecutiveErrors = 0;
 let trendTimer = null;
 let aoScanTimer = null;
+let powerLockTimer = null;
 let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
@@ -1516,6 +1532,94 @@ async function writePowerLockInitialAo() {
   }
 }
 
+function formatPowerLockState(state) {
+  if (!state) return '--';
+  const measured = state.measured === null || state.measured === undefined
+    ? '--'
+    : Number(state.measured).toExponential(5);
+  const errorPercent = state.relative_error === null || state.relative_error === undefined
+    ? '--'
+    : `${formatNumber(Number(state.relative_error) * 100, 3)}%`;
+  const voltage = state.voltage === null || state.voltage === undefined
+    ? '--'
+    : `${formatNumber(state.voltage, 5)} V`;
+  const limited = state.limited ? '  LIMIT' : '';
+  return `${state.feedback_field}=${measured}  err=${errorPercent}  AO=${voltage}${limited}`;
+}
+
+function updatePowerLockStatus(status) {
+  const running = Boolean(status && status.running);
+  const error = status && status.error ? status.error : '';
+  const states = status && Array.isArray(status.states) ? status.states : [];
+  const eomState = states.find(state => state.name === 'EOM') || states[0];
+  const aomState = states.find(state => state.name === 'AOM') || states[1];
+
+  document.getElementById('power_lock_status').value = error || (running ? '锁定中' : '停止');
+  document.getElementById('power_lock_iterations').value = status && status.iterations !== undefined
+    ? String(status.iterations)
+    : '0';
+  document.getElementById('power_lock_eom_status').value = formatPowerLockState(eomState);
+  document.getElementById('power_lock_aom_status').value = formatPowerLockState(aomState);
+  document.getElementById('powerLockStartBtn').disabled = running;
+  document.getElementById('powerLockStopBtn').disabled = !running;
+
+  if (running && powerLockTimer === null) {
+    powerLockTimer = setInterval(() => refreshPowerLockStatus(false), 1000);
+  }
+  if (!running && powerLockTimer !== null) {
+    clearInterval(powerLockTimer);
+    powerLockTimer = null;
+  }
+}
+
+async function refreshPowerLockStatus(showStatus = false) {
+  try {
+    const response = await fetch('/api/power_lock/status');
+    const status = await response.json();
+    if (!response.ok || status.ok === false) {
+      throw new Error(status.error || '查询功率锁定状态失败');
+    }
+    updatePowerLockStatus(status);
+    if (showStatus && status.running) {
+      setStatus('检测到功率锁定正在运行，已接管状态。', 'ok');
+    }
+  } catch (err) {
+    if (showStatus) {
+      setStatus(String(err.message || err), 'error');
+    }
+  }
+}
+
+async function startPowerLock() {
+  try {
+    const controllers = buildPowerLockControllers();
+    controllers.forEach(validatePowerLockController);
+    const updateS = Number(document.getElementById('lock_update_s').value);
+    if (!Number.isFinite(updateS) || updateS <= 0) {
+      throw new Error('锁定更新周期必须 > 0。');
+    }
+    const status = await postJson('/api/power_lock/start', {
+      controllers,
+      update_s: updateS,
+    });
+    updatePowerLockStatus(status);
+    setStatus('双路慢速功率锁定已启动。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshPowerLockStatus(false);
+  }
+}
+
+async function stopPowerLock() {
+  try {
+    const status = await postJson('/api/power_lock/stop', {});
+    updatePowerLockStatus(status);
+    setStatus('双路慢速功率锁定已停止，AO 保持最后输出。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
 async function pollBackendStreamLatest() {
   if (!streamRunning) return;
   if (streamPollInFlight) return;
@@ -2032,6 +2136,7 @@ refreshSavedSamples();
 syncBackendStreamStatus(true);
 refreshTrendStatus(true);
 refreshAoScanStatus(true);
+refreshPowerLockStatus(true);
 </script>
 </body>
 </html>

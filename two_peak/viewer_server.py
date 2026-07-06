@@ -77,6 +77,8 @@ def make_handler(state: ViewerState):
                     self._send_json(get_area_trend_status(state))
                 elif path == "/api/ao_scan/status":
                     self._send_json(state.ao_scan_calibrator.status())
+                elif path == "/api/power_lock/status":
+                    self._send_json(state.power_lock.status())
                 elif path == "/api/samples":
                     self._send_json(list_saved_frames(state))
                 else:
@@ -120,6 +122,16 @@ def make_handler(state: ViewerState):
                 elif self.path == "/api/power_lock/write_initial_ao":
                     body = self._read_json()
                     self._send_json(_write_power_lock_initial_ao(state, body))
+                elif self.path == "/api/power_lock/start":
+                    body = self._read_json()
+                    self._send_json(
+                        state.power_lock.start(
+                            controllers=body.get("controllers", []),
+                            update_s=float(body.get("update_s", 1.0)),
+                        )
+                    )
+                elif self.path == "/api/power_lock/stop":
+                    self._send_json(state.power_lock.stop())
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)

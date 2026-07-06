@@ -8,6 +8,7 @@ from typing import Any
 
 from two_peak.ao_scan_calibrator import AoScanCalibrator
 from two_peak.config import TwoPeakSettings
+from two_peak.power_lock import PowerLockController
 from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
 
@@ -41,6 +42,12 @@ class ViewerState:
             daq=self.daq,
             trend_logger=self.trend_logger,
             output_dir=sample_dir.parent / "ao_scan_calibrations",
+        )
+        # 双路慢速功率锁定器读取面积慢漂统计，并通过 daq client 写 AO。
+        # 它只在用户点击“启动锁定”后运行，默认不会自动闭环。
+        self.power_lock = PowerLockController(
+            daq=self.daq,
+            trend_logger=self.trend_logger,
         )
 
     def factory_web_defaults(self) -> dict[str, Any]:
