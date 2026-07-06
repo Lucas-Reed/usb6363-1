@@ -697,6 +697,8 @@ let streamConsecutiveErrors = 0;
 let trendTimer = null;
 let aoScanTimer = null;
 let powerLockTimer = null;
+let trendRunning = false;
+let latestTrendStats = null;
 let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
@@ -1127,6 +1129,8 @@ async function syncBackendStreamStatus(showStatus = false) {
 function updateTrendStatus(status) {
   const running = Boolean(status && status.running);
   const latest = status && status.latest_stats ? status.latest_stats : {};
+  trendRunning = running;
+  latestTrendStats = Object.keys(latest).length ? latest : null;
   const error = status && status.error ? `错误：${status.error}` : '';
   document.getElementById('trend_status').value = error || (running ? '记录中' : '停止');
   document.getElementById('trend_records').value = status && status.records_written !== undefined
@@ -1156,6 +1160,9 @@ function updateTrendStatus(status) {
     document.getElementById('trend_latest').value = '--';
   }
   drawAreaTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
+  updateManualAreaTable();
+  updateDualAreaTable();
+  renderPlots();
 
   document.getElementById('trendStartBtn').disabled = running;
   document.getElementById('trendStopBtn').disabled = !running;
@@ -1968,6 +1975,32 @@ function drawWaveform(canvas, data, channelIndex) {
   ctx.fillText(`x ${range.start}-${range.end}`, x0 + 300 * devicePixelRatio, h - 8 * devicePixelRatio);
 }
 
+function getActiveAreaStats() {
+  // 面积慢漂记录运行时，功率锁定实际读取的就是 latestTrendStats。
+  // 因此画线和表格也必须优先使用这份后端统计，不能再使用输入框里的旧窗口。
+  if (!trendRunning || !latestTrendStats) return null;
+  if (latestTrendStats.area_left === undefined || latestTrendStats.area_right === undefined) return null;
+  return latestTrendStats;
+}
+
+function getDisplayedAreaEdges() {
+  const stats = getActiveAreaStats();
+  if (stats) {
+    return [
+      {index: Number(stats.area_left), label: 'A-L', color: '#7c3aed'},
+      {index: Number(stats.area_right), label: 'A-R', color: '#7c3aed'},
+      {index: Number(stats.area2_left), label: 'B-L', color: '#16803c'},
+      {index: Number(stats.area2_right), label: 'B-R', color: '#16803c'},
+    ];
+  }
+  return [
+    {index: Number(document.getElementById('manual_area_left').value), label: 'A-L', color: '#7c3aed'},
+    {index: Number(document.getElementById('manual_area_right').value), label: 'A-R', color: '#7c3aed'},
+    {index: Number(document.getElementById('manual_area2_left').value), label: 'B-L', color: '#16803c'},
+    {index: Number(document.getElementById('manual_area2_right').value), label: 'B-R', color: '#16803c'},
+  ];
+}
+
 function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, range) {
   const analysisIndex = Number(document.getElementById('analysis_channel_index').value);
   if (channelIndex !== analysisIndex) return;
@@ -1990,14 +2023,9 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
     ctx.fillText(i === 0 ? 'P1' : 'P2', x + 4 * devicePixelRatio, y0 + 16 * devicePixelRatio);
   });
 
-  const areaEdges = [
-    {id: 'manual_area_left', label: 'A-L', color: '#7c3aed'},
-    {id: 'manual_area_right', label: 'A-R', color: '#7c3aed'},
-    {id: 'manual_area2_left', label: 'B-L', color: '#16803c'},
-    {id: 'manual_area2_right', label: 'B-R', color: '#16803c'},
-  ];
+  const areaEdges = getDisplayedAreaEdges();
   areaEdges.forEach(edge => {
-    const idx = Number(document.getElementById(edge.id).value);
+    const idx = Number(edge.index);
     if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
     const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
     ctx.strokeStyle = edge.color;
@@ -2121,6 +2149,18 @@ function updateDualAreaHistory() {
 
 function updateManualAreaTable() {
   const rows = document.getElementById('manualAreaRows');
+  const trendStats = getActiveAreaStats();
+  if (trendStats) {
+    rows.innerHTML = `
+      <tr><td>范围</td><td>${trendStats.area_left}-${trendStats.area_right}</td></tr>
+      <tr><td>当前面积</td><td>${Number(trendStats.area_current).toExponential(6)}</td></tr>
+      <tr><td>均值</td><td>${Number(trendStats.area_mean).toExponential(6)}</td></tr>
+      <tr><td>EMA</td><td>${trendStats.area_ema === null || trendStats.area_ema === undefined ? '--' : Number(trendStats.area_ema).toExponential(6)}</td></tr>
+      <tr><td>标准差</td><td>${Number(trendStats.area_std).toExponential(6)} / ${trendStats.sample_count} 帧</td></tr>
+    `;
+    return;
+  }
+
   const area = latestMeasurement ? latestMeasurement.manual_area : null;
   if (!area) {
     rows.innerHTML = '<tr><td>面积</td><td>--</td></tr><tr><td>最近抖动</td><td>--</td></tr>';
@@ -2140,6 +2180,50 @@ function updateManualAreaTable() {
     <tr><td>最近均值</td><td>${mean.toExponential(6)}</td></tr>
     <tr><td>最近标准差</td><td>${std.toExponential(6)} / ${manualAreaHistory.length} 帧</td></tr>
   `;
+}
+
+function trendAreaStats(name) {
+  const stats = getActiveAreaStats();
+  if (!stats) return null;
+  if (name === 'A') {
+    return {
+      range: `${stats.area_left}-${stats.area_right}`,
+      current: stats.area_current,
+      mean: stats.area_mean,
+      ema: stats.area_ema,
+      std: stats.area_std,
+      sampleCount: stats.sample_count,
+    };
+  }
+  if (stats.area2_left === null || stats.area2_left === undefined) return null;
+  return {
+    range: `${stats.area2_left}-${stats.area2_right}`,
+    current: stats.area2_current,
+    mean: stats.area2_mean,
+    ema: stats.area2_ema,
+    std: stats.area2_std,
+    sampleCount: stats.sample_count,
+  };
+}
+
+function formatTrendAreaStats(stats) {
+  if (!stats || stats.current === null || stats.current === undefined) {
+    return {range: '--', current: '--', stats: '--'};
+  }
+  const meanText = stats.mean === null || stats.mean === undefined
+    ? '--'
+    : Number(stats.mean).toExponential(6);
+  const stdText = stats.std === null || stats.std === undefined
+    ? '--'
+    : Number(stats.std).toExponential(6);
+  const emaText = stats.ema === null || stats.ema === undefined
+    ? '--'
+    : Number(stats.ema).toExponential(6);
+  return {
+    range: stats.range,
+    current: Number(stats.current).toExponential(6),
+    stats: `${meanText} / ${stdText} / EMA ${emaText} / ${stats.sampleCount || 0} 帧`,
+  };
 }
 
 function areaStats(history, area) {
@@ -2163,6 +2247,17 @@ function areaStats(history, area) {
 
 function updateDualAreaTable() {
   const rows = document.getElementById('dualAreaRows');
+  const trendStats = getActiveAreaStats();
+  if (trendStats) {
+    const statsA = formatTrendAreaStats(trendAreaStats('A'));
+    const statsB = formatTrendAreaStats(trendAreaStats('B'));
+    rows.innerHTML = `
+      <tr><td>A</td><td>${statsA.range}</td><td>${statsA.current}</td><td>${statsA.stats}</td></tr>
+      <tr><td>B</td><td>${statsB.range}</td><td>${statsB.current}</td><td>${statsB.stats}</td></tr>
+    `;
+    return;
+  }
+
   const areaA = getAreaByName('A') || (latestMeasurement ? latestMeasurement.manual_area : null);
   const areaB = getAreaByName('B');
   const statsA = areaStats(manualAreaHistory, areaA);
