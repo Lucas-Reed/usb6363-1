@@ -303,6 +303,88 @@ def write_ao_voltages(
         task.write(values, auto_start=True, timeout=timeout)
 
 
+class StaticAoVoltageSession:
+    """保持打开的静态 AO 输出会话。
+
+    旧版 legacy 程序的 AO 输出是这样工作的：
+    1. 创建一个包含 ao0/ao1 的 AO task。
+    2. task.start()。
+    3. 锁定期间反复 task.write([ao0, ao1])。
+    4. 程序结束时才关闭 task。
+
+    功率锁定也应该采用这种方式。这样 AO task 不会在每次写入后关闭，
+    可以避免某些硬件/驱动组合在 task 关闭后让输出回落到 0。
+    """
+
+    def __init__(
+        self,
+        device_name: str,
+        outputs: list[dict[str, float | str]],
+        timeout: float,
+    ) -> None:
+        _get_device(device_name)
+        if not outputs:
+            raise ValueError("outputs must not be empty")
+
+        nidaqmx_module, _, _, _, _ = _load_nidaqmx()
+        self._task = nidaqmx_module.Task()
+        self._channels: list[str] = []
+        self._closed = False
+
+        try:
+            for output in outputs:
+                physical_channel = str(output["physical_channel"])
+                self._task.ao_channels.add_ao_voltage_chan(
+                    physical_channel,
+                    min_val=float(output["min_val"]),
+                    max_val=float(output["max_val"]),
+                )
+                self._channels.append(physical_channel)
+
+            self._task.start()
+            self.write(outputs, timeout=timeout)
+        except Exception:
+            self.close()
+            raise
+
+    @property
+    def channels(self) -> list[str]:
+        """返回这个 AO session 管理的物理通道顺序。"""
+
+        return list(self._channels)
+
+    def write(self, outputs: list[dict[str, float | str]], timeout: float) -> None:
+        """向已经打开的 AO task 写入一组电压。"""
+
+        if self._closed:
+            raise RuntimeError("AO voltage session is already closed")
+
+        values_by_channel = {
+            str(output["physical_channel"]): float(output["value"])
+            for output in outputs
+        }
+        missing = [channel for channel in self._channels if channel not in values_by_channel]
+        if missing:
+            raise ValueError(f"AO session missing values for channels: {missing}")
+
+        values = [values_by_channel[channel] for channel in self._channels]
+        self._task.write(values, auto_start=False, timeout=timeout)
+
+    def close(self) -> None:
+        """关闭 AO task。注意：某些设备在关闭后可能不再保持最后输出。"""
+
+        if self._closed:
+            return
+        try:
+            self._task.stop()
+        except Exception:
+            pass
+        try:
+            self._task.close()
+        finally:
+            self._closed = True
+
+
 def read_digital_line(device_name: str, physical_line: str, timeout: float) -> bool:
     """读取数字线或 PFI 电平。"""
 
