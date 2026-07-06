@@ -974,6 +974,69 @@ class DaqController:
             "value": float(value),
         }
 
+    def write_ao_voltages(
+        self,
+        outputs: list[dict[str, Any]],
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """同时输出多个静态 AO 电压。
+
+        这个接口主要给双路功率锁定使用。它和连续波形输出不是一回事：
+        这里只是把 ao0/ao1 等通道的“当前直流电压”一次性写到硬件。
+        """
+
+        if not outputs:
+            raise ValueError("outputs must not be empty")
+
+        normalized_outputs: list[dict[str, Any]] = []
+        seen_channels: set[str] = set()
+        for output in outputs:
+            channel = str(output.get("channel", "")).strip()
+            if not channel:
+                raise ValueError("AO output channel is empty")
+
+            physical_channel = self._normalize_ao_channel(channel)
+            if physical_channel in seen_channels:
+                raise ValueError(f"duplicate AO channel: {physical_channel}")
+            seen_channels.add(physical_channel)
+
+            value = float(output["value"])
+            min_val = float(output.get("min_val", -10.0))
+            max_val = float(output.get("max_val", 10.0))
+            if min_val >= max_val:
+                raise ValueError(f"{physical_channel} min_val must be smaller than max_val")
+            if not min_val <= value <= max_val:
+                raise ValueError(f"{physical_channel} value must be between {min_val} and {max_val}")
+
+            normalized_outputs.append(
+                {
+                    "physical_channel": physical_channel,
+                    "value": value,
+                    "min_val": min_val,
+                    "max_val": max_val,
+                }
+            )
+
+        with self._hardware_lock:
+            nidaqmx_driver.write_ao_voltages(
+                device_name=self.device_name,
+                outputs=normalized_outputs,
+                timeout=timeout,
+            )
+
+        return {
+            "device": self.device_name,
+            "outputs": [
+                {
+                    "channel": output["physical_channel"],
+                    "value": output["value"],
+                    "min_val": output["min_val"],
+                    "max_val": output["max_val"],
+                }
+                for output in normalized_outputs
+            ],
+        }
+
     def read_digital_line(self, line: str = "PFI0", timeout: float = 10.0) -> dict[str, Any]:
         """读取一个数字线或 PFI 端子的高低电平。"""
 

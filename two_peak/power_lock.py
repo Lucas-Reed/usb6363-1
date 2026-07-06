@@ -72,6 +72,8 @@ class PowerLockController:
                         "feedback_field": controller["feedback_field"],
                         "target": controller["target"],
                         "voltage": controller["initial_voltage"],
+                        "min_voltage": controller["min_voltage"],
+                        "max_voltage": controller["max_voltage"],
                         "integral": 0.0,
                         "measured": None,
                         "relative_error": None,
@@ -150,13 +152,17 @@ class PowerLockController:
 
         try:
             # 启动锁定时先写一次初始电压，确保软件状态和硬件状态一致。
-            for controller in controllers:
-                self._daq.write_ao(
-                    channel=controller["channel"],
-                    value=controller["initial_voltage"],
-                    min_val=controller["min_voltage"],
-                    max_val=controller["max_voltage"],
-                )
+            self._write_controller_voltages(
+                [
+                    {
+                        "channel": controller["channel"],
+                        "voltage": controller["initial_voltage"],
+                        "min_voltage": controller["min_voltage"],
+                        "max_voltage": controller["max_voltage"],
+                    }
+                    for controller in controllers
+                ]
+            )
 
             last_time = time.time()
             while not stop_event.is_set():
@@ -176,6 +182,8 @@ class PowerLockController:
                     previous = self._states[index] if index < len(self._states) else {}
                     state = self._update_one_controller(controller, previous, latest, dt)
                     next_states.append(state)
+
+                self._write_controller_voltages(next_states)
 
                 with self._lock:
                     self._states = next_states
@@ -232,13 +240,6 @@ class PowerLockController:
         if limited:
             integral -= relative_error * dt
 
-        self._daq.write_ao(
-            channel=controller["channel"],
-            value=voltage,
-            min_val=controller["min_voltage"],
-            max_val=controller["max_voltage"],
-        )
-
         return {
             "name": controller["name"],
             "channel": controller["channel"],
@@ -247,10 +248,31 @@ class PowerLockController:
             "measured": measured,
             "relative_error": relative_error,
             "voltage": voltage,
+            "min_voltage": controller["min_voltage"],
+            "max_voltage": controller["max_voltage"],
             "command_delta": voltage - old_voltage,
             "integral": integral,
             "limited": limited,
         }
+
+    def _write_controller_voltages(self, states: list[dict[str, Any]]) -> None:
+        """把所有控制通道放在同一个 AO task 里同时写入。
+
+        这里刻意不循环调用 write_ao。循环单通道写入可能导致后写的通道影响先写通道的保持状态，
+        用户在示波器上看到的“电脑显示升高、真实电压归零”就很像这个问题。
+        """
+
+        outputs = []
+        for state in states:
+            outputs.append(
+                {
+                    "channel": state["channel"],
+                    "value": float(state["voltage"]),
+                    "min_val": float(state["min_voltage"]),
+                    "max_val": float(state["max_voltage"]),
+                }
+            )
+        self._daq.write_ao_many(outputs=outputs)
 
 
 def _validate_controller(controller: dict[str, Any]) -> dict[str, Any] | None:

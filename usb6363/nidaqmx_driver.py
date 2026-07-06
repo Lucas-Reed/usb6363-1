@@ -273,6 +273,36 @@ def write_ao_voltage(
         task.write(float(value), auto_start=True, timeout=timeout)
 
 
+def write_ao_voltages(
+    device_name: str,
+    outputs: list[dict[str, float | str]],
+    timeout: float,
+) -> None:
+    """在同一个 NI-DAQmx AO task 中同时写多个静态电压。
+
+    双路功率锁定需要同时控制 ao0/ao1。如果分成两个单通道 task 写，
+    某些 NI 设备/驱动组合在关闭第二个 task 时可能会影响第一个 AO 的保持状态。
+    因此这里把多个 AO 通道放进同一个 task，一次性写入一组电压。
+    """
+
+    _get_device(device_name)
+    if not outputs:
+        raise ValueError("outputs must not be empty")
+
+    nidaqmx_module, _, _, _, _ = _load_nidaqmx()
+    with nidaqmx_module.Task() as task:
+        values: list[float] = []
+        for output in outputs:
+            task.ao_channels.add_ao_voltage_chan(
+                str(output["physical_channel"]),
+                min_val=float(output["min_val"]),
+                max_val=float(output["max_val"]),
+            )
+            values.append(float(output["value"]))
+
+        task.write(values, auto_start=True, timeout=timeout)
+
+
 def read_digital_line(device_name: str, physical_line: str, timeout: float) -> bool:
     """读取数字线或 PFI 电平。"""
 
