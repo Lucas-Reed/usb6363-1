@@ -415,6 +415,82 @@
     <button class="green" id="trendStartBtn" onclick="startAreaTrend()">开始慢漂记录</button>
     <button class="secondary" id="trendStopBtn" onclick="stopAreaTrend()" disabled>停止慢漂记录</button>
   </div>
+
+  <h2>AO 扫描标定</h2>
+  <div class="grid2">
+    <div>
+      <label>AO 通道</label>
+      <input id="ao_scan_channel" value="ao0">
+    </div>
+    <div>
+      <label>测量字段</label>
+      <select id="ao_scan_measure_field">
+        <option value="area_sum_ema">area_sum_ema</option>
+        <option value="area_sum_mean">area_sum_mean</option>
+      </select>
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>起始电压 / V</label>
+      <input id="ao_scan_start_voltage" type="number" value="0" step="0.01">
+    </div>
+    <div>
+      <label>终止电压 / V</label>
+      <input id="ao_scan_stop_voltage" type="number" value="1" step="0.01">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>步长 / V</label>
+      <input id="ao_scan_step_voltage" type="number" value="0.05" step="0.01">
+    </div>
+    <div>
+      <label>结束恢复电压 / V，留空则保持</label>
+      <input id="ao_scan_restore_voltage" type="number" value="" step="0.01" placeholder="保持最后电压">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AO 最小值 / V</label>
+      <input id="ao_scan_min_val" type="number" value="-10" step="0.1">
+    </div>
+    <div>
+      <label>AO 最大值 / V</label>
+      <input id="ao_scan_max_val" type="number" value="10" step="0.1">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>改电压后等待 / s</label>
+      <input id="ao_scan_settle_s" type="number" value="0.5" min="0" step="0.1">
+    </div>
+    <div>
+      <label>每点测量时间 / s</label>
+      <input id="ao_scan_dwell_s" type="number" value="2" min="0.1" step="0.1">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>扫描状态</label>
+      <input id="ao_scan_status" value="停止" readonly>
+    </div>
+    <div>
+      <label>已完成点数</label>
+      <input id="ao_scan_points" value="0" readonly>
+    </div>
+  </div>
+  <label>标定 CSV 文件</label>
+  <input id="ao_scan_file" value="" readonly>
+  <label>最新标定点</label>
+  <input id="ao_scan_latest" value="--" readonly>
+  <div class="plot" style="height:160px; margin-top:8px;">
+    <canvas id="aoScanCanvas"></canvas>
+  </div>
+  <div class="actions">
+    <button class="green" id="aoScanStartBtn" onclick="startAoScan()">开始 AO 扫描</button>
+    <button class="secondary" id="aoScanStopBtn" onclick="stopAoScan()" disabled>停止 AO 扫描</button>
+  </div>
 </aside>
 
 <main>
@@ -436,6 +512,7 @@ let streamLastFrameId = 0;
 let streamPollInFlight = false;
 let streamConsecutiveErrors = 0;
 let trendTimer = null;
+let aoScanTimer = null;
 let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
@@ -496,12 +573,28 @@ function getTrendParams() {
   };
 }
 
+function getAoScanParams() {
+  return {
+    channel: document.getElementById('ao_scan_channel').value,
+    start_voltage: Number(document.getElementById('ao_scan_start_voltage').value),
+    stop_voltage: Number(document.getElementById('ao_scan_stop_voltage').value),
+    step_voltage: Number(document.getElementById('ao_scan_step_voltage').value),
+    min_val: Number(document.getElementById('ao_scan_min_val').value),
+    max_val: Number(document.getElementById('ao_scan_max_val').value),
+    settle_s: Number(document.getElementById('ao_scan_settle_s').value),
+    dwell_s: Number(document.getElementById('ao_scan_dwell_s').value),
+    measure_field: document.getElementById('ao_scan_measure_field').value,
+    restore_voltage: document.getElementById('ao_scan_restore_voltage').value,
+  };
+}
+
 function getAllUiParameters() {
   return {
     ...getCaptureParams(),
     ...getMeasureParams(),
     ...getViewParams(),
     ...getTrendParams(),
+    ...getAoScanParams(),
   };
 }
 
@@ -513,6 +606,13 @@ function setInputValue(id, value) {
   } else {
     element.value = Array.isArray(value) ? value.join(', ') : value;
   }
+}
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
 }
 
 function applyDefaultsToUi(defaults) {
@@ -551,6 +651,16 @@ function applyDefaultsToUi(defaults) {
     'trend_ema_alpha',
     defaults.ema_alpha !== undefined ? defaults.ema_alpha : defaults.trend_ema_alpha,
   );
+  setInputValue('ao_scan_channel', firstDefined(defaults.channel, defaults.ao_scan_channel));
+  setInputValue('ao_scan_start_voltage', firstDefined(defaults.start_voltage, defaults.ao_scan_start_voltage));
+  setInputValue('ao_scan_stop_voltage', firstDefined(defaults.stop_voltage, defaults.ao_scan_stop_voltage));
+  setInputValue('ao_scan_step_voltage', firstDefined(defaults.step_voltage, defaults.ao_scan_step_voltage));
+  setInputValue('ao_scan_min_val', firstDefined(defaults.ao_min_val, defaults.ao_scan_min_val));
+  setInputValue('ao_scan_max_val', firstDefined(defaults.ao_max_val, defaults.ao_scan_max_val));
+  setInputValue('ao_scan_settle_s', firstDefined(defaults.settle_s, defaults.ao_scan_settle_s));
+  setInputValue('ao_scan_dwell_s', firstDefined(defaults.dwell_s, defaults.ao_scan_dwell_s));
+  setInputValue('ao_scan_measure_field', firstDefined(defaults.measure_field, defaults.ao_scan_measure_field));
+  setInputValue('ao_scan_restore_voltage', firstDefined(defaults.restore_voltage, defaults.ao_scan_restore_voltage));
   updateDerivedTimingFromInputs();
   applyXView(false);
 }
@@ -937,6 +1047,183 @@ async function stopAreaTrend() {
     const status = await postJson('/api/trend/stop', {});
     updateTrendStatus(status);
     setStatus('慢漂记录已停止。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+function updateAoScanStatus(status) {
+  const running = Boolean(status && status.running);
+  const error = status && status.error ? status.error : '';
+  const points = status && Array.isArray(status.points) ? status.points : [];
+  const latest = points.length ? points[points.length - 1] : null;
+
+  document.getElementById('ao_scan_status').value = error || (running ? '扫描中' : '停止');
+  document.getElementById('ao_scan_points').value = status && status.points_written !== undefined
+    ? String(status.points_written)
+    : String(points.length);
+  document.getElementById('ao_scan_file').value = status && status.csv_file ? status.csv_file : '';
+  document.getElementById('ao_scan_latest').value = latest
+    ? `V=${formatNumber(latest.ao_voltage, 4)}  area=${Number(latest.area_value_mean).toExponential(6)}  n=${latest.sample_count}`
+    : '--';
+
+  drawAoScan(points);
+  document.getElementById('aoScanStartBtn').disabled = running;
+  document.getElementById('aoScanStopBtn').disabled = !running;
+
+  if (running && aoScanTimer === null) {
+    aoScanTimer = setInterval(() => refreshAoScanStatus(false), 1000);
+  }
+  if (!running && aoScanTimer !== null) {
+    clearInterval(aoScanTimer);
+    aoScanTimer = null;
+  }
+}
+
+function drawAoScan(points) {
+  const canvas = document.getElementById('aoScanCanvas');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const devicePixelRatio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(rect.width * devicePixelRatio));
+  canvas.height = Math.max(1, Math.floor(rect.height * devicePixelRatio));
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const rows = (points || [])
+    .filter(point => point.ao_voltage !== undefined && point.area_value_mean !== undefined)
+    .map(point => ({
+      voltage: Number(point.ao_voltage),
+      value: Number(point.area_value_mean),
+    }))
+    .filter(point => Number.isFinite(point.voltage) && Number.isFinite(point.value));
+
+  if (rows.length < 2) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
+    ctx.fillText('等待 AO 扫描点...', 10 * devicePixelRatio, 24 * devicePixelRatio);
+    return;
+  }
+
+  let minX = Math.min(...rows.map(point => point.voltage));
+  let maxX = Math.max(...rows.map(point => point.voltage));
+  let minY = Math.min(...rows.map(point => point.value));
+  let maxY = Math.max(...rows.map(point => point.value));
+  if (maxX === minX) {
+    maxX += 1;
+    minX -= 1;
+  }
+  if (maxY === minY) {
+    maxY += 1;
+    minY -= 1;
+  }
+
+  const padL = 48 * devicePixelRatio;
+  const padR = 12 * devicePixelRatio;
+  const padT = 16 * devicePixelRatio;
+  const padB = 26 * devicePixelRatio;
+  const plotW = canvas.width - padL - padR;
+  const plotH = canvas.height - padT - padB;
+  const xFor = value => padL + ((value - minX) / (maxX - minX)) * plotW;
+  const yFor = value => padT + (1 - (value - minY) / (maxY - minY)) * plotH;
+
+  ctx.strokeStyle = '#d1d5db';
+  ctx.lineWidth = 1 * devicePixelRatio;
+  ctx.strokeRect(padL, padT, plotW, plotH);
+  ctx.fillStyle = '#6b7280';
+  ctx.font = `${10 * devicePixelRatio}px Segoe UI`;
+  ctx.fillText(maxY.toExponential(2), 4 * devicePixelRatio, padT + 8 * devicePixelRatio);
+  ctx.fillText(minY.toExponential(2), 4 * devicePixelRatio, padT + plotH);
+  ctx.fillText(`${formatNumber(minX, 3)} V`, padL, canvas.height - 8 * devicePixelRatio);
+  ctx.fillText(`${formatNumber(maxX, 3)} V`, padL + plotW - 42 * devicePixelRatio, canvas.height - 8 * devicePixelRatio);
+
+  ctx.strokeStyle = '#16833a';
+  ctx.lineWidth = 1.5 * devicePixelRatio;
+  ctx.beginPath();
+  rows.forEach((point, index) => {
+    const x = xFor(point.voltage);
+    const y = yFor(point.value);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = '#16833a';
+  rows.forEach(point => {
+    const x = xFor(point.voltage);
+    const y = yFor(point.value);
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5 * devicePixelRatio, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+async function refreshAoScanStatus(showStatus = false) {
+  try {
+    const response = await fetch('/api/ao_scan/status');
+    const status = await response.json();
+    if (!response.ok || status.ok === false) {
+      throw new Error(status.error || '查询 AO 扫描状态失败');
+    }
+    updateAoScanStatus(status);
+    if (showStatus && status.running) {
+      setStatus('检测到 AO 扫描正在运行，已接管状态。', 'ok');
+    }
+  } catch (err) {
+    if (showStatus) {
+      setStatus(String(err.message || err), 'error');
+    }
+  }
+}
+
+async function startAoScan() {
+  const params = getAoScanParams();
+  if (!params.channel.trim()) {
+    setStatus('请填写 AO 通道，例如 ao0。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.start_voltage) || !Number.isFinite(params.stop_voltage)) {
+    setStatus('AO 起始/终止电压必须是数字。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.step_voltage) || params.step_voltage === 0) {
+    setStatus('AO 步长必须是非零数字。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.min_val) || !Number.isFinite(params.max_val) || params.min_val >= params.max_val) {
+    setStatus('AO 最小值必须小于最大值。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.settle_s) || params.settle_s < 0) {
+    setStatus('改电压后等待时间必须 >= 0。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.dwell_s) || params.dwell_s <= 0) {
+    setStatus('每点测量时间必须 > 0。', 'error');
+    return;
+  }
+  if (params.restore_voltage !== '' && !Number.isFinite(Number(params.restore_voltage))) {
+    setStatus('结束恢复电压必须留空或填数字。', 'error');
+    return;
+  }
+
+  try {
+    const status = await postJson('/api/ao_scan/start', params);
+    updateAoScanStatus(status);
+    setStatus('AO 扫描标定已启动。请不要在扫描过程中手动改 AO 输出。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshAoScanStatus(false);
+  }
+}
+
+async function stopAoScan() {
+  try {
+    const status = await postJson('/api/ao_scan/stop', {});
+    updateAoScanStatus(status);
+    setStatus('AO 扫描标定已停止。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }
@@ -1457,6 +1744,7 @@ loadDefaults();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
 refreshTrendStatus(true);
+refreshAoScanStatus(true);
 </script>
 </body>
 </html>

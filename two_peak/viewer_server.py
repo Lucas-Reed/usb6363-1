@@ -75,6 +75,8 @@ def make_handler(state: ViewerState):
                     )
                 elif path == "/api/trend/status":
                     self._send_json(get_area_trend_status(state))
+                elif path == "/api/ao_scan/status":
+                    self._send_json(state.ao_scan_calibrator.status())
                 elif path == "/api/samples":
                     self._send_json(list_saved_frames(state))
                 else:
@@ -97,6 +99,24 @@ def make_handler(state: ViewerState):
                     self._send_json(start_area_trend(state, body))
                 elif self.path == "/api/trend/stop":
                     self._send_json(stop_area_trend(state))
+                elif self.path == "/api/ao_scan/start":
+                    body = self._read_json()
+                    self._send_json(
+                        state.ao_scan_calibrator.start(
+                            channel=str(body.get("channel", "ao0")),
+                            start_voltage=float(body.get("start_voltage", 0.0)),
+                            stop_voltage=float(body.get("stop_voltage", 1.0)),
+                            step_voltage=float(body.get("step_voltage", 0.05)),
+                            min_val=float(body.get("min_val", -10.0)),
+                            max_val=float(body.get("max_val", 10.0)),
+                            settle_s=float(body.get("settle_s", 0.5)),
+                            dwell_s=float(body.get("dwell_s", 2.0)),
+                            measure_field=str(body.get("measure_field", "area_sum_ema")),
+                            restore_voltage=_optional_float(body.get("restore_voltage")),
+                        )
+                    )
+                elif self.path == "/api/ao_scan/stop":
+                    self._send_json(state.ao_scan_calibrator.stop())
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)
@@ -162,3 +182,14 @@ def make_handler(state: ViewerState):
             self._send_json({"ok": False, "error": message}, status=status)
 
     return TwoPeakViewerHandler
+
+
+def _optional_float(value: Any) -> float | None:
+    """把前端传来的可选数字转换成 float。
+
+    空字符串/None 表示用户不想在扫描结束后自动恢复 AO 电压。
+    """
+
+    if value in (None, ""):
+        return None
+    return float(value)

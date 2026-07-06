@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from two_peak.ao_scan_calibrator import AoScanCalibrator
 from two_peak.config import TwoPeakSettings
 from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
@@ -33,6 +34,13 @@ class ViewerState:
         self.trend_logger = AreaTrendLogger(
             daq=self.daq,
             output_dir=sample_dir.parent / "two_peak_trends",
+        )
+        # AO 扫描标定器读取上面的面积慢漂统计，并通过 daq client 写 AO。
+        # 它不直接访问 NI-DAQmx，因此不会破坏“只有 8765 底层服务碰硬件”的边界。
+        self.ao_scan_calibrator = AoScanCalibrator(
+            daq=self.daq,
+            trend_logger=self.trend_logger,
+            output_dir=sample_dir.parent / "ao_scan_calibrations",
         )
 
     def factory_web_defaults(self) -> dict[str, Any]:
