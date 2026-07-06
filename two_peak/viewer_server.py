@@ -119,6 +119,9 @@ def make_handler(state: ViewerState):
                     )
                 elif self.path == "/api/ao_scan/stop":
                     self._send_json(state.ao_scan_calibrator.stop())
+                elif self.path == "/api/ao_test/write":
+                    body = self._read_json()
+                    self._send_json(_write_single_ao_for_test(state, body))
                 elif self.path == "/api/power_lock/write_initial_ao":
                     body = self._read_json()
                     self._send_json(_write_power_lock_initial_ao(state, body))
@@ -208,6 +211,40 @@ def _optional_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _write_single_ao_for_test(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
+    """单路 AO 诊断写入。
+
+    这个接口故意和 AO 扫描一样，只写一个 AO 通道。
+    用途是把“底层 AO 是否能重复写入”和“双路锁定逻辑是否有问题”分开排查。
+    """
+
+    channel = str(body.get("channel", "ao0")).strip()
+    value = float(body.get("value", 0.0))
+    min_val = float(body.get("min_val", -10.0))
+    max_val = float(body.get("max_val", 10.0))
+    if not channel:
+        raise ValueError("AO channel is empty")
+    if min_val >= max_val:
+        raise ValueError("min_val must be smaller than max_val")
+    if value < min_val or value > max_val:
+        raise ValueError(f"value {value} is outside [{min_val}, {max_val}]")
+
+    result = state.daq.write_ao(
+        channel=channel,
+        value=value,
+        min_val=min_val,
+        max_val=max_val,
+    )
+    return {
+        "ok": True,
+        "channel": channel,
+        "value": value,
+        "min_val": min_val,
+        "max_val": max_val,
+        "result": result,
+    }
 
 
 def _write_power_lock_initial_ao(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
