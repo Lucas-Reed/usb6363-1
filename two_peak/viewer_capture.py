@@ -263,6 +263,9 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         window_frames=int(body.get("window_frames", 200)),
         record_hz=float(body.get("record_hz", 1.0)),
         ema_alpha=float(body.get("ema_alpha", 0.02)),
+        auto_track_enabled=_as_bool(body.get("auto_track_enabled", False)),
+        auto_track_smooth_window=int(body.get("auto_track_smooth_window", 9)),
+        auto_track_max_shift=int(body.get("auto_track_max_shift", 5)),
         poll_interval=float(body.get("poll_interval", 0.05)),
         stream_source=stream_source_from_body(body),
         channels=parse_channels(body.get("channels", ["ai0", "ai1"])),
@@ -514,3 +517,15 @@ def _resolve_sample_file(sample_dir: Path, path: Path, suffix: str) -> Path:
     if not resolved.exists():
         raise FileNotFoundError(str(resolved))
     return resolved
+
+
+def _as_bool(value: Any) -> bool:
+    """把前端传来的 checkbox 值转换成 bool。"""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return False

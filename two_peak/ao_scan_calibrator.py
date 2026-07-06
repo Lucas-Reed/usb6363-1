@@ -204,12 +204,16 @@ class AoScanCalibrator:
                     if _sleep_until_stop(stop_event, float(settings["settle_s"])):
                         break
 
-                    values = self._collect_values(
-                        field=str(settings["measure_field"]),
+                    stats_samples = self._collect_latest_stats(
                         dwell_s=float(settings["dwell_s"]),
                         stop_event=stop_event,
                     )
-                    row = _build_point_row(index=index, voltage=float(voltage), values=values, settings=settings)
+                    row = _build_point_row(
+                        index=index,
+                        voltage=float(voltage),
+                        stats_samples=stats_samples,
+                        settings=settings,
+                    )
                     writer.writerow(row)
                     file.flush()
 
@@ -235,39 +239,36 @@ class AoScanCalibrator:
                 self._thread = None
                 self._stop_event = None
 
-    def _collect_values(
+    def _collect_latest_stats(
         self,
-        field: str,
         dwell_s: float,
         stop_event: threading.Event,
-    ) -> list[float]:
-        """在一个电压点停留期间收集面积统计值。"""
+    ) -> list[dict[str, Any]]:
+        """在一个电压点停留期间收集面积统计行。
 
-        values: list[float] = []
+        每一行来自 AreaTrendLogger.status()["latest_stats"]。
+        这里保存整行，而不是只保存一个字段，是为了 AO 标定能同时得到
+        A、B、A+B 三个反馈量，后续分别锁定两个峰时不需要重扫。
+        """
+
+        rows: list[dict[str, Any]] = []
         seen_keys: set[tuple[Any, Any]] = set()
         deadline = time.time() + dwell_s
 
         while time.time() < deadline and not stop_event.is_set():
             status = self._trend_logger.status()
             latest = status.get("latest_stats") or {}
-            value = latest.get(field)
-            if value is None and field == "area_sum_ema":
-                # alpha=0 时 EMA 关闭，此时退回到未滤波的面积和均值。
-                value = latest.get("area_sum_mean")
 
             key = (latest.get("unix_time"), latest.get("frame_id"))
-            if value is not None and key not in seen_keys:
-                try:
-                    values.append(float(value))
-                    seen_keys.add(key)
-                except (TypeError, ValueError):
-                    pass
+            if latest and key not in seen_keys:
+                rows.append(dict(latest))
+                seen_keys.add(key)
 
             time.sleep(0.1)
 
-        if not values:
+        if not rows:
             raise RuntimeError("AO scan did not receive area statistics during dwell time")
-        return values
+        return rows
 
 
 def _build_voltage_points(start: float, stop: float, step: float) -> list[float]:
@@ -305,10 +306,94 @@ def _sleep_until_stop(stop_event: threading.Event, seconds: float) -> bool:
 def _build_point_row(
     index: int,
     voltage: float,
-    values: list[float],
+    stats_samples: list[dict[str, Any]],
     settings: dict[str, Any],
 ) -> dict[str, Any]:
     """把一个扫描点的测量值整理成 CSV 行。"""
+
+    selected_stats = _field_stats(
+        stats_samples,
+        field=str(settings["measure_field"]),
+        fallback_field=_fallback_field(str(settings["measure_field"])),
+    )
+    area_a_stats = _field_stats(stats_samples, "area_mean")
+    area_a_ema_stats = _field_stats(stats_samples, "area_ema", fallback_field="area_mean")
+    area_b_stats = _field_stats(stats_samples, "area2_mean")
+    area_b_ema_stats = _field_stats(stats_samples, "area2_ema", fallback_field="area2_mean")
+    area_sum_stats = _field_stats(stats_samples, "area_sum_mean")
+    area_sum_ema_stats = _field_stats(stats_samples, "area_sum_ema", fallback_field="area_sum_mean")
+
+    return {
+        "iso_time": datetime.now().isoformat(timespec="seconds"),
+        "point_index": index + 1,
+        "ao_channel": settings["channel"],
+        "ao_voltage": voltage,
+        "measure_field": settings["measure_field"],
+        "sample_count": len(stats_samples),
+        "area_value_mean": selected_stats["mean"],
+        "area_value_std": selected_stats["std"],
+        "area_value_rel_std_percent": selected_stats["rel_std_percent"],
+        "area_value_first": selected_stats["first"],
+        "area_value_last": selected_stats["last"],
+        "area_a_mean": area_a_stats["mean"],
+        "area_a_std": area_a_stats["std"],
+        "area_a_ema_mean": area_a_ema_stats["mean"],
+        "area_b_mean": area_b_stats["mean"],
+        "area_b_std": area_b_stats["std"],
+        "area_b_ema_mean": area_b_ema_stats["mean"],
+        "area_sum_mean": area_sum_stats["mean"],
+        "area_sum_std": area_sum_stats["std"],
+        "area_sum_ema_mean": area_sum_ema_stats["mean"],
+        "area_window_a_left": stats_samples[-1].get("area_left"),
+        "area_window_a_right": stats_samples[-1].get("area_right"),
+        "area_window_a_peak_index": stats_samples[-1].get("area_peak_index"),
+        "area_window_b_left": stats_samples[-1].get("area2_left"),
+        "area_window_b_right": stats_samples[-1].get("area2_right"),
+        "area_window_b_peak_index": stats_samples[-1].get("area2_peak_index"),
+        "settle_s": settings["settle_s"],
+        "dwell_s": settings["dwell_s"],
+    }
+
+
+def _fallback_field(field: str) -> str | None:
+    """EMA 关闭时使用对应的未滤波字段作为后备。"""
+
+    if field == "area_ema":
+        return "area_mean"
+    if field == "area2_ema":
+        return "area2_mean"
+    if field == "area_sum_ema":
+        return "area_sum_mean"
+    return None
+
+
+def _field_stats(
+    rows: list[dict[str, Any]],
+    field: str,
+    fallback_field: str | None = None,
+) -> dict[str, Any]:
+    """从若干 latest_stats 行里提取一个字段并计算统计量。"""
+
+    values: list[float] = []
+    for row in rows:
+        value = row.get(field)
+        if value is None and fallback_field is not None:
+            value = row.get(fallback_field)
+        if value is None:
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    if not values:
+        return {
+            "mean": None,
+            "std": None,
+            "rel_std_percent": None,
+            "first": None,
+            "last": None,
+        }
 
     mean = sum(values) / len(values)
     if len(values) >= 2:
@@ -319,19 +404,11 @@ def _build_point_row(
     rel_std = None if mean == 0 else std / abs(mean) * 100.0
 
     return {
-        "iso_time": datetime.now().isoformat(timespec="seconds"),
-        "point_index": index + 1,
-        "ao_channel": settings["channel"],
-        "ao_voltage": voltage,
-        "measure_field": settings["measure_field"],
-        "sample_count": len(values),
-        "area_value_mean": mean,
-        "area_value_std": std,
-        "area_value_rel_std_percent": rel_std,
-        "area_value_first": values[0],
-        "area_value_last": values[-1],
-        "settle_s": settings["settle_s"],
-        "dwell_s": settings["dwell_s"],
+        "mean": mean,
+        "std": std,
+        "rel_std_percent": rel_std,
+        "first": values[0],
+        "last": values[-1],
     }
 
 
@@ -350,6 +427,21 @@ def _csv_fieldnames() -> list[str]:
         "area_value_rel_std_percent",
         "area_value_first",
         "area_value_last",
+        "area_a_mean",
+        "area_a_std",
+        "area_a_ema_mean",
+        "area_b_mean",
+        "area_b_std",
+        "area_b_ema_mean",
+        "area_sum_mean",
+        "area_sum_std",
+        "area_sum_ema_mean",
+        "area_window_a_left",
+        "area_window_a_right",
+        "area_window_a_peak_index",
+        "area_window_b_left",
+        "area_window_b_right",
+        "area_window_b_peak_index",
         "settle_s",
         "dwell_s",
     ]

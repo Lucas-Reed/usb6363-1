@@ -394,6 +394,20 @@
   </div>
   <label>面积和 EMA alpha，0 表示关闭滤波</label>
   <input id="trend_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.005">
+  <label class="inline">
+    <input id="auto_track_enabled" type="checkbox">
+    自动跟随面积窗口内最高点
+  </label>
+  <div class="grid2">
+    <div>
+      <label>跟随平滑窗口 / 点</label>
+      <input id="auto_track_smooth_window" type="number" value="9" min="1" step="2">
+    </div>
+    <div>
+      <label>每帧最大移动 / 点</label>
+      <input id="auto_track_max_shift" type="number" value="5" min="0" step="1">
+    </div>
+  </div>
   <div class="grid2">
     <div>
       <label>记录状态</label>
@@ -425,7 +439,11 @@
     <div>
       <label>测量字段</label>
       <select id="ao_scan_measure_field">
-        <option value="area_sum_ema">area_sum_ema</option>
+        <option value="area_ema">area_ema</option>
+        <option value="area_mean">area_mean</option>
+        <option value="area2_ema">area2_ema</option>
+        <option value="area2_mean">area2_mean</option>
+        <option value="area_sum_ema" selected>area_sum_ema</option>
         <option value="area_sum_mean">area_sum_mean</option>
       </select>
     </div>
@@ -570,6 +588,9 @@ function getTrendParams() {
     window_frames: Number(document.getElementById('trend_window_frames').value),
     record_hz: Number(document.getElementById('trend_record_hz').value),
     ema_alpha: Number(document.getElementById('trend_ema_alpha').value),
+    auto_track_enabled: document.getElementById('auto_track_enabled').checked,
+    auto_track_smooth_window: Number(document.getElementById('auto_track_smooth_window').value),
+    auto_track_max_shift: Number(document.getElementById('auto_track_max_shift').value),
   };
 }
 
@@ -651,6 +672,9 @@ function applyDefaultsToUi(defaults) {
     'trend_ema_alpha',
     defaults.ema_alpha !== undefined ? defaults.ema_alpha : defaults.trend_ema_alpha,
   );
+  setInputValue('auto_track_enabled', defaults.auto_track_enabled);
+  setInputValue('auto_track_smooth_window', firstDefined(defaults.auto_track_smooth_window, 9));
+  setInputValue('auto_track_max_shift', firstDefined(defaults.auto_track_max_shift, 5));
   setInputValue('ao_scan_channel', firstDefined(defaults.channel, defaults.ao_scan_channel));
   setInputValue('ao_scan_start_voltage', firstDefined(defaults.start_voltage, defaults.ao_scan_start_voltage));
   setInputValue('ao_scan_stop_voltage', firstDefined(defaults.stop_voltage, defaults.ao_scan_stop_voltage));
@@ -888,8 +912,14 @@ function updateTrendStatus(status) {
     const emaText = latest.area_sum_ema === null || latest.area_sum_ema === undefined
       ? 'EMA=--'
       : `EMA=${Number(latest.area_sum_ema).toExponential(6)}`;
+    const areaAText = latest.area_ema === null || latest.area_ema === undefined
+      ? 'A=--'
+      : `A=${Number(latest.area_ema).toExponential(6)}`;
+    const areaBText = latest.area2_ema === null || latest.area2_ema === undefined
+      ? 'B=--'
+      : `B=${Number(latest.area2_ema).toExponential(6)}`;
     document.getElementById('trend_latest').value =
-      `SUM=${Number(latest.area_sum_mean).toExponential(6)}  ${emaText}  std=${rel}  shot=${shot}`;
+      `SUM=${Number(latest.area_sum_mean).toExponential(6)}  ${emaText}  ${areaAText}  ${areaBText}  std=${rel}  shot=${shot}`;
   } else {
     document.getElementById('trend_latest').value = '--';
   }
@@ -1028,6 +1058,14 @@ async function startAreaTrend() {
     setStatus('EMA alpha 需要在 0 到 1 之间。', 'error');
     return;
   }
+  if (!Number.isFinite(params.auto_track_smooth_window) || params.auto_track_smooth_window < 1) {
+    setStatus('跟随平滑窗口必须 >= 1。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.auto_track_max_shift) || params.auto_track_max_shift < 0) {
+    setStatus('每帧最大移动必须 >= 0。', 'error');
+    return;
+  }
   if (!streamRunning) {
     setStatus('请先启动后端连续采集，再开始慢漂记录。', 'error');
     return;
@@ -1063,8 +1101,11 @@ function updateAoScanStatus(status) {
     ? String(status.points_written)
     : String(points.length);
   document.getElementById('ao_scan_file').value = status && status.csv_file ? status.csv_file : '';
+  const latestValueText = latest && latest.area_value_mean !== null && latest.area_value_mean !== undefined
+    ? Number(latest.area_value_mean).toExponential(6)
+    : '--';
   document.getElementById('ao_scan_latest').value = latest
-    ? `V=${formatNumber(latest.ao_voltage, 4)}  area=${Number(latest.area_value_mean).toExponential(6)}  n=${latest.sample_count}`
+    ? `V=${formatNumber(latest.ao_voltage, 4)}  area=${latestValueText}  n=${latest.sample_count}`
     : '--';
 
   drawAoScan(points);
@@ -1093,7 +1134,7 @@ function drawAoScan(points) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   const rows = (points || [])
-    .filter(point => point.ao_voltage !== undefined && point.area_value_mean !== undefined)
+    .filter(point => point.ao_voltage !== undefined && point.area_value_mean !== undefined && point.area_value_mean !== null)
     .map(point => ({
       voltage: Number(point.ao_voltage),
       value: Number(point.area_value_mean),

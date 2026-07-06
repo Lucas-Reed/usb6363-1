@@ -36,6 +36,7 @@ class ManualAreaMeasurement:
     point_count: int
     value: float
     mode: str = "raw_sum"
+    peak_index: int | None = None
 
 
 def smooth_moving_average(signal: np.ndarray, window: int) -> np.ndarray:
@@ -150,6 +151,63 @@ def measure_manual_area(
         point_count=int(window.size),
         value=float(np.sum(window)),
     )
+
+
+def track_and_measure_manual_area(
+    signal: np.ndarray,
+    left_index: int,
+    right_index: int,
+    smooth_window: int = 9,
+    max_shift_per_frame: int = 5,
+) -> ManualAreaMeasurement:
+    """自动跟随峰位置的手动面积测量。
+
+    用户先给一个初始面积窗口。程序在这个窗口内部寻找平滑后的最高点，
+    然后保持窗口宽度不变，把窗口中心移动到这个最高点附近。
+
+    为了避免被单个毛刺拖走，第一版做两个保守限制：
+    - 找最高点前可以做一个很轻的移动平均平滑。
+    - 每一帧窗口最多移动 max_shift_per_frame 个点。
+    """
+
+    data = np.asarray(signal, dtype=float)
+    if data.size == 0:
+        raise ValueError("signal must not be empty")
+
+    left = int(round(left_index))
+    right = int(round(right_index))
+    if right < left:
+        left, right = right, left
+
+    left = max(0, min(left, data.size - 1))
+    right = max(0, min(right, data.size - 1))
+    if right <= left:
+        raise ValueError("manual area right index must be greater than left index")
+
+    width = right - left
+    smoothed = smooth_moving_average(data, smooth_window)
+    local = smoothed[left : right + 1]
+    peak_index = left + int(np.argmax(local))
+
+    target_left = peak_index - width // 2
+    target_left = max(0, min(target_left, data.size - width - 1))
+
+    max_shift = max(0, int(max_shift_per_frame))
+    if max_shift > 0:
+        shift = target_left - left
+        if shift > max_shift:
+            target_left = left + max_shift
+        elif shift < -max_shift:
+            target_left = left - max_shift
+
+    target_right = target_left + width
+    measurement = measure_manual_area(
+        data,
+        left_index=target_left,
+        right_index=target_right,
+    )
+    measurement.peak_index = peak_index
+    return measurement
 
 
 def locate_and_measure_two_peaks(

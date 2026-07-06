@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 
-from two_peak.signal import measure_manual_area
+from two_peak.signal import measure_manual_area, track_and_measure_manual_area
 from usb6363_client import Usb6363Client
 
 
@@ -35,6 +35,12 @@ class AreaTrendSample:
     timestamp: float
     area: float
     area2: float | None = None
+    area_left: int | None = None
+    area_right: int | None = None
+    area_peak_index: int | None = None
+    area2_left: int | None = None
+    area2_right: int | None = None
+    area2_peak_index: int | None = None
 
 
 class AreaTrendLogger:
@@ -69,6 +75,9 @@ class AreaTrendLogger:
         window_frames: int = 200,
         record_hz: float = 1.0,
         ema_alpha: float = 0.02,
+        auto_track_enabled: bool = False,
+        auto_track_smooth_window: int = 9,
+        auto_track_max_shift: int = 5,
         poll_interval: float = 0.05,
         stream_source: str = "unified_stream",
         channels: list[str] | None = None,
@@ -90,6 +99,10 @@ class AreaTrendLogger:
             raise ValueError("record_hz must be > 0")
         if ema_alpha < 0 or ema_alpha > 1:
             raise ValueError("ema_alpha must be between 0 and 1")
+        if auto_track_smooth_window < 1:
+            raise ValueError("auto_track_smooth_window must be >= 1")
+        if auto_track_max_shift < 0:
+            raise ValueError("auto_track_max_shift must be >= 0")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
 
@@ -110,6 +123,9 @@ class AreaTrendLogger:
                 "window_frames": int(window_frames),
                 "record_hz": float(record_hz),
                 "ema_alpha": float(ema_alpha),
+                "auto_track_enabled": bool(auto_track_enabled),
+                "auto_track_smooth_window": int(auto_track_smooth_window),
+                "auto_track_max_shift": int(auto_track_max_shift),
                 "poll_interval": float(poll_interval),
                 "stream_source": str(stream_source),
                 "channels": list(channels or []),
@@ -187,6 +203,8 @@ class AreaTrendLogger:
         next_record_time = time.time()
         record_period = 1.0 / float(settings["record_hz"])
         ema_alpha = float(settings.get("ema_alpha", 0.02))
+        area_ema: float | None = None
+        area2_ema: float | None = None
         area_sum_ema: float | None = None
 
         try:
@@ -218,12 +236,13 @@ class AreaTrendLogger:
                         # 如果连续采集意外停住，这里不会把同一批旧数据反复写很多行。
                         if now >= next_record_time and samples and last_seen_frame_id > last_recorded_frame_id:
                             row = self._build_csv_row(samples, settings)
-                            area_sum_mean = row.get("area_sum_mean")
-                            if ema_alpha > 0 and area_sum_mean is not None:
-                                raw_value = float(area_sum_mean)
-                                area_sum_ema = raw_value if area_sum_ema is None else (
-                                    ema_alpha * raw_value + (1.0 - ema_alpha) * area_sum_ema
-                                )
+                            area_ema = _update_ema(area_ema, row.get("area_mean"), ema_alpha)
+                            area2_ema = _update_ema(area2_ema, row.get("area2_mean"), ema_alpha)
+                            area_sum_ema = _update_ema(area_sum_ema, row.get("area_sum_mean"), ema_alpha)
+                            row["area_ema_alpha"] = ema_alpha
+                            row["area_ema"] = area_ema
+                            row["area2_ema_alpha"] = ema_alpha
+                            row["area2_ema"] = area2_ema
                             row["area_sum_ema_alpha"] = ema_alpha
                             row["area_sum_ema"] = area_sum_ema
                             writer.writerow(row)
@@ -275,24 +294,54 @@ class AreaTrendLogger:
         if channel_index < 0 or channel_index >= values.shape[0]:
             raise ValueError("analysis_channel_index is out of range")
 
-        measurement = measure_manual_area(
-            values[channel_index],
-            left_index=int(settings["area_left"]),
-            right_index=int(settings["area_right"]),
-        )
+        signal = values[channel_index]
+        if settings.get("auto_track_enabled"):
+            measurement = track_and_measure_manual_area(
+                signal,
+                left_index=int(settings["area_left"]),
+                right_index=int(settings["area_right"]),
+                smooth_window=int(settings.get("auto_track_smooth_window", 9)),
+                max_shift_per_frame=int(settings.get("auto_track_max_shift", 5)),
+            )
+            # 记录线程内部保存最新窗口位置，下一帧从这个位置继续跟随。
+            settings["area_left"] = measurement.left_index
+            settings["area_right"] = measurement.right_index
+        else:
+            measurement = measure_manual_area(
+                signal,
+                left_index=int(settings["area_left"]),
+                right_index=int(settings["area_right"]),
+            )
         measurement2 = None
         if settings.get("area2_left") is not None and settings.get("area2_right") is not None:
             # 第二个面积窗口和第一个完全独立，仍然使用同一帧、同一分析通道。
-            measurement2 = measure_manual_area(
-                values[channel_index],
-                left_index=int(settings["area2_left"]),
-                right_index=int(settings["area2_right"]),
-            )
+            if settings.get("auto_track_enabled"):
+                measurement2 = track_and_measure_manual_area(
+                    signal,
+                    left_index=int(settings["area2_left"]),
+                    right_index=int(settings["area2_right"]),
+                    smooth_window=int(settings.get("auto_track_smooth_window", 9)),
+                    max_shift_per_frame=int(settings.get("auto_track_max_shift", 5)),
+                )
+                settings["area2_left"] = measurement2.left_index
+                settings["area2_right"] = measurement2.right_index
+            else:
+                measurement2 = measure_manual_area(
+                    signal,
+                    left_index=int(settings["area2_left"]),
+                    right_index=int(settings["area2_right"]),
+                )
         return AreaTrendSample(
             frame_id=int(frame.get("frame_id", 0)),
             timestamp=float(frame.get("finished_at", time.time())),
             area=float(measurement.value),
             area2=None if measurement2 is None else float(measurement2.value),
+            area_left=int(measurement.left_index),
+            area_right=int(measurement.right_index),
+            area_peak_index=measurement.peak_index,
+            area2_left=None if measurement2 is None else int(measurement2.left_index),
+            area2_right=None if measurement2 is None else int(measurement2.right_index),
+            area2_peak_index=None if measurement2 is None else measurement2.peak_index,
         )
 
     def _build_csv_row(
@@ -325,20 +374,29 @@ class AreaTrendLogger:
             "frame_id_start": frame_ids[0],
             "frame_id_end": frame_ids[-1],
             "analysis_channel_index": int(settings["analysis_channel_index"]),
-            "area_left": int(settings["area_left"]),
-            "area_right": int(settings["area_right"]),
-            "area2_left": settings.get("area2_left"),
-            "area2_right": settings.get("area2_right"),
+            "auto_track_enabled": bool(settings.get("auto_track_enabled", False)),
+            "auto_track_smooth_window": int(settings.get("auto_track_smooth_window", 9)),
+            "auto_track_max_shift": int(settings.get("auto_track_max_shift", 5)),
+            "area_left": latest.area_left,
+            "area_right": latest.area_right,
+            "area_peak_index": latest.area_peak_index,
+            "area2_left": latest.area2_left,
+            "area2_right": latest.area2_right,
+            "area2_peak_index": latest.area2_peak_index,
             "window_frames": window_frames,
             "sample_count": int(areas.size),
             "area_current": float(areas[-1]),
             "area_mean": area_stats["mean"],
             "area_std": area_stats["std"],
             "area_rel_std_percent": area_stats["rel_std_percent"],
+            "area_ema_alpha": float(settings.get("ema_alpha", 0.02)),
+            "area_ema": None,
             "area2_current": latest.area2,
             "area2_mean": area2_stats.get("mean"),
             "area2_std": area2_stats.get("std"),
             "area2_rel_std_percent": area2_stats.get("rel_std_percent"),
+            "area2_ema_alpha": float(settings.get("ema_alpha", 0.02)),
+            "area2_ema": None,
             "area_sum_current": latest_area_sum,
             "area_sum_mean": area_sum_stats["mean"],
             "area_sum_std": area_sum_stats["std"],
@@ -373,6 +431,21 @@ def _relative_percent(std_or_delta: float, mean: float) -> float | None:
     if abs(mean) < 1e-30:
         return None
     return float(std_or_delta / abs(mean) * 100.0)
+
+
+def _update_ema(previous: float | None, value: Any, alpha: float) -> float | None:
+    """更新指数滑动平均。
+
+    alpha=0 表示关闭 EMA，此时返回 None。
+    value=None 常见于没有设置 B 窗口的情况，此时不更新。
+    """
+
+    if alpha <= 0 or value is None:
+        return previous if alpha > 0 else None
+    raw_value = float(value)
+    if previous is None:
+        return raw_value
+    return float(alpha * raw_value + (1.0 - alpha) * previous)
 
 
 def _area_stats(values: np.ndarray) -> dict[str, Any]:
@@ -472,20 +545,29 @@ def _csv_fieldnames() -> list[str]:
         "frame_id_start",
         "frame_id_end",
         "analysis_channel_index",
+        "auto_track_enabled",
+        "auto_track_smooth_window",
+        "auto_track_max_shift",
         "area_left",
         "area_right",
+        "area_peak_index",
         "area2_left",
         "area2_right",
+        "area2_peak_index",
         "window_frames",
         "sample_count",
         "area_current",
         "area_mean",
         "area_std",
         "area_rel_std_percent",
+        "area_ema_alpha",
+        "area_ema",
         "area2_current",
         "area2_mean",
         "area2_std",
         "area2_rel_std_percent",
+        "area2_ema_alpha",
+        "area2_ema",
         "area_sum_current",
         "area_sum_mean",
         "area_sum_std",
