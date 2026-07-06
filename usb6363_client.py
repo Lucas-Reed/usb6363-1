@@ -422,26 +422,6 @@ class Usb6363Client:
             },
         )
 
-    def write_ao_many(
-        self,
-        outputs: list[dict[str, Any]],
-        timeout: float = 10.0,
-    ) -> dict[str, Any]:
-        """同时写多个 AO 静态电压。
-
-        outputs 的每一项形如：
-            {"channel": "ao0", "value": 2.0, "min_val": 0.0, "max_val": 5.0}
-        双路功率锁定使用这个接口，让 ao0/ao1 在同一个硬件 task 里一起更新。
-        """
-
-        return self._post(
-            "/api/ao/write_many",
-            {
-                "outputs": outputs,
-                "timeout": timeout,
-            },
-        )
-
     def read_pfi(self, line: str = "PFI0", timeout: float = 10.0) -> dict[str, Any]:
         """读取 PFI 或数字线的高低电平。
 

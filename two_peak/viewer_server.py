@@ -221,7 +221,6 @@ def _write_power_lock_initial_ao(state: ViewerState, body: dict[str, Any]) -> di
     if not isinstance(controllers, list) or not controllers:
         raise ValueError("controllers must be a non-empty list")
 
-    outputs: list[dict[str, Any]] = []
     written: list[dict[str, Any]] = []
     for controller in controllers:
         if not isinstance(controller, dict):
@@ -245,13 +244,11 @@ def _write_power_lock_initial_ao(state: ViewerState, body: dict[str, Any]) -> di
                 f"[{min_voltage}, {max_voltage}]"
             )
 
-        outputs.append(
-            {
-                "channel": channel,
-                "value": initial_voltage,
-                "min_val": min_voltage,
-                "max_val": max_voltage,
-            }
+        result = state.daq.write_ao(
+            channel=channel,
+            value=initial_voltage,
+            min_val=min_voltage,
+            max_val=max_voltage,
         )
         written.append(
             {
@@ -260,12 +257,10 @@ def _write_power_lock_initial_ao(state: ViewerState, body: dict[str, Any]) -> di
                 "initial_voltage": initial_voltage,
                 "min_voltage": min_voltage,
                 "max_voltage": max_voltage,
+                "result": result,
             }
         )
 
     if not written:
         raise ValueError("no enabled controller to write")
-    result = state.daq.write_ao_many(outputs=outputs)
-    for item in written:
-        item["result"] = result
     return {"ok": True, "written": written}

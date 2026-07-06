@@ -126,9 +126,6 @@ def make_handler(controller: DaqController):
                 if parsed.path == "/api/ao/write":
                     # 写模拟输出。请求体 body 是 JSON，例如 {"channel": "ao0", "value": 1.23}。
                     self._send_json(controller.write_ao_voltage(**_ao_args(body)))
-                elif parsed.path == "/api/ao/write_many":
-                    # 同时写多个 AO。双路功率锁定要用这个接口，避免 ao0/ao1 分开写时互相影响。
-                    self._send_json(controller.write_ao_voltages(**_ao_many_args(body)))
                 # LEGACY AI routes: 旧后台 AI 订阅/记录/同步采帧模型，仅保留兼容和调试。
                 elif parsed.path == "/api/ai/subscribe":
                     # 订阅一个 AI 通道，后台会自动按通道数重算采样率。
@@ -340,32 +337,6 @@ def _ao_args(body: dict[str, Any]) -> dict[str, Any]:
         "value": float(body["value"]),
         "min_val": float(body.get("min_val", -10.0)),
         "max_val": float(body.get("max_val", 10.0)),
-        "timeout": float(body.get("timeout", 10.0)),
-    }
-
-
-def _ao_many_args(body: dict[str, Any]) -> dict[str, Any]:
-    """把 POST JSON 转换成 write_ao_voltages 需要的参数类型。"""
-
-    outputs = body.get("outputs", [])
-    if not isinstance(outputs, list) or not outputs:
-        raise ValueError("outputs must be a non-empty list")
-
-    normalized_outputs: list[dict[str, Any]] = []
-    for output in outputs:
-        if not isinstance(output, dict):
-            raise ValueError("each AO output must be an object")
-        normalized_outputs.append(
-            {
-                "channel": str(output.get("channel", "ao0")),
-                "value": float(output["value"]),
-                "min_val": float(output.get("min_val", -10.0)),
-                "max_val": float(output.get("max_val", 10.0)),
-            }
-        )
-
-    return {
-        "outputs": normalized_outputs,
         "timeout": float(body.get("timeout", 10.0)),
     }
 
