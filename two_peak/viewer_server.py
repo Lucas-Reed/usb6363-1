@@ -132,8 +132,6 @@ def make_handler(state: ViewerState):
                     )
                 elif self.path == "/api/power_lock/stop":
                     self._send_json(state.power_lock.stop())
-                elif self.path == "/api/power_lock/release_ao":
-                    self._send_json(state.power_lock.release_ao_session())
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)
@@ -267,7 +265,7 @@ def _write_power_lock_initial_ao(state: ViewerState, body: dict[str, Any]) -> di
 
     if not written:
         raise ValueError("no enabled controller to write")
-    result = state.daq.start_ao_session(outputs=outputs)
+    result = state.daq.write_ao_many(outputs=outputs)
     for item in written:
         item["result"] = result
     return {"ok": True, "written": written}

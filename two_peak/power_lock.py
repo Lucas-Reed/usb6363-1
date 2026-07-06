@@ -122,16 +122,6 @@ class PowerLockController:
 
         return self.status()
 
-    def release_ao_session(self) -> dict[str, Any]:
-        """释放底层持久 AO task。
-
-        停止锁定只是停止 PI 更新，不会关闭 AO task，因为关闭后硬件可能不再保持最后电压。
-        只有用户明确需要释放 AO 给扫描标定等其他功能使用时，才调用这个方法。
-        """
-
-        self.stop()
-        return self._daq.close_ao_session()
-
     def status(self) -> dict[str, Any]:
         """返回 WebUI 需要显示的锁定状态。"""
 
@@ -162,7 +152,7 @@ class PowerLockController:
 
         try:
             # 启动锁定时先写一次初始电压，确保软件状态和硬件状态一致。
-            self._start_controller_voltages(
+            self._write_controller_voltages(
                 [
                     {
                         "channel": controller["channel"],
@@ -282,22 +272,7 @@ class PowerLockController:
                     "max_val": float(state["max_voltage"]),
                 }
             )
-        self._daq.write_ao_session(outputs=outputs)
-
-    def _start_controller_voltages(self, states: list[dict[str, Any]]) -> None:
-        """打开持久 AO task，并写入初始电压。"""
-
-        outputs = []
-        for state in states:
-            outputs.append(
-                {
-                    "channel": state["channel"],
-                    "value": float(state["voltage"]),
-                    "min_val": float(state["min_voltage"]),
-                    "max_val": float(state["max_voltage"]),
-                }
-            )
-        self._daq.start_ao_session(outputs=outputs)
+        self._daq.write_ao_many(outputs=outputs)
 
 
 def _validate_controller(controller: dict[str, Any]) -> dict[str, Any] | None:

@@ -82,9 +82,6 @@ class DaqController:
 
         # 用于保护短硬件操作，例如 AO、PFI、单点 AI。
         self._hardware_lock = threading.RLock()
-        self._ao_voltage_session: nidaqmx_driver.StaticAoVoltageSession | None = None
-        self._ao_voltage_session_outputs: list[dict[str, Any]] = []
-        self._ao_voltage_session_last_update = 0.0
 
         # 用于保护后台 AI 采样状态。
         self._ai_lock = threading.RLock()
@@ -962,8 +959,6 @@ class DaqController:
 
         physical_channel = self._normalize_ao_channel(channel)
         with self._hardware_lock:
-            if self._ao_voltage_session is not None:
-                raise RuntimeError("persistent AO voltage session is running; close it before single AO write")
             nidaqmx_driver.write_ao_voltage(
                 device_name=self.device_name,
                 physical_channel=physical_channel,
@@ -989,124 +984,6 @@ class DaqController:
         这个接口主要给双路功率锁定使用。它和连续波形输出不是一回事：
         这里只是把 ao0/ao1 等通道的“当前直流电压”一次性写到硬件。
         """
-
-        if not outputs:
-            raise ValueError("outputs must not be empty")
-
-        normalized_outputs = self._normalize_ao_outputs(outputs)
-
-        with self._hardware_lock:
-            if self._ao_voltage_session is not None:
-                raise RuntimeError("persistent AO voltage session is running; close it before one-shot AO write")
-            nidaqmx_driver.write_ao_voltages(
-                device_name=self.device_name,
-                outputs=normalized_outputs,
-                timeout=timeout,
-            )
-
-        return {
-            "device": self.device_name,
-            "outputs": [
-                {
-                    "channel": output["physical_channel"],
-                    "value": output["value"],
-                    "min_val": output["min_val"],
-                    "max_val": output["max_val"],
-                }
-                for output in normalized_outputs
-            ],
-        }
-
-    def start_ao_voltage_session(
-        self,
-        outputs: list[dict[str, Any]],
-        timeout: float = 10.0,
-    ) -> dict[str, Any]:
-        """打开一个持久 AO task，并写入初始电压。
-
-        这个接口主要用于功率锁定。和 write_ao_voltages 不同，它不会写完就关闭 task，
-        因此更接近旧版 legacy 程序的 AO 输出方式。
-        """
-
-        normalized_outputs = self._normalize_ao_outputs(outputs)
-        with self._hardware_lock:
-            if self._ao_voltage_session is not None:
-                self._ao_voltage_session.close()
-                self._ao_voltage_session = None
-
-            session = nidaqmx_driver.StaticAoVoltageSession(
-                device_name=self.device_name,
-                outputs=normalized_outputs,
-                timeout=timeout,
-            )
-            self._ao_voltage_session = session
-            self._ao_voltage_session_outputs = [
-                {
-                    "channel": output["physical_channel"],
-                    "value": output["value"],
-                    "min_val": output["min_val"],
-                    "max_val": output["max_val"],
-                }
-                for output in normalized_outputs
-            ]
-            self._ao_voltage_session_last_update = time.time()
-
-        return self.get_ao_voltage_session_status()
-
-    def write_ao_voltage_session(
-        self,
-        outputs: list[dict[str, Any]],
-        timeout: float = 10.0,
-    ) -> dict[str, Any]:
-        """向已经打开的持久 AO task 写入新电压。"""
-
-        normalized_outputs = self._normalize_ao_outputs(outputs)
-        with self._hardware_lock:
-            if self._ao_voltage_session is None:
-                raise RuntimeError("persistent AO voltage session is not running")
-
-            self._ao_voltage_session.write(normalized_outputs, timeout=timeout)
-            self._ao_voltage_session_outputs = [
-                {
-                    "channel": output["physical_channel"],
-                    "value": output["value"],
-                    "min_val": output["min_val"],
-                    "max_val": output["max_val"],
-                }
-                for output in normalized_outputs
-            ]
-            self._ao_voltage_session_last_update = time.time()
-
-        return self.get_ao_voltage_session_status()
-
-    def close_ao_voltage_session(self) -> dict[str, Any]:
-        """关闭持久 AO task。
-
-        注意：某些设备在 AO task 关闭后不保证继续保持最后输出。
-        因此功率锁定的“停止锁定”默认不会调用这个接口。
-        """
-
-        with self._hardware_lock:
-            if self._ao_voltage_session is not None:
-                self._ao_voltage_session.close()
-            self._ao_voltage_session = None
-            self._ao_voltage_session_outputs = []
-            self._ao_voltage_session_last_update = time.time()
-        return self.get_ao_voltage_session_status()
-
-    def get_ao_voltage_session_status(self) -> dict[str, Any]:
-        """返回持久 AO task 的状态。"""
-
-        with self._hardware_lock:
-            return {
-                "device": self.device_name,
-                "running": self._ao_voltage_session is not None,
-                "outputs": [dict(output) for output in self._ao_voltage_session_outputs],
-                "last_update": self._ao_voltage_session_last_update,
-            }
-
-    def _normalize_ao_outputs(self, outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """校验并标准化多路 AO 输出参数。"""
 
         if not outputs:
             raise ValueError("outputs must not be empty")
@@ -1139,7 +1016,26 @@ class DaqController:
                     "max_val": max_val,
                 }
             )
-        return normalized_outputs
+
+        with self._hardware_lock:
+            nidaqmx_driver.write_ao_voltages(
+                device_name=self.device_name,
+                outputs=normalized_outputs,
+                timeout=timeout,
+            )
+
+        return {
+            "device": self.device_name,
+            "outputs": [
+                {
+                    "channel": output["physical_channel"],
+                    "value": output["value"],
+                    "min_val": output["min_val"],
+                    "max_val": output["max_val"],
+                }
+                for output in normalized_outputs
+            ],
+        }
 
     def read_digital_line(self, line: str = "PFI0", timeout: float = 10.0) -> dict[str, Any]:
         """读取一个数字线或 PFI 端子的高低电平。"""

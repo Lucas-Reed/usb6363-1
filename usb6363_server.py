@@ -101,9 +101,6 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/frame_stream/latest":
                     # 读取固定点数分帧连续采集的最新一帧。
                     self._send_json(controller.get_ai_frame_stream_latest())
-                elif parsed.path == "/api/ao/session/status":
-                    # 查询持久 AO task 是否正在运行。
-                    self._send_json(controller.get_ao_voltage_session_status())
                 elif parsed.path == "/api/pfi/read":
                     # 读取某个 PFI 或数字线的当前高低电平。
                     self._send_json(controller.read_digital_line(**_digital_read_args(query)))
@@ -132,15 +129,6 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ao/write_many":
                     # 同时写多个 AO。双路功率锁定要用这个接口，避免 ao0/ao1 分开写时互相影响。
                     self._send_json(controller.write_ao_voltages(**_ao_many_args(body)))
-                elif parsed.path == "/api/ao/session/start":
-                    # 打开持久 AO task，并写入初始电压。
-                    self._send_json(controller.start_ao_voltage_session(**_ao_many_args(body)))
-                elif parsed.path == "/api/ao/session/write":
-                    # 向持久 AO task 写入新电压。
-                    self._send_json(controller.write_ao_voltage_session(**_ao_many_args(body)))
-                elif parsed.path == "/api/ao/session/close":
-                    # 关闭持久 AO task。关闭后某些设备可能不再保持最后输出。
-                    self._send_json(controller.close_ao_voltage_session())
                 # LEGACY AI routes: 旧后台 AI 订阅/记录/同步采帧模型，仅保留兼容和调试。
                 elif parsed.path == "/api/ai/subscribe":
                     # 订阅一个 AI 通道，后台会自动按通道数重算采样率。

@@ -644,7 +644,6 @@
     <button class="secondary" onclick="writePowerLockInitialAo()">写入初始 AO 电压</button>
     <button class="green" id="powerLockStartBtn" onclick="startPowerLock()">启动锁定</button>
     <button class="secondary" id="powerLockStopBtn" onclick="stopPowerLock()" disabled>停止锁定</button>
-    <button class="secondary" onclick="releasePowerLockAo()">释放 AO task</button>
   </div>
 </aside>
 
@@ -1616,16 +1615,6 @@ async function stopPowerLock() {
     const status = await postJson('/api/power_lock/stop', {});
     updatePowerLockStatus(status);
     setStatus('双路慢速功率锁定已停止，AO 保持最后输出。', 'ok');
-  } catch (err) {
-    setStatus(String(err.message || err), 'error');
-  }
-}
-
-async function releasePowerLockAo() {
-  try {
-    await postJson('/api/power_lock/release_ao', {});
-    await refreshPowerLockStatus(false);
-    setStatus('已释放 AO task。注意：释放后硬件可能不再保持最后电压。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }

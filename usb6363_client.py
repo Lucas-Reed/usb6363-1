@@ -442,46 +442,6 @@ class Usb6363Client:
             },
         )
 
-    def start_ao_session(
-        self,
-        outputs: list[dict[str, Any]],
-        timeout: float = 10.0,
-    ) -> dict[str, Any]:
-        """打开持久 AO task，并写入初始电压。"""
-
-        return self._post(
-            "/api/ao/session/start",
-            {
-                "outputs": outputs,
-                "timeout": timeout,
-            },
-        )
-
-    def write_ao_session(
-        self,
-        outputs: list[dict[str, Any]],
-        timeout: float = 10.0,
-    ) -> dict[str, Any]:
-        """向持久 AO task 写入新电压。"""
-
-        return self._post(
-            "/api/ao/session/write",
-            {
-                "outputs": outputs,
-                "timeout": timeout,
-            },
-        )
-
-    def close_ao_session(self) -> dict[str, Any]:
-        """关闭持久 AO task。"""
-
-        return self._post("/api/ao/session/close", {})
-
-    def get_ao_session_status(self) -> dict[str, Any]:
-        """查询持久 AO task 状态。"""
-
-        return self._get("/api/ao/session/status")
-
     def read_pfi(self, line: str = "PFI0", timeout: float = 10.0) -> dict[str, Any]:
         """读取 PFI 或数字线的高低电平。
 
