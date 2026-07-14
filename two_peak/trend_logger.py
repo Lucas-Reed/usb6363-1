@@ -1,12 +1,13 @@
-"""手动面积慢漂记录器。
+"""双窗口面积与峰高慢漂记录器。
 
-这个模块只负责一件事：在后端长期记录手动面积的慢漂趋势。
+这个模块只负责一件事：在后端长期记录动态窗口内面积和峰高的慢漂趋势。
 它不直接访问 nidaqmx，而是通过 Usb6363Client 读取统一 AI 流的最新帧。
 
-第一版刻意保持简单：
-- 只记录一个手动面积窗口。
-- 不做滤波、不扣本底。
+当前统计原则：
+- A、B 两个窗口独立跟随各自的最高点，窗口宽度保持不变。
+- 面积使用窗口内原始采样值求和，峰高使用同一窗口内原始采样值的最大值。
 - 用最近 N 帧计算滑动均值、标准差、相对标准差和 shot-to-shot 抖动。
+- 面积与峰高使用同一个 EMA alpha，便于直接比较两种测量量。
 - 按指定记录频率写 CSV，适合一整晚观察慢漂。
 """
 
@@ -29,18 +30,26 @@ from usb6363_client import Usb6363Client
 
 @dataclass
 class AreaTrendSample:
-    """一帧手动面积数据。"""
+    """一帧动态窗口测量数据。
+
+    面积和峰高来自同一帧、同一个窗口。峰高使用移动完成后的原始波形最大值，
+    因此不会因为跟随定位使用了平滑波形而改变峰高本身的物理含义。
+    """
 
     frame_id: int
     timestamp: float
     area: float
+    peak_height: float
     area2: float | None = None
+    peak2_height: float | None = None
     area_left: int | None = None
     area_right: int | None = None
     area_peak_index: int | None = None
+    peak_height_index: int | None = None
     area2_left: int | None = None
     area2_right: int | None = None
     area2_peak_index: int | None = None
+    peak2_height_index: int | None = None
 
 
 class AreaTrendLogger:
@@ -206,6 +215,8 @@ class AreaTrendLogger:
         area_ema: float | None = None
         area2_ema: float | None = None
         area_sum_ema: float | None = None
+        peak_height_ema: float | None = None
+        peak2_height_ema: float | None = None
 
         try:
             with csv_path.open("w", newline="", encoding="utf-8") as file:
@@ -239,12 +250,26 @@ class AreaTrendLogger:
                             area_ema = _update_ema(area_ema, row.get("area_mean"), ema_alpha)
                             area2_ema = _update_ema(area2_ema, row.get("area2_mean"), ema_alpha)
                             area_sum_ema = _update_ema(area_sum_ema, row.get("area_sum_mean"), ema_alpha)
+                            peak_height_ema = _update_ema(
+                                peak_height_ema,
+                                row.get("peak_height_mean"),
+                                ema_alpha,
+                            )
+                            peak2_height_ema = _update_ema(
+                                peak2_height_ema,
+                                row.get("peak2_height_mean"),
+                                ema_alpha,
+                            )
                             row["area_ema_alpha"] = ema_alpha
                             row["area_ema"] = area_ema
                             row["area2_ema_alpha"] = ema_alpha
                             row["area2_ema"] = area2_ema
                             row["area_sum_ema_alpha"] = ema_alpha
                             row["area_sum_ema"] = area_sum_ema
+                            row["peak_height_ema_alpha"] = ema_alpha
+                            row["peak_height_ema"] = peak_height_ema
+                            row["peak2_height_ema_alpha"] = ema_alpha
+                            row["peak2_height_ema"] = peak2_height_ema
                             writer.writerow(row)
                             file.flush()
                             last_recorded_frame_id = last_seen_frame_id
@@ -285,7 +310,7 @@ class AreaTrendLogger:
         return frame
 
     def _measure_frame(self, frame: dict[str, Any], settings: dict[str, Any]) -> AreaTrendSample:
-        """从一帧波形里计算手动面积。"""
+        """从一帧波形里计算两个动态窗口的面积和峰高。"""
 
         values = np.asarray(frame["values"], dtype=float)
         channel_index = int(settings["analysis_channel_index"])
@@ -331,17 +356,38 @@ class AreaTrendLogger:
                     left_index=int(settings["area2_left"]),
                     right_index=int(settings["area2_right"]),
                 )
+
+        # 跟随算法只负责决定窗口位置；峰高始终在移动完成后的原始数据窗口内寻找。
+        # 这样面积和峰高严格使用相同的左右边界，WebUI 和 CSV 的统计口径也一致。
+        peak_height, peak_height_index = _measure_window_peak_height(
+            signal,
+            measurement.left_index,
+            measurement.right_index,
+        )
+        peak2_height = None
+        peak2_height_index = None
+        if measurement2 is not None:
+            peak2_height, peak2_height_index = _measure_window_peak_height(
+                signal,
+                measurement2.left_index,
+                measurement2.right_index,
+            )
+
         return AreaTrendSample(
             frame_id=int(frame.get("frame_id", 0)),
             timestamp=float(frame.get("finished_at", time.time())),
             area=float(measurement.value),
+            peak_height=peak_height,
             area2=None if measurement2 is None else float(measurement2.value),
+            peak2_height=peak2_height,
             area_left=int(measurement.left_index),
             area_right=int(measurement.right_index),
             area_peak_index=measurement.peak_index,
+            peak_height_index=peak_height_index,
             area2_left=None if measurement2 is None else int(measurement2.left_index),
             area2_right=None if measurement2 is None else int(measurement2.right_index),
             area2_peak_index=None if measurement2 is None else measurement2.peak_index,
+            peak2_height_index=peak2_height_index,
         )
 
     def _build_csv_row(
@@ -349,7 +395,7 @@ class AreaTrendLogger:
         samples: deque[AreaTrendSample],
         settings: dict[str, Any],
     ) -> dict[str, Any]:
-        """根据最近 N 帧面积构造一行 CSV。"""
+        """根据最近 N 帧面积和峰高构造一行 CSV。"""
 
         window_frames = int(settings["window_frames"])
         recent = list(samples)[-window_frames:]
@@ -359,11 +405,19 @@ class AreaTrendLogger:
             [sample.area + (0.0 if sample.area2 is None else sample.area2) for sample in recent],
             dtype=float,
         )
+        peak_heights = np.asarray([sample.peak_height for sample in recent], dtype=float)
+        peak2_heights = [
+            sample.peak2_height for sample in recent if sample.peak2_height is not None
+        ]
         frame_ids = [sample.frame_id for sample in recent]
 
         area_stats = _area_stats(areas)
         area2_stats = _area_stats(np.asarray(area2_values, dtype=float)) if area2_values else {}
         area_sum_stats = _area_stats(area_sums)
+        peak_height_stats = _area_stats(peak_heights)
+        peak2_height_stats = (
+            _area_stats(np.asarray(peak2_heights, dtype=float)) if peak2_heights else {}
+        )
 
         latest = recent[-1]
         latest_area_sum = latest.area + (0.0 if latest.area2 is None else latest.area2)
@@ -380,9 +434,11 @@ class AreaTrendLogger:
             "area_left": latest.area_left,
             "area_right": latest.area_right,
             "area_peak_index": latest.area_peak_index,
+            "peak_height_index": latest.peak_height_index,
             "area2_left": latest.area2_left,
             "area2_right": latest.area2_right,
             "area2_peak_index": latest.area2_peak_index,
+            "peak2_height_index": latest.peak2_height_index,
             "window_frames": window_frames,
             "sample_count": int(areas.size),
             "area_current": float(areas[-1]),
@@ -403,6 +459,18 @@ class AreaTrendLogger:
             "area_sum_rel_std_percent": area_sum_stats["rel_std_percent"],
             "area_sum_ema_alpha": float(settings.get("ema_alpha", 0.02)),
             "area_sum_ema": None,
+            "peak_height_current": latest.peak_height,
+            "peak_height_mean": peak_height_stats["mean"],
+            "peak_height_std": peak_height_stats["std"],
+            "peak_height_rel_std_percent": peak_height_stats["rel_std_percent"],
+            "peak_height_ema_alpha": float(settings.get("ema_alpha", 0.02)),
+            "peak_height_ema": None,
+            "peak2_height_current": latest.peak2_height,
+            "peak2_height_mean": peak2_height_stats.get("mean"),
+            "peak2_height_std": peak2_height_stats.get("std"),
+            "peak2_height_rel_std_percent": peak2_height_stats.get("rel_std_percent"),
+            "peak2_height_ema_alpha": float(settings.get("ema_alpha", 0.02)),
+            "peak2_height_ema": None,
             "shot2shot_last_delta": area_stats["last_delta"],
             "shot2shot_last_delta_rel_percent": area_stats["last_delta_rel_percent"],
             "shot2shot_std": area_stats["shot2shot_std"],
@@ -415,6 +483,22 @@ class AreaTrendLogger:
             "area2_shot2shot_last_delta_rel_percent": area2_stats.get("last_delta_rel_percent"),
             "area2_shot2shot_std": area2_stats.get("shot2shot_std"),
             "area2_shot2shot_rel_std_percent": area2_stats.get("shot2shot_rel_std_percent"),
+            "peak_height_shot2shot_last_delta": peak_height_stats["last_delta"],
+            "peak_height_shot2shot_last_delta_rel_percent": peak_height_stats[
+                "last_delta_rel_percent"
+            ],
+            "peak_height_shot2shot_std": peak_height_stats["shot2shot_std"],
+            "peak_height_shot2shot_rel_std_percent": peak_height_stats[
+                "shot2shot_rel_std_percent"
+            ],
+            "peak2_height_shot2shot_last_delta": peak2_height_stats.get("last_delta"),
+            "peak2_height_shot2shot_last_delta_rel_percent": peak2_height_stats.get(
+                "last_delta_rel_percent"
+            ),
+            "peak2_height_shot2shot_std": peak2_height_stats.get("shot2shot_std"),
+            "peak2_height_shot2shot_rel_std_percent": peak2_height_stats.get(
+                "shot2shot_rel_std_percent"
+            ),
             "record_hz": float(settings["record_hz"]),
         }
 
@@ -431,6 +515,25 @@ def _relative_percent(std_or_delta: float, mean: float) -> float | None:
     if abs(mean) < 1e-30:
         return None
     return float(std_or_delta / abs(mean) * 100.0)
+
+
+def _measure_window_peak_height(
+    signal: np.ndarray,
+    left_index: int,
+    right_index: int,
+) -> tuple[float, int]:
+    """返回指定闭区间内原始波形的最高值及其全局索引。"""
+
+    data = np.asarray(signal, dtype=float)
+    left = max(0, min(int(left_index), data.size - 1))
+    right = max(0, min(int(right_index), data.size - 1))
+    if right < left:
+        left, right = right, left
+    window = data[left : right + 1]
+    if window.size == 0:
+        raise ValueError("peak height window must not be empty")
+    local_index = int(np.argmax(window))
+    return float(window[local_index]), left + local_index
 
 
 def _update_ema(previous: float | None, value: Any, alpha: float) -> float | None:
@@ -551,9 +654,11 @@ def _csv_fieldnames() -> list[str]:
         "area_left",
         "area_right",
         "area_peak_index",
+        "peak_height_index",
         "area2_left",
         "area2_right",
         "area2_peak_index",
+        "peak2_height_index",
         "window_frames",
         "sample_count",
         "area_current",
@@ -574,6 +679,18 @@ def _csv_fieldnames() -> list[str]:
         "area_sum_rel_std_percent",
         "area_sum_ema_alpha",
         "area_sum_ema",
+        "peak_height_current",
+        "peak_height_mean",
+        "peak_height_std",
+        "peak_height_rel_std_percent",
+        "peak_height_ema_alpha",
+        "peak_height_ema",
+        "peak2_height_current",
+        "peak2_height_mean",
+        "peak2_height_std",
+        "peak2_height_rel_std_percent",
+        "peak2_height_ema_alpha",
+        "peak2_height_ema",
         "shot2shot_last_delta",
         "shot2shot_last_delta_rel_percent",
         "shot2shot_std",
@@ -586,5 +703,13 @@ def _csv_fieldnames() -> list[str]:
         "area2_shot2shot_last_delta_rel_percent",
         "area2_shot2shot_std",
         "area2_shot2shot_rel_std_percent",
+        "peak_height_shot2shot_last_delta",
+        "peak_height_shot2shot_last_delta_rel_percent",
+        "peak_height_shot2shot_std",
+        "peak_height_shot2shot_rel_std_percent",
+        "peak2_height_shot2shot_last_delta",
+        "peak2_height_shot2shot_last_delta_rel_percent",
+        "peak2_height_shot2shot_std",
+        "peak2_height_shot2shot_rel_std_percent",
         "record_hz",
     ]

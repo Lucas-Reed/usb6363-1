@@ -380,6 +380,14 @@
       <tr><td>B</td><td>--</td><td>--</td><td>--</td></tr>
     </tbody>
   </table>
+  <h2>双峰高统计（慢漂记录）</h2>
+  <table>
+    <thead><tr><th>窗口</th><th>峰顶索引</th><th>当前峰高</th><th>最近均值/标准差/EMA</th></tr></thead>
+    <tbody id="dualPeakHeightRows">
+      <tr><td>A</td><td>--</td><td>--</td><td>--</td></tr>
+      <tr><td>B</td><td>--</td><td>--</td><td>--</td></tr>
+    </tbody>
+  </table>
 
   <h2>慢漂记录</h2>
   <div class="grid2">
@@ -392,7 +400,7 @@
       <input id="trend_record_hz" type="number" value="1" min="0.01" step="0.5">
     </div>
   </div>
-  <label>面积和 EMA alpha，0 表示关闭滤波</label>
+  <label>面积和峰高 EMA alpha，0 表示关闭滤波</label>
   <input id="trend_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.005">
   <label class="inline">
     <input id="auto_track_enabled" type="checkbox">
@@ -424,6 +432,9 @@
   <input id="trend_latest" value="--" readonly>
   <div class="plot" style="height:160px; margin-top:8px;">
     <canvas id="areaTrendCanvas"></canvas>
+  </div>
+  <div class="plot" style="height:160px; margin-top:8px;">
+    <canvas id="peakHeightTrendCanvas"></canvas>
   </div>
   <div class="actions">
     <button class="green" id="trendStartBtn" onclick="startAreaTrend()">开始慢漂记录</button>
@@ -1160,8 +1171,10 @@ function updateTrendStatus(status) {
     document.getElementById('trend_latest').value = '--';
   }
   drawAreaTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
+  drawPeakHeightTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
   updateManualAreaTable();
   updateDualAreaTable();
+  updateDualPeakHeightTable();
   renderPlots();
 
   document.getElementById('trendStartBtn').disabled = running;
@@ -1176,7 +1189,35 @@ function updateTrendStatus(status) {
 }
 
 function drawAreaTrend(rows) {
-  const canvas = document.getElementById('areaTrendCanvas');
+  drawTrendChart({
+    canvasId: 'areaTrendCanvas',
+    rows,
+    requiredField: 'area_sum_mean',
+    waitText: '等待面积记录...',
+    series: [
+      {field: 'area_sum_mean', label: 'SUM raw', color: '#2563eb'},
+      {field: 'area_sum_ema', label: 'SUM EMA', color: '#dc2626'},
+    ],
+  });
+}
+
+function drawPeakHeightTrend(rows) {
+  drawTrendChart({
+    canvasId: 'peakHeightTrendCanvas',
+    rows,
+    requiredField: 'peak_height_mean',
+    waitText: '等待峰高记录...',
+    series: [
+      {field: 'peak_height_mean', label: 'A raw', color: '#2563eb'},
+      {field: 'peak_height_ema', label: 'A EMA', color: '#dc2626'},
+      {field: 'peak2_height_mean', label: 'B raw', color: '#16803c'},
+      {field: 'peak2_height_ema', label: 'B EMA', color: '#7c3aed'},
+    ],
+  });
+}
+
+function drawTrendChart({canvasId, rows, requiredField, waitText, series}) {
+  const canvas = document.getElementById(canvasId);
   if (!canvas) return;
   const rect = canvas.getBoundingClientRect();
   const devicePixelRatio = window.devicePixelRatio || 1;
@@ -1188,20 +1229,25 @@ function drawAreaTrend(rows) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   const points = (rows || [])
-    .filter(row => row.area_sum_mean !== null && row.area_sum_mean !== undefined)
+    .filter(row => row[requiredField] !== null && row[requiredField] !== undefined)
     .slice(-300);
   if (points.length < 2) {
     ctx.fillStyle = '#6b7280';
     ctx.font = `${12 * devicePixelRatio}px Segoe UI`;
-    ctx.fillText('等待面积记录...', 10 * devicePixelRatio, 24 * devicePixelRatio);
+    ctx.fillText(waitText, 10 * devicePixelRatio, 24 * devicePixelRatio);
     return;
   }
 
-  const rawValues = points.map(row => Number(row.area_sum_mean));
-  const emaValues = points
-    .map(row => row.area_sum_ema === null || row.area_sum_ema === undefined ? NaN : Number(row.area_sum_ema))
+  const preparedSeries = series.map(item => ({
+    ...item,
+    values: points.map(row => row[item.field] === null || row[item.field] === undefined
+      ? NaN
+      : Number(row[item.field])),
+  }));
+  const allValues = preparedSeries
+    .flatMap(item => item.values)
     .filter(value => Number.isFinite(value));
-  const allValues = rawValues.concat(emaValues);
+  if (!allValues.length) return;
   let min = Math.min(...allValues);
   let max = Math.max(...allValues);
   if (!Number.isFinite(min) || !Number.isFinite(max)) return;
@@ -1227,20 +1273,13 @@ function drawAreaTrend(rows) {
   ctx.fillText(max.toExponential(2), 4 * devicePixelRatio, padT + 8 * devicePixelRatio);
   ctx.fillText(min.toExponential(2), 4 * devicePixelRatio, padT + plotH);
 
-  drawTrendLine(ctx, rawValues, xFor, yFor, '#2563eb', devicePixelRatio);
-  drawTrendLine(
-    ctx,
-    points.map(row => row.area_sum_ema === null || row.area_sum_ema === undefined ? NaN : Number(row.area_sum_ema)),
-    xFor,
-    yFor,
-    '#dc2626',
-    devicePixelRatio,
-  );
-
-  ctx.fillStyle = '#2563eb';
-  ctx.fillText('SUM raw', padL, canvas.height - 8 * devicePixelRatio);
-  ctx.fillStyle = '#dc2626';
-  ctx.fillText('EMA', padL + 76 * devicePixelRatio, canvas.height - 8 * devicePixelRatio);
+  let legendX = padL;
+  preparedSeries.forEach(item => {
+    drawTrendLine(ctx, item.values, xFor, yFor, item.color, devicePixelRatio);
+    ctx.fillStyle = item.color;
+    ctx.fillText(item.label, legendX, canvas.height - 8 * devicePixelRatio);
+    legendX += ctx.measureText(item.label).width + 18 * devicePixelRatio;
+  });
 }
 
 function drawTrendLine(ctx, values, xFor, yFor, color, devicePixelRatio) {
@@ -2265,6 +2304,62 @@ function updateDualAreaTable() {
   rows.innerHTML = `
     <tr><td>A</td><td>${statsA.range}</td><td>${statsA.current}</td><td>${statsA.stats}</td></tr>
     <tr><td>B</td><td>${statsB.range}</td><td>${statsB.current}</td><td>${statsB.stats}</td></tr>
+  `;
+}
+
+function trendPeakHeightStats(name) {
+  // 峰高和面积直接读取同一条后端统计记录，确保动态窗口、帧数和 EMA 完全一致。
+  const stats = getActiveAreaStats();
+  if (!stats) return null;
+  if (name === 'A') {
+    return {
+      index: stats.peak_height_index,
+      current: stats.peak_height_current,
+      mean: stats.peak_height_mean,
+      std: stats.peak_height_std,
+      ema: stats.peak_height_ema,
+      sampleCount: stats.sample_count,
+    };
+  }
+  if (stats.peak2_height_current === null || stats.peak2_height_current === undefined) return null;
+  return {
+    index: stats.peak2_height_index,
+    current: stats.peak2_height_current,
+    mean: stats.peak2_height_mean,
+    std: stats.peak2_height_std,
+    ema: stats.peak2_height_ema,
+    sampleCount: stats.sample_count,
+  };
+}
+
+function formatTrendPeakHeightStats(stats) {
+  if (!stats || stats.current === null || stats.current === undefined) {
+    return {index: '--', current: '--', stats: '--'};
+  }
+  const meanText = stats.mean === null || stats.mean === undefined
+    ? '--'
+    : Number(stats.mean).toExponential(6);
+  const stdText = stats.std === null || stats.std === undefined
+    ? '--'
+    : Number(stats.std).toExponential(6);
+  const emaText = stats.ema === null || stats.ema === undefined
+    ? '--'
+    : Number(stats.ema).toExponential(6);
+  return {
+    index: stats.index === null || stats.index === undefined ? '--' : String(stats.index),
+    current: Number(stats.current).toExponential(6),
+    stats: `${meanText} / ${stdText} / EMA ${emaText} / ${stats.sampleCount || 0} 帧`,
+  };
+}
+
+function updateDualPeakHeightTable() {
+  const rows = document.getElementById('dualPeakHeightRows');
+  if (!rows) return;
+  const statsA = formatTrendPeakHeightStats(trendPeakHeightStats('A'));
+  const statsB = formatTrendPeakHeightStats(trendPeakHeightStats('B'));
+  rows.innerHTML = `
+    <tr><td>A</td><td>${statsA.index}</td><td>${statsA.current}</td><td>${statsA.stats}</td></tr>
+    <tr><td>B</td><td>${statsB.index}</td><td>${statsB.current}</td><td>${statsB.stats}</td></tr>
   `;
 }
 
