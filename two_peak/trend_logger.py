@@ -30,6 +30,10 @@ from two_peak.window_voltage_recorder import WindowVoltageRecorder
 from usb6363_client import Usb6363Client
 
 
+class FrameHistoryError(RuntimeError):
+    """表示历史帧已经不连续，继续记录会产生无法察觉的数据缺口。"""
+
+
 @dataclass
 class AreaTrendSample:
     """一帧动态窗口测量数据。
@@ -130,6 +134,13 @@ class AreaTrendLogger:
         if start_after_frame_id < 0:
             raise ValueError("start_after_frame_id must be >= 0")
 
+        actual_start_after_frame_id = int(start_after_frame_id)
+        if str(stream_source) == "unified_stream" and actual_start_after_frame_id == 0:
+            # 普通记录可能在统一流运行很久以后才开始。此时从“点击开始”的当前帧
+            # 往后记录，而不是错误地要求补回从 frame 1 开始的全部历史。
+            stream_status = self._daq.get_unified_ai_stream_status()
+            actual_start_after_frame_id = int(stream_status.get("frame_id", 0))
+
         with self._lock:
             if self._running:
                 raise RuntimeError("Area trend logger is already running")
@@ -161,7 +172,7 @@ class AreaTrendLogger:
                 ),
                 "session_id": actual_session_id,
                 "trigger_unix_time": trigger_unix_time,
-                "start_after_frame_id": int(start_after_frame_id),
+                "start_after_frame_id": actual_start_after_frame_id,
             }
 
             voltage_recorder = None
@@ -269,8 +280,8 @@ class AreaTrendLogger:
         samples: deque[AreaTrendSample] = deque(maxlen=max(10_000, int(settings["window_frames"]) * 5))
         last_seen_frame_id = int(settings.get("start_after_frame_id", 0))
         last_recorded_frame_id = int(settings.get("start_after_frame_id", 0))
-        next_record_time = time.time()
         record_period = 1.0 / float(settings["record_hz"])
+        next_record_timestamp: float | None = None
         ema_alpha = float(settings.get("ema_alpha", 0.02))
         area_ema: float | None = None
         area2_ema: float | None = None
@@ -286,14 +297,29 @@ class AreaTrendLogger:
                 while not stop_event.is_set():
                     try:
                         status = self._get_stream_status(settings)
-                        frame_id = int(status.get("frame_id", 0))
                         if status.get("running") is not True and not status.get("has_frame"):
                             self._set_error("AI stream is not running and has no frame")
                             time.sleep(float(settings["poll_interval"]))
                             continue
 
-                        if frame_id > last_seen_frame_id:
-                            frame = self._get_stream_latest(settings)
+                        frames, has_more = self._get_stream_frames(
+                            settings,
+                            last_seen_frame_id,
+                            status,
+                        )
+                        for frame in frames:
+                            frame_id = int(frame.get("frame_id", 0))
+                            expected_frame_id = last_seen_frame_id + 1
+                            if (
+                                settings.get("stream_source") == "unified_stream"
+                                and frame_id != expected_frame_id
+                            ):
+                                raise FrameHistoryError(
+                                    "统一 AI 历史帧不连续："
+                                    f"期望 frame_id={expected_frame_id}，实际得到 {frame_id}。"
+                                    "记录已停止，避免生成带有隐藏缺口的数据。"
+                                )
+
                             sample = self._measure_frame(frame, settings)
                             samples.append(sample)
                             if voltage_recorder is not None:
@@ -313,50 +339,69 @@ class AreaTrendLogger:
                                 self._last_frame_id = sample.frame_id
                                 self._error = None
 
+                            # CSV 降采样使用帧自身的实验时间。即使一次补回多帧，
+                            # 也会按原采集时刻写入，而不是挤在补取发生的电脑时间上。
+                            if next_record_timestamp is None:
+                                next_record_timestamp = sample.timestamp
+                            if (
+                                sample.timestamp + 1e-9 >= next_record_timestamp
+                                and sample.frame_id > last_recorded_frame_id
+                            ):
+                                row = self._build_csv_row(samples, settings)
+                                area_ema = _update_ema(
+                                    area_ema, row.get("area_mean"), ema_alpha
+                                )
+                                area2_ema = _update_ema(
+                                    area2_ema, row.get("area2_mean"), ema_alpha
+                                )
+                                area_sum_ema = _update_ema(
+                                    area_sum_ema, row.get("area_sum_mean"), ema_alpha
+                                )
+                                peak_height_ema = _update_ema(
+                                    peak_height_ema,
+                                    row.get("peak_height_mean"),
+                                    ema_alpha,
+                                )
+                                peak2_height_ema = _update_ema(
+                                    peak2_height_ema,
+                                    row.get("peak2_height_mean"),
+                                    ema_alpha,
+                                )
+                                row["area_ema_alpha"] = ema_alpha
+                                row["area_ema"] = area_ema
+                                row["area2_ema_alpha"] = ema_alpha
+                                row["area2_ema"] = area2_ema
+                                row["area_sum_ema_alpha"] = ema_alpha
+                                row["area_sum_ema"] = area_sum_ema
+                                row["peak_height_ema_alpha"] = ema_alpha
+                                row["peak_height_ema"] = peak_height_ema
+                                row["peak2_height_ema_alpha"] = ema_alpha
+                                row["peak2_height_ema"] = peak2_height_ema
+                                writer.writerow(row)
+                                file.flush()
+                                last_recorded_frame_id = sample.frame_id
+                                with self._lock:
+                                    self._records_written += 1
+                                    self._latest_stats = dict(row)
+                                    self._recent_stats.append(dict(row))
+                                while next_record_timestamp <= sample.timestamp + 1e-9:
+                                    next_record_timestamp += record_period
+
                         if voltage_recorder is not None:
                             voltage_error = voltage_recorder.status().get("error")
                             if voltage_error:
                                 self._set_error(f"窗口电压写盘失败：{voltage_error}")
                                 break
 
-                        now = time.time()
-                        # 只有真的看到新帧之后才写 CSV。
-                        # 如果连续采集意外停住，这里不会把同一批旧数据反复写很多行。
-                        if now >= next_record_time and samples and last_seen_frame_id > last_recorded_frame_id:
-                            row = self._build_csv_row(samples, settings)
-                            area_ema = _update_ema(area_ema, row.get("area_mean"), ema_alpha)
-                            area2_ema = _update_ema(area2_ema, row.get("area2_mean"), ema_alpha)
-                            area_sum_ema = _update_ema(area_sum_ema, row.get("area_sum_mean"), ema_alpha)
-                            peak_height_ema = _update_ema(
-                                peak_height_ema,
-                                row.get("peak_height_mean"),
-                                ema_alpha,
-                            )
-                            peak2_height_ema = _update_ema(
-                                peak2_height_ema,
-                                row.get("peak2_height_mean"),
-                                ema_alpha,
-                            )
-                            row["area_ema_alpha"] = ema_alpha
-                            row["area_ema"] = area_ema
-                            row["area2_ema_alpha"] = ema_alpha
-                            row["area2_ema"] = area2_ema
-                            row["area_sum_ema_alpha"] = ema_alpha
-                            row["area_sum_ema"] = area_sum_ema
-                            row["peak_height_ema_alpha"] = ema_alpha
-                            row["peak_height_ema"] = peak_height_ema
-                            row["peak2_height_ema_alpha"] = ema_alpha
-                            row["peak2_height_ema"] = peak2_height_ema
-                            writer.writerow(row)
-                            file.flush()
-                            last_recorded_frame_id = last_seen_frame_id
-                            with self._lock:
-                                self._records_written += 1
-                                self._latest_stats = dict(row)
-                                self._recent_stats.append(dict(row))
-                            next_record_time = now + record_period
+                        # 历史接口还有数据时立即继续补取，不额外 sleep。
+                        if has_more:
+                            continue
 
+                    except FrameHistoryError as exc:
+                        self._set_error(str(exc))
+                        break
                     except Exception as exc:
+                        # 网络短暂失败沿用原行为：显示错误但继续尝试，成功读取后会清除。
                         self._set_error(str(exc))
 
                     time.sleep(float(settings["poll_interval"]))
@@ -377,18 +422,43 @@ class AreaTrendLogger:
             return self._daq.get_unified_ai_stream_status()
         return self._daq.get_ai_frame_stream_status()
 
-    def _get_stream_latest(self, settings: dict[str, Any]) -> dict[str, Any]:
-        """读取当前数据流的最新帧，并按需要过滤到 WebUI 选择的通道。"""
+    def _get_stream_frames(
+        self,
+        settings: dict[str, Any],
+        last_seen_frame_id: int,
+        status: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """返回尚未处理的帧，以及是否应立即继续读取下一批。"""
 
+        channels = [str(channel) for channel in (settings.get("channels") or [])]
         if settings.get("stream_source") == "unified_stream":
-            frame = self._daq.get_unified_ai_stream_latest_frame()
-        else:
-            frame = self._daq.get_ai_frame_stream_latest()
+            if not channels:
+                channels = [
+                    str(channel)
+                    for channel in ((status.get("settings") or {}).get("channels") or [])
+                ]
+            batch = self._daq.get_unified_ai_frame_batch(
+                after_frame_id=last_seen_frame_id,
+                channels=channels,
+                max_frames=100,
+            )
+            if batch.get("history_overrun"):
+                missing = int(batch.get("missing_before_first", 0))
+                oldest = int(batch.get("oldest_available_frame_id", 0))
+                raise FrameHistoryError(
+                    f"统一 AI 历史缓冲区已经覆盖 {missing} 帧，"
+                    f"当前最老可用 frame_id={oldest}。"
+                    "记录已停止，避免生成带有隐藏缺口的数据。"
+                )
+            return list(batch.get("frames") or []), bool(batch.get("has_more"))
 
-        channels = settings.get("channels") or []
+        # 旧 frame_stream 没有历史缓冲，只维持原来的“有新帧就取最新帧”行为。
+        if int(status.get("frame_id", 0)) <= last_seen_frame_id:
+            return [], False
+        frame = self._daq.get_ai_frame_stream_latest()
         if channels:
-            frame = _filter_frame_channels(frame, [str(channel) for channel in channels])
-        return frame
+            frame = _filter_frame_channels(frame, channels)
+        return [frame], False
 
     def _measure_frame(self, frame: dict[str, Any], settings: dict[str, Any]) -> AreaTrendSample:
         """从一帧波形里计算两个动态窗口的面积和峰高。"""
