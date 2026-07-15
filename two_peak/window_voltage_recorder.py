@@ -15,11 +15,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
 
 VALID_MODES = {"none", "a", "b", "both"}
+
+# 写盘线程短暂落后时允许采集线程等待；超过这个时间说明继续运行已经无法保证完整。
+WINDOW_QUEUE_PUT_TIMEOUT_SECONDS = 5.0
+
+# Windows 上杀毒软件、索引器或其他读取进程可能短暂占用 manifest.json。
+# 原子替换在约 5 秒内重试，避免一次瞬时 WinError 5/32 终止整场实验。
+MANIFEST_REPLACE_TIMEOUT_SECONDS = 5.0
+MANIFEST_REPLACE_INITIAL_DELAY_SECONDS = 0.02
 
 
 class WindowVoltageRecorder:
@@ -45,11 +54,13 @@ class WindowVoltageRecorder:
             raise ValueError("session_id 只能包含字母、数字、下划线和连字符")
 
         self._lock = threading.Lock()
+        self._manifest_lock = threading.Lock()
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=queue_frames)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._session_dir = output_dir / f"window_voltage_{session_id}"
         self._manifest_path = self._session_dir / "manifest.json"
+        self._active_manifest_path = self._manifest_path
         self._session_id = session_id
         self._mode = normalized_mode
         self._chunk_frames = int(chunk_frames)
@@ -71,6 +82,8 @@ class WindowVoltageRecorder:
         self._last_written_frame_id: int | None = None
         self._chunks: list[dict[str, Any]] = []
         self._bytes_written = 0
+        self._manifest_warning: str | None = None
+        self._manifest_write_failures = 0
 
     def start(self) -> dict[str, Any]:
         """创建会话目录并启动写盘线程。"""
@@ -87,23 +100,31 @@ class WindowVoltageRecorder:
         return self.status()
 
     def append(self, record: dict[str, Any]) -> None:
-        """把一帧窗口数据放入写盘队列，不阻塞趋势采集线程。"""
+        """把一帧窗口数据放入写盘队列；队列满时最多等待 5 秒。"""
 
         frame_id = int(record["frame_id"])
         with self._lock:
             if not self._running or self._error:
                 return
+
+        try:
+            # 这里主动施加背压：宁可短暂等写盘，也不能悄悄扔掉实验帧。
+            self._queue.put(record, timeout=WINDOW_QUEUE_PUT_TIMEOUT_SECONDS)
+        except queue.Full:
+            with self._lock:
+                self._error = (
+                    f"窗口电压写入队列持续满 {WINDOW_QUEUE_PUT_TIMEOUT_SECONDS:g} 秒，"
+                    f"frame_id={frame_id} 未能写入；记录已停止。"
+                )
+                self._queue_dropped_frames += 1
+            self._stop_event.set()
+            return
+
+        with self._lock:
             if self._last_received_frame_id is not None and frame_id > self._last_received_frame_id + 1:
                 self._source_gap_frames += frame_id - self._last_received_frame_id - 1
             self._last_received_frame_id = frame_id
             self._frames_received += 1
-
-        try:
-            self._queue.put_nowait(record)
-        except queue.Full:
-            # 队列满说明磁盘写入已经追不上输入；继续统计丢帧，方便实验后判断数据是否可用。
-            with self._lock:
-                self._queue_dropped_frames += 1
 
     def stop(self) -> dict[str, Any]:
         """停止接收新帧，等待队列写完并刷新最后一个不完整块。"""
@@ -117,7 +138,12 @@ class WindowVoltageRecorder:
                 self._error = "窗口电压写盘线程未能在 15 秒内停止"
             self._running = False
             self._finished_at = self._finished_at or time.time()
-        self._write_manifest(completed=self._error is None and not (thread and thread.is_alive()))
+        # 正常退出时 worker 已经写过最终清单；只有线程未能退出时才由 stop 补写。
+        if thread is None or thread.is_alive():
+            self._write_manifest(
+                completed=self._error is None and not (thread and thread.is_alive()),
+                final=True,
+            )
         return self.status()
 
     def status(self) -> dict[str, Any]:
@@ -131,7 +157,9 @@ class WindowVoltageRecorder:
                 "mode": self._mode,
                 "session_id": self._session_id,
                 "directory": str(self._session_dir.resolve()),
-                "manifest_file": str(self._manifest_path.resolve()),
+                "manifest_file": str(self._active_manifest_path.resolve()),
+                "manifest_warning": self._manifest_warning,
+                "manifest_write_failures": self._manifest_write_failures,
                 "chunk_frames": self._chunk_frames,
                 "frames_received": self._frames_received,
                 "frames_written": self._frames_written,
@@ -166,7 +194,7 @@ class WindowVoltageRecorder:
             with self._lock:
                 self._running = False
                 self._finished_at = time.time()
-            self._write_manifest(completed=self._error is None)
+            self._write_manifest(completed=self._error is None, final=True)
 
     def _write_chunk(self, records: list[dict[str, Any]]) -> None:
         """把一批同宽窗口写成一个未压缩 NPZ，并用原子改名完成落盘。"""
@@ -210,11 +238,11 @@ class WindowVoltageRecorder:
             )
         self._write_manifest(completed=False)
 
-    def _write_manifest(self, completed: bool) -> None:
-        """原子更新清单，避免程序意外退出时留下半个 JSON。"""
+    def _manifest_payload(self, completed: bool) -> dict[str, Any]:
+        """生成 manifest 内容；调用者随后负责原子写入。"""
 
         with self._lock:
-            payload = {
+            return {
                 "format": "two_peak_window_voltage_npz_v1",
                 "session_id": self._session_id,
                 "mode": self._mode,
@@ -232,18 +260,97 @@ class WindowVoltageRecorder:
                 "frames_written": self._frames_written,
                 "source_gap_frames": self._source_gap_frames,
                 "queue_dropped_frames": self._queue_dropped_frames,
+                "manifest_warning": self._manifest_warning,
+                "manifest_write_failures": self._manifest_write_failures,
                 "first_frame_id": self._first_written_frame_id,
                 "last_frame_id": self._last_written_frame_id,
                 "bytes_written": self._bytes_written,
                 "chunks": list(self._chunks),
                 "settings": dict(self._metadata),
             }
-        temp_path = self._manifest_path.with_suffix(".json.tmp")
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+
+    def _write_manifest(self, completed: bool, final: bool = False) -> bool:
+        """更新清单；临时占用只产生 warning，不中断 NPZ 数据写入。
+
+        final=True 表示记录正在收尾。若固定的 manifest.json 始终被占用，
+        会改写一个独立的 manifest_final_*.json，确保最终元数据仍可恢复。
+        """
+
+        with self._manifest_lock:
+            payload = self._manifest_payload(completed)
+            # 本次若成功，旧 warning 已经恢复，因此写入文件时清空它。
+            payload["manifest_warning"] = None
+            try:
+                self._atomic_write_json(self._manifest_path, payload)
+            except OSError as exc:
+                warning = f"manifest.json 更新失败：{exc}"
+                with self._lock:
+                    self._manifest_write_failures += 1
+                    self._manifest_warning = warning
+
+                if not final:
+                    return False
+
+                fallback_path = self._session_dir / (
+                    "manifest_final_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".json"
+                )
+                fallback_payload = self._manifest_payload(completed)
+                fallback_payload["manifest_warning"] = (
+                    warning + f"；最终清单已改写到 {fallback_path.name}"
+                )
+                try:
+                    self._atomic_write_json(fallback_path, fallback_payload)
+                except OSError as fallback_exc:
+                    with self._lock:
+                        self._manifest_write_failures += 1
+                        self._manifest_warning = (
+                            warning + f"；备用最终清单也写入失败：{fallback_exc}"
+                        )
+                    return False
+
+                with self._lock:
+                    self._active_manifest_path = fallback_path
+                    self._manifest_warning = fallback_payload["manifest_warning"]
+                return True
+
+            with self._lock:
+                self._active_manifest_path = self._manifest_path
+                self._manifest_warning = None
+            return True
+
+    def _atomic_write_json(self, final_path: Path, payload: dict[str, Any]) -> None:
+        """用唯一临时文件写 JSON，并对 Windows 文件占用进行退避重试。"""
+
+        temp_path = final_path.with_name(
+            f".{final_path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
         )
-        temp_path.replace(self._manifest_path)
+        try:
+            with temp_path.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+
+            deadline = time.monotonic() + MANIFEST_REPLACE_TIMEOUT_SECONDS
+            delay = MANIFEST_REPLACE_INITIAL_DELAY_SECONDS
+            while True:
+                try:
+                    os.replace(temp_path, final_path)
+                    return
+                except OSError as exc:
+                    # WinError 5 是拒绝访问，WinError 32 是文件正被其他进程使用。
+                    # PermissionError 在不同 Python/Windows 版本上可能只提供 errno。
+                    winerror = getattr(exc, "winerror", None)
+                    retryable = isinstance(exc, PermissionError) or winerror in (5, 32)
+                    if not retryable or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 0.5)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                # 临时文件清理失败不应覆盖真正的 manifest 写入错误。
+                pass
 
 
 def _window_arrays(records: list[dict[str, Any]], prefix: str) -> dict[str, np.ndarray]:
