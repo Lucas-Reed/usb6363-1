@@ -430,6 +430,31 @@
   <input id="trend_file" value="" readonly>
   <label>最新统计</label>
   <input id="trend_latest" value="--" readonly>
+
+  <h2>逐帧窗口电压（临时测试）</h2>
+  <label>记录窗口</label>
+  <select id="window_voltage_mode">
+    <option value="none" selected>不记录</option>
+    <option value="a">仅窗口 A</option>
+    <option value="b">仅窗口 B</option>
+    <option value="both">窗口 A+B</option>
+  </select>
+  <label>NPZ 输出目录</label>
+  <input id="window_voltage_output_dir" value="data/two_peak_window_voltage">
+  <div class="grid2">
+    <div>
+      <label>写盘状态</label>
+      <input id="window_voltage_status" value="关闭" readonly>
+    </div>
+    <div>
+      <label>数据量估计</label>
+      <input id="window_voltage_estimate" value="--" readonly>
+    </div>
+  </div>
+  <label>记录进度</label>
+  <input id="window_voltage_progress" value="--" readonly>
+  <label>记录目录</label>
+  <input id="window_voltage_directory" value="" readonly>
   <div class="plot" style="height:160px; margin-top:8px;">
     <canvas id="areaTrendCanvas"></canvas>
   </div>
@@ -770,6 +795,8 @@ function getTrendParams() {
     auto_track_enabled: document.getElementById('auto_track_enabled').checked,
     auto_track_smooth_window: Number(document.getElementById('auto_track_smooth_window').value),
     auto_track_max_shift: Number(document.getElementById('auto_track_max_shift').value),
+    window_voltage_mode: document.getElementById('window_voltage_mode').value,
+    window_voltage_output_dir: document.getElementById('window_voltage_output_dir').value,
   };
 }
 
@@ -893,6 +920,11 @@ function applyDefaultsToUi(defaults) {
   setInputValue('auto_track_enabled', defaults.auto_track_enabled);
   setInputValue('auto_track_smooth_window', firstDefined(defaults.auto_track_smooth_window, 9));
   setInputValue('auto_track_max_shift', firstDefined(defaults.auto_track_max_shift, 5));
+  setInputValue('window_voltage_mode', firstDefined(defaults.window_voltage_mode, 'none'));
+  setInputValue(
+    'window_voltage_output_dir',
+    firstDefined(defaults.window_voltage_output_dir, 'data/two_peak_window_voltage'),
+  );
   setInputValue('ao_scan_channel', firstDefined(defaults.channel, defaults.ao_scan_channel));
   setInputValue('ao_scan_start_voltage', firstDefined(defaults.start_voltage, defaults.ao_scan_start_voltage));
   setInputValue('ao_scan_stop_voltage', firstDefined(defaults.stop_voltage, defaults.ao_scan_stop_voltage));
@@ -931,6 +963,7 @@ function applyDefaultsToUi(defaults) {
   setInputValue('lock_aom_kp', firstDefined(defaults.lock_aom_kp, 0));
   setInputValue('lock_aom_ki', firstDefined(defaults.lock_aom_ki, 0));
   updateDerivedTimingFromInputs();
+  updateWindowVoltageEstimate();
   applyXView(false);
 }
 
@@ -1148,6 +1181,17 @@ function updateTrendStatus(status) {
     ? status.records_written
     : 0;
   document.getElementById('trend_file').value = status && status.csv_file ? status.csv_file : '';
+  const voltage = status && status.window_voltage ? status.window_voltage : {};
+  const voltageError = voltage.error ? `错误：${voltage.error}` : '';
+  document.getElementById('window_voltage_status').value = voltageError
+    || (voltage.running ? '写入中' : (voltage.enabled ? '已停止' : '关闭'));
+  document.getElementById('window_voltage_progress').value = voltage.enabled
+    ? `帧=${voltage.frames_written || 0}  块=${voltage.chunks_written || 0}`
+      + `  源漏帧=${voltage.source_gap_frames || 0}`
+      + `  队列丢帧=${voltage.queue_dropped_frames || 0}`
+      + `  文件=${formatBytes(voltage.bytes_written || 0)}`
+    : '--';
+  document.getElementById('window_voltage_directory').value = voltage.directory || '';
 
   if (latest.area_sum_mean !== undefined) {
     const rel = latest.area_sum_rel_std_percent === null || latest.area_sum_rel_std_percent === undefined
@@ -1199,6 +1243,38 @@ function drawAreaTrend(rows) {
       {field: 'area_sum_ema', label: 'SUM EMA', color: '#dc2626'},
     ],
   });
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes.toFixed(0)} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(2)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(2)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+function updateWindowVoltageEstimate() {
+  const mode = document.getElementById('window_voltage_mode').value;
+  if (mode === 'none') {
+    document.getElementById('window_voltage_estimate').value = '--';
+    return;
+  }
+  const rate = Number(document.getElementById('rate').value);
+  const samples = Number(document.getElementById('samples').value);
+  const frameRate = rate > 0 && samples > 0 ? rate / samples : 0;
+  const leftA = document.getElementById('manual_area_left').value;
+  const rightA = document.getElementById('manual_area_right').value;
+  const leftB = document.getElementById('manual_area2_left').value;
+  const rightB = document.getElementById('manual_area2_right').value;
+  const widthA = leftA === '' || rightA === '' ? NaN : Math.abs(Number(rightA) - Number(leftA)) + 1;
+  const widthB = leftB === '' || rightB === '' ? NaN : Math.abs(Number(rightB) - Number(leftB)) + 1;
+  let pointsPerFrame = 0;
+  if (mode === 'a' || mode === 'both') pointsPerFrame += Number.isFinite(widthA) ? widthA : 0;
+  if (mode === 'b' || mode === 'both') pointsPerFrame += Number.isFinite(widthB) ? widthB : 0;
+  const bytesPerSecond = frameRate * pointsPerFrame * 4;
+  document.getElementById('window_voltage_estimate').value =
+    `${formatBytes(bytesPerSecond)}/s，约 ${formatBytes(bytesPerSecond * 3600)}/h`;
 }
 
 function drawPeakHeightTrend(rows) {
@@ -2383,7 +2459,10 @@ function updateFrameInfo() {
 
 window.addEventListener('resize', resizeAndDraw);
 for (const id of ['rate', 'samples']) {
-  document.getElementById(id).addEventListener('input', updateDerivedTimingFromInputs);
+  document.getElementById(id).addEventListener('input', () => {
+    updateDerivedTimingFromInputs();
+    updateWindowVoltageEstimate();
+  });
 }
 for (const id of ['manual_area_left', 'manual_area_right', 'manual_area2_left', 'manual_area2_right']) {
   document.getElementById(id).addEventListener('input', () => {
@@ -2394,10 +2473,13 @@ for (const id of ['manual_area_left', 'manual_area_right', 'manual_area2_left', 
     }
     updateManualAreaTable();
     updateDualAreaTable();
+    updateWindowVoltageEstimate();
     renderPlots();
   });
 }
+document.getElementById('window_voltage_mode').addEventListener('change', updateWindowVoltageEstimate);
 updateDerivedTimingFromInputs();
+updateWindowVoltageEstimate();
 updateStreamStatus({running: false, frame_id: 0});
 updatePeakTable();
 updateManualAreaTable();

@@ -269,6 +269,17 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         poll_interval=float(body.get("poll_interval", 0.05)),
         stream_source=stream_source_from_body(body),
         channels=parse_channels(body.get("channels", ["ai0", "ai1"])),
+        window_voltage_mode=str(body.get("window_voltage_mode", "none")),
+        window_voltage_output_dir=Path(
+            str(body.get("window_voltage_output_dir", "data/two_peak_window_voltage"))
+        ),
+        session_id=(None if body.get("session_id") in (None, "") else str(body["session_id"])),
+        trigger_unix_time=(
+            None
+            if body.get("trigger_unix_time") in (None, "")
+            else float(body["trigger_unix_time"])
+        ),
+        start_after_frame_id=int(body.get("start_after_frame_id", 0)),
     )
 
 

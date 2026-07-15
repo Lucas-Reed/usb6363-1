@@ -21,10 +21,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
 from two_peak.signal import measure_manual_area, track_and_measure_manual_area
+from two_peak.window_voltage_recorder import WindowVoltageRecorder
 from usb6363_client import Usb6363Client
 
 
@@ -73,6 +75,7 @@ class AreaTrendLogger:
         self._last_frame_id = 0
         self._latest_stats: dict[str, Any] | None = None
         self._recent_stats: deque[dict[str, Any]] = deque(maxlen=1000)
+        self._voltage_recorder: WindowVoltageRecorder | None = None
 
     def start(
         self,
@@ -90,6 +93,11 @@ class AreaTrendLogger:
         poll_interval: float = 0.05,
         stream_source: str = "unified_stream",
         channels: list[str] | None = None,
+        window_voltage_mode: str = "none",
+        window_voltage_output_dir: Path | None = None,
+        session_id: str | None = None,
+        trigger_unix_time: float | None = None,
+        start_after_frame_id: int = 0,
     ) -> dict[str, Any]:
         """启动长期记录。
 
@@ -114,6 +122,13 @@ class AreaTrendLogger:
             raise ValueError("auto_track_max_shift must be >= 0")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
+        voltage_mode = str(window_voltage_mode).strip().lower()
+        if voltage_mode not in ("none", "a", "b", "both"):
+            raise ValueError("window_voltage_mode must be none, a, b or both")
+        if voltage_mode in ("b", "both") and (area2_left is None or area2_right is None):
+            raise ValueError("记录窗口 B 电压时，必须同时设置面积 B 的左右边界")
+        if start_after_frame_id < 0:
+            raise ValueError("start_after_frame_id must be >= 0")
 
         with self._lock:
             if self._running:
@@ -122,6 +137,7 @@ class AreaTrendLogger:
             self._output_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_path = self._output_dir / f"area_trend_{timestamp}.csv"
+            actual_session_id = session_id or f"{timestamp}_{uuid4().hex[:8]}"
 
             settings = {
                 "analysis_channel_index": int(analysis_channel_index),
@@ -138,12 +154,30 @@ class AreaTrendLogger:
                 "poll_interval": float(poll_interval),
                 "stream_source": str(stream_source),
                 "channels": list(channels or []),
+                "window_voltage_mode": voltage_mode,
+                "window_voltage_output_dir": str(
+                    window_voltage_output_dir
+                    or (self._output_dir.parent / "two_peak_window_voltage")
+                ),
+                "session_id": actual_session_id,
+                "trigger_unix_time": trigger_unix_time,
+                "start_after_frame_id": int(start_after_frame_id),
             }
+
+            voltage_recorder = None
+            if voltage_mode != "none":
+                voltage_recorder = WindowVoltageRecorder(
+                    output_dir=Path(settings["window_voltage_output_dir"]),
+                    session_id=actual_session_id,
+                    mode=voltage_mode,
+                    metadata=settings,
+                )
+                voltage_recorder.start()
 
             stop_event = threading.Event()
             thread = threading.Thread(
                 target=self._worker,
-                args=(settings, csv_path, stop_event),
+                args=(settings, csv_path, stop_event, voltage_recorder),
                 daemon=True,
                 name="two-peak-area-trend-logger",
             )
@@ -158,7 +192,15 @@ class AreaTrendLogger:
             self._last_frame_id = 0
             self._latest_stats = None
             self._recent_stats.clear()
-            thread.start()
+            self._voltage_recorder = voltage_recorder
+            try:
+                thread.start()
+            except Exception:
+                if voltage_recorder is not None:
+                    voltage_recorder.stop()
+                self._running = False
+                self._voltage_recorder = None
+                raise
 
         return self.status()
 
@@ -186,7 +228,8 @@ class AreaTrendLogger:
         """返回当前记录状态。"""
 
         with self._lock:
-            return {
+            voltage_recorder = self._voltage_recorder
+            result = {
                 "running": self._running,
                 "error": self._error,
                 "csv_file": str(self._csv_path.resolve()) if self._csv_path else None,
@@ -197,18 +240,35 @@ class AreaTrendLogger:
                 "latest_stats": dict(self._latest_stats or {}),
                 "recent_stats": [dict(row) for row in self._recent_stats],
             }
+        result["window_voltage"] = (
+            voltage_recorder.status()
+            if voltage_recorder is not None
+            else {
+                "enabled": False,
+                "running": False,
+                "mode": "none",
+                "frames_written": 0,
+                "source_gap_frames": 0,
+                "queue_dropped_frames": 0,
+                "chunks_written": 0,
+                "bytes_written": 0,
+                "error": None,
+            }
+        )
+        return result
 
     def _worker(
         self,
         settings: dict[str, Any],
         csv_path: Path,
         stop_event: threading.Event,
+        voltage_recorder: WindowVoltageRecorder | None,
     ) -> None:
         """记录线程主体。"""
 
         samples: deque[AreaTrendSample] = deque(maxlen=max(10_000, int(settings["window_frames"]) * 5))
-        last_seen_frame_id = 0
-        last_recorded_frame_id = 0
+        last_seen_frame_id = int(settings.get("start_after_frame_id", 0))
+        last_recorded_frame_id = int(settings.get("start_after_frame_id", 0))
         next_record_time = time.time()
         record_period = 1.0 / float(settings["record_hz"])
         ema_alpha = float(settings.get("ema_alpha", 0.02))
@@ -236,11 +296,28 @@ class AreaTrendLogger:
                             frame = self._get_stream_latest(settings)
                             sample = self._measure_frame(frame, settings)
                             samples.append(sample)
+                            if voltage_recorder is not None:
+                                voltage_recorder.append(
+                                    _build_window_voltage_record(
+                                        frame,
+                                        sample,
+                                        analysis_channel_index=int(
+                                            settings["analysis_channel_index"]
+                                        ),
+                                        mode=str(settings["window_voltage_mode"]),
+                                    )
+                                )
                             last_seen_frame_id = sample.frame_id
                             with self._lock:
                                 self._frames_seen += 1
                                 self._last_frame_id = sample.frame_id
                                 self._error = None
+
+                        if voltage_recorder is not None:
+                            voltage_error = voltage_recorder.status().get("error")
+                            if voltage_error:
+                                self._set_error(f"窗口电压写盘失败：{voltage_error}")
+                                break
 
                         now = time.time()
                         # 只有真的看到新帧之后才写 CSV。
@@ -285,6 +362,10 @@ class AreaTrendLogger:
                     time.sleep(float(settings["poll_interval"]))
 
         finally:
+            if voltage_recorder is not None:
+                recorder_status = voltage_recorder.stop()
+                if recorder_status.get("error"):
+                    self._set_error(f"窗口电压写盘失败：{recorder_status['error']}")
             with self._lock:
                 if self._thread is threading.current_thread():
                     self._running = False
@@ -427,6 +508,7 @@ class AreaTrendLogger:
             "frame_id": latest.frame_id,
             "frame_id_start": frame_ids[0],
             "frame_id_end": frame_ids[-1],
+            "session_id": str(settings.get("session_id", "")),
             "analysis_channel_index": int(settings["analysis_channel_index"]),
             "auto_track_enabled": bool(settings.get("auto_track_enabled", False)),
             "auto_track_smooth_window": int(settings.get("auto_track_smooth_window", 9)),
@@ -534,6 +616,54 @@ def _measure_window_peak_height(
         raise ValueError("peak height window must not be empty")
     local_index = int(np.argmax(window))
     return float(window[local_index]), left + local_index
+
+
+def _build_window_voltage_record(
+    frame: dict[str, Any],
+    sample: AreaTrendSample,
+    analysis_channel_index: int,
+    mode: str,
+) -> dict[str, Any]:
+    """从已完成统计的同一帧中切出 A/B 原始电压窗口。"""
+
+    values = np.asarray(frame["values"], dtype=float)
+    if values.ndim != 2 or analysis_channel_index < 0 or analysis_channel_index >= values.shape[0]:
+        raise RuntimeError("窗口电压记录找不到分析通道")
+    signal = values[analysis_channel_index]
+    record: dict[str, Any] = {
+        "frame_id": sample.frame_id,
+        "finished_at": sample.timestamp,
+    }
+    if mode in ("a", "both"):
+        record.update(_window_record_fields("a", signal, sample, second=False))
+    if mode in ("b", "both"):
+        record.update(_window_record_fields("b", signal, sample, second=True))
+    return record
+
+
+def _window_record_fields(
+    prefix: str,
+    signal: np.ndarray,
+    sample: AreaTrendSample,
+    second: bool,
+) -> dict[str, Any]:
+    """构造一个窗口的逐帧值和位置元数据。"""
+
+    left = sample.area2_left if second else sample.area_left
+    right = sample.area2_right if second else sample.area_right
+    if left is None or right is None:
+        raise RuntimeError(f"窗口 {prefix.upper()} 没有有效边界")
+    return {
+        f"{prefix}_values": np.asarray(signal[left : right + 1], dtype=np.float32).copy(),
+        f"{prefix}_left": int(left),
+        f"{prefix}_right": int(right),
+        f"{prefix}_track_peak_index": (
+            sample.area2_peak_index if second else sample.area_peak_index
+        ),
+        f"{prefix}_peak_height_index": (
+            sample.peak2_height_index if second else sample.peak_height_index
+        ),
+    }
 
 
 def _update_ema(previous: float | None, value: Any, alpha: float) -> float | None:
@@ -647,6 +777,7 @@ def _csv_fieldnames() -> list[str]:
         "frame_id",
         "frame_id_start",
         "frame_id_end",
+        "session_id",
         "analysis_channel_index",
         "auto_track_enabled",
         "auto_track_smooth_window",
