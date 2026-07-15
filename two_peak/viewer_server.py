@@ -75,6 +75,12 @@ def make_handler(state: ViewerState):
                     )
                 elif path == "/api/trend/status":
                     self._send_json(get_area_trend_status(state))
+                elif path == "/api/test_sync/status":
+                    self._send_json(
+                        state.sync_test.status(
+                            power_api_url=query.get("power_api_url", [None])[0]
+                        )
+                    )
                 elif path == "/api/ao_scan/status":
                     self._send_json(state.ao_scan_calibrator.status())
                 elif path == "/api/power_lock/status":
@@ -101,6 +107,16 @@ def make_handler(state: ViewerState):
                     self._send_json(start_area_trend(state, body))
                 elif self.path == "/api/trend/stop":
                     self._send_json(stop_area_trend(state))
+                elif self.path == "/api/test_sync/start":
+                    body = self._read_json()
+                    self._send_json(
+                        state.sync_test.start(
+                            body,
+                            start_trend=lambda parameters: start_area_trend(state, parameters),
+                        )
+                    )
+                elif self.path == "/api/test_sync/stop":
+                    self._send_json(state.sync_test.stop())
                 elif self.path == "/api/ao_scan/start":
                     body = self._read_json()
                     self._send_json(

@@ -466,6 +466,28 @@
     <button class="secondary" id="trendStopBtn" onclick="stopAreaTrend()" disabled>停止慢漂记录</button>
   </div>
 
+  <h2>临时同步测试</h2>
+  <label>功率慢漂服务</label>
+  <input id="sync_power_api_url" value="http://127.0.0.1:8767">
+  <div class="grid2">
+    <div>
+      <label>功率端预备</label>
+      <input id="sync_power_armed" value="未连接" readonly>
+    </div>
+    <div>
+      <label>同步状态</label>
+      <input id="sync_status" value="停止" readonly>
+    </div>
+  </div>
+  <label>Session ID</label>
+  <input id="sync_session_id" value="" readonly>
+  <label>同步清单</label>
+  <input id="sync_manifest_file" value="" readonly>
+  <div class="actions">
+    <button class="green" id="syncStartBtn" onclick="startSyncTest()">同步开始功率与窗口记录</button>
+    <button class="secondary" id="syncStopBtn" onclick="stopSyncTest()" disabled>同步停止</button>
+  </div>
+
   <h2>AO 扫描标定</h2>
   <div class="grid2">
     <div>
@@ -733,6 +755,7 @@ let streamConsecutiveErrors = 0;
 let trendTimer = null;
 let aoScanTimer = null;
 let powerLockTimer = null;
+let syncTestTimer = null;
 let trendRunning = false;
 let latestTrendStats = null;
 let xViewStart = null;
@@ -800,6 +823,12 @@ function getTrendParams() {
   };
 }
 
+function getSyncTestParams() {
+  return {
+    power_api_url: document.getElementById('sync_power_api_url').value,
+  };
+}
+
 function getAoScanParams() {
   return {
     channel: document.getElementById('ao_scan_channel').value,
@@ -861,6 +890,7 @@ function getAllUiParameters() {
     ...getAoScanParams(),
     ...getAoTestParams(),
     ...getPowerLockParams(),
+    ...getSyncTestParams(),
   };
 }
 
@@ -924,6 +954,10 @@ function applyDefaultsToUi(defaults) {
   setInputValue(
     'window_voltage_output_dir',
     firstDefined(defaults.window_voltage_output_dir, 'data/two_peak_window_voltage'),
+  );
+  setInputValue(
+    'sync_power_api_url',
+    firstDefined(defaults.power_api_url, defaults.sync_power_api_url, 'http://127.0.0.1:8767'),
   );
   setInputValue('ao_scan_channel', firstDefined(defaults.channel, defaults.ao_scan_channel));
   setInputValue('ao_scan_start_voltage', firstDefined(defaults.start_voltage, defaults.ao_scan_start_voltage));
@@ -1619,6 +1653,87 @@ async function stopAoScan() {
     const status = await postJson('/api/ao_scan/stop', {});
     updateAoScanStatus(status);
     setStatus('AO 扫描标定已停止。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+function updateSyncTestStatus(status) {
+  const running = Boolean(status && status.running);
+  const armed = Boolean(status && status.power_armed);
+  const probeError = status && status.power_probe_error ? status.power_probe_error : '';
+  const syncError = status && status.error ? status.error : '';
+  document.getElementById('sync_power_armed').value = probeError
+    ? `连接失败：${probeError}`
+    : (status && status.power_running ? '功率记录中' : (armed ? '已预备' : '未预备'));
+  document.getElementById('sync_status').value = syncError
+    ? `错误：${syncError}`
+    : (running ? '同步记录中' : '停止');
+  document.getElementById('sync_session_id').value = status && status.session_id
+    ? status.session_id
+    : '';
+  document.getElementById('sync_manifest_file').value = status && status.manifest_file
+    ? status.manifest_file
+    : '';
+  document.getElementById('syncStartBtn').disabled = running || !armed || Boolean(probeError);
+  document.getElementById('syncStopBtn').disabled = !running;
+}
+
+async function refreshSyncTestStatus(showError = false) {
+  const powerUrl = encodeURIComponent(document.getElementById('sync_power_api_url').value);
+  try {
+    const response = await fetch(`/api/test_sync/status?power_api_url=${powerUrl}`);
+    const status = await response.json();
+    if (!response.ok || status.ok === false) {
+      throw new Error(status.error || '查询同步测试状态失败');
+    }
+    updateSyncTestStatus(status);
+  } catch (err) {
+    if (showError) setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function startSyncTest() {
+  const params = {
+    ...getCaptureParams(),
+    ...getTrendParams(),
+    ...getSyncTestParams(),
+  };
+  if (!streamRunning) {
+    setStatus('请先接管正在运行的统一 AI 流。', 'error');
+    return;
+  }
+  if (params.window_voltage_mode === 'none') {
+    setStatus('同步测试必须选择记录窗口 A、窗口 B 或窗口 A+B。', 'error');
+    return;
+  }
+  if (params.area_left === '' || params.area_right === '') {
+    setStatus('请先设置窗口 A 的左右边界。', 'error');
+    return;
+  }
+  if ((params.window_voltage_mode === 'b' || params.window_voltage_mode === 'both')
+      && (params.area2_left === '' || params.area2_right === '')) {
+    setStatus('记录窗口 B 时必须先设置 B 的左右边界。', 'error');
+    return;
+  }
+  try {
+    const status = await postJson('/api/test_sync/start', params);
+    updateSyncTestStatus(status);
+    await refreshTrendStatus(false);
+    setStatus(`同步测试已启动：${status.session_id}`, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshSyncTestStatus(false);
+    await refreshTrendStatus(false);
+  }
+}
+
+async function stopSyncTest() {
+  try {
+    const status = await postJson('/api/test_sync/stop', {});
+    updateSyncTestStatus(status);
+    await refreshTrendStatus(false);
+    setStatus('同步测试已停止，最后一个 NPZ 块已经刷新。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }
@@ -2478,6 +2593,9 @@ for (const id of ['manual_area_left', 'manual_area_right', 'manual_area2_left', 
   });
 }
 document.getElementById('window_voltage_mode').addEventListener('change', updateWindowVoltageEstimate);
+document.getElementById('sync_power_api_url').addEventListener('change', () => {
+  refreshSyncTestStatus(false);
+});
 updateDerivedTimingFromInputs();
 updateWindowVoltageEstimate();
 updateStreamStatus({running: false, frame_id: 0});
@@ -2488,6 +2606,8 @@ loadDefaults();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
 refreshTrendStatus(true);
+refreshSyncTestStatus(false);
+syncTestTimer = setInterval(() => refreshSyncTestStatus(false), 1000);
 refreshAoScanStatus(true);
 refreshPowerLockStatus(true);
 </script>

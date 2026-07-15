@@ -163,7 +163,7 @@ class PowerDriftWebState:
         if settings is None:
             raise RuntimeError("功率慢漂尚未预备同步触发")
 
-        status = self.start(
+        self.start(
             settings,
             session_id=session_id,
             trigger_unix_time=trigger_unix_time,
@@ -171,7 +171,7 @@ class PowerDriftWebState:
         )
         with self._lock:
             self._armed_settings = None
-        return status
+        return self.status()
 
     def stop(self) -> dict[str, Any]:
         """停止后台记录。

@@ -9,6 +9,7 @@ from typing import Any
 from two_peak.ao_scan_calibrator import AoScanCalibrator
 from two_peak.config import TwoPeakSettings
 from two_peak.power_lock import PowerLockController
+from two_peak.sync_test import SyncTestCoordinator
 from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
 
@@ -48,6 +49,12 @@ class ViewerState:
         self.power_lock = PowerLockController(
             daq=self.daq,
             trend_logger=self.trend_logger,
+        )
+        # 临时同步测试只协调现有记录器，不直接接触采集卡。
+        self.sync_test = SyncTestCoordinator(
+            daq=self.daq,
+            trend_logger=self.trend_logger,
+            output_dir=sample_dir.parent / "sync_tests",
         )
 
     def factory_web_defaults(self) -> dict[str, Any]:

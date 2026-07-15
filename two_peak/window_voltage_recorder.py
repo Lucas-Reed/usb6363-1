@@ -62,7 +62,11 @@ class WindowVoltageRecorder:
         self._frames_written = 0
         self._source_gap_frames = 0
         self._queue_dropped_frames = 0
-        self._last_received_frame_id: int | None = None
+        baseline_frame_id = int(metadata.get("start_after_frame_id", 0) or 0)
+        # 同步触发时把基线当作上一帧，这样第一帧若已经跳号也能准确计入缺口。
+        self._last_received_frame_id: int | None = (
+            baseline_frame_id if baseline_frame_id > 0 else None
+        )
         self._first_written_frame_id: int | None = None
         self._last_written_frame_id: int | None = None
         self._chunks: list[dict[str, Any]] = []
