@@ -67,8 +67,19 @@ class PowerDriftWebState:
         self._rows_written = 0
         self._latest_point: PowerDriftPoint | None = None
         self._recent_points: deque[PowerDriftPoint] = deque(maxlen=1000)
+        # “预备同步触发”只保存在内存中，8767 重启后自然清除。
+        self._armed_settings: PowerDriftSettings | None = None
+        self._session_id: str | None = None
+        self._trigger_unix_time: float | None = None
+        self._start_after_frame_id = 0
 
-    def start(self, settings: PowerDriftSettings) -> dict[str, Any]:
+    def start(
+        self,
+        settings: PowerDriftSettings,
+        session_id: str | None = None,
+        trigger_unix_time: float | None = None,
+        start_after_frame_id: int = 0,
+    ) -> dict[str, Any]:
         """启动后台功率慢漂记录线程。"""
 
         with self._lock:
@@ -83,7 +94,15 @@ class PowerDriftWebState:
             stop_event = threading.Event()
             thread = threading.Thread(
                 target=self._worker,
-                args=(settings, csv_path, metadata_path, stop_event),
+                args=(
+                    settings,
+                    csv_path,
+                    metadata_path,
+                    stop_event,
+                    session_id,
+                    trigger_unix_time,
+                    int(start_after_frame_id),
+                ),
                 daemon=True,
                 name="power-drift-web-monitor",
             )
@@ -100,9 +119,59 @@ class PowerDriftWebState:
             self._rows_written = 0
             self._latest_point = None
             self._recent_points.clear()
+            self._session_id = session_id
+            self._trigger_unix_time = trigger_unix_time
+            self._start_after_frame_id = int(start_after_frame_id)
             thread.start()
 
         return self.status()
+
+    def arm(self, settings: PowerDriftSettings) -> dict[str, Any]:
+        """保存同步测试待启动参数，但此时不创建文件也不读取采集卡。"""
+
+        if settings.data_source != "unified_stream":
+            raise ValueError("同步测试只允许使用 unified_stream 数据来源")
+        with self._lock:
+            if self._running:
+                raise RuntimeError("功率慢漂正在记录，不能进入同步预备状态")
+            self._armed_settings = settings
+        return self.status()
+
+    def disarm(self) -> dict[str, Any]:
+        """取消尚未启动的同步测试预备参数。"""
+
+        with self._lock:
+            if self._running:
+                raise RuntimeError("功率慢漂正在记录，不能取消当前运行会话")
+            self._armed_settings = None
+        return self.status()
+
+    def start_armed(
+        self,
+        session_id: str,
+        trigger_unix_time: float,
+        start_after_frame_id: int,
+    ) -> dict[str, Any]:
+        """消费已经预备的参数并启动同步测试功率记录。"""
+
+        if not session_id:
+            raise ValueError("session_id is required")
+        if start_after_frame_id < 0:
+            raise ValueError("start_after_frame_id must be >= 0")
+        with self._lock:
+            settings = self._armed_settings
+        if settings is None:
+            raise RuntimeError("功率慢漂尚未预备同步触发")
+
+        status = self.start(
+            settings,
+            session_id=session_id,
+            trigger_unix_time=trigger_unix_time,
+            start_after_frame_id=start_after_frame_id,
+        )
+        with self._lock:
+            self._armed_settings = None
+        return status
 
     def stop(self) -> dict[str, Any]:
         """停止后台记录。
@@ -143,6 +212,15 @@ class PowerDriftWebState:
                 "settings": _settings_for_json(self._settings) if self._settings else None,
                 "latest_point": asdict(self._latest_point) if self._latest_point else None,
                 "recent_points": [asdict(point) for point in self._recent_points],
+                "armed": self._armed_settings is not None,
+                "armed_settings": (
+                    _settings_for_json(self._armed_settings)
+                    if self._armed_settings is not None
+                    else None
+                ),
+                "session_id": self._session_id,
+                "trigger_unix_time": self._trigger_unix_time,
+                "start_after_frame_id": self._start_after_frame_id,
             }
 
     def latest_csv_path(self) -> Path:
@@ -159,6 +237,9 @@ class PowerDriftWebState:
         csv_path: Path,
         metadata_path: Path,
         stop_event: threading.Event,
+        session_id: str | None,
+        trigger_unix_time: float | None,
+        start_after_frame_id: int,
     ) -> None:
         """后台记录线程主体。"""
 
@@ -171,6 +252,13 @@ class PowerDriftWebState:
         try:
             # 启动前检查硬件状态，避免和双峰连续采集等任务互相抢 AI。
             monitor.check_hardware_idle()
+            if start_after_frame_id > 0:
+                _wait_for_unified_frame_after(
+                    monitor,
+                    start_after_frame_id,
+                    stop_event,
+                    timeout=settings.timeout,
+                )
 
             metadata_path.write_text(
                 json.dumps(
@@ -178,6 +266,9 @@ class PowerDriftWebState:
                         "started_at": datetime.fromtimestamp(start_time).isoformat(timespec="seconds"),
                         "csv_file": str(csv_path.resolve()),
                         "settings": _settings_for_json(settings),
+                        "session_id": session_id,
+                        "trigger_unix_time": trigger_unix_time,
+                        "start_after_frame_id": start_after_frame_id,
                         "note": "power_estimate = (mean_v - zero_voltage) * power_per_volt",
                     },
                     ensure_ascii=False,
@@ -203,6 +294,7 @@ class PowerDriftWebState:
 
                     row_index += 1
                     point = monitor.read_one_point(row_index=row_index, start_time=start_time)
+                    point.session_id = session_id
                     writer.writerow(asdict(point))
                     file.flush()
 
@@ -256,6 +348,20 @@ def make_handler(state: PowerDriftWebState):
                 if parsed.path == "/api/start":
                     settings = _settings_from_body(self._read_json())
                     self._send_json(state.start(settings))
+                elif parsed.path == "/api/arm":
+                    settings = _settings_from_body(self._read_json())
+                    self._send_json(state.arm(settings))
+                elif parsed.path == "/api/disarm":
+                    self._send_json(state.disarm())
+                elif parsed.path == "/api/start_armed":
+                    body = self._read_json()
+                    self._send_json(
+                        state.start_armed(
+                            session_id=str(body.get("session_id", "")),
+                            trigger_unix_time=float(body.get("trigger_unix_time", time.time())),
+                            start_after_frame_id=int(body.get("start_after_frame_id", 0)),
+                        )
+                    )
                 elif parsed.path == "/api/stop":
                     self._send_json(state.stop())
                 else:
@@ -340,6 +446,24 @@ def _settings_from_body(body: dict[str, Any]) -> PowerDriftSettings:
     )
     _validate_settings(settings)
     return settings
+
+
+def _wait_for_unified_frame_after(
+    monitor: PowerDriftMonitor,
+    baseline_frame_id: int,
+    stop_event: threading.Event,
+    timeout: float,
+) -> None:
+    """同步测试时跳过点击触发前已经缓存在统一流里的旧帧。"""
+
+    deadline = time.time() + max(float(timeout), 1.0)
+    while not stop_event.is_set():
+        status = monitor.daq.get_unified_ai_stream_status()
+        if int(status.get("frame_id", 0)) > baseline_frame_id:
+            return
+        if time.time() >= deadline:
+            raise TimeoutError("等待同步触发后的第一帧超时")
+        stop_event.wait(0.02)
 
 
 def _validate_settings(settings: PowerDriftSettings) -> None:
@@ -638,6 +762,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="secondary" id="stopBtn" onclick="stopMonitor()" disabled>停止记录</button>
   </div>
   <button class="secondary" id="downloadBtn" onclick="downloadCsv()" disabled style="margin-top:8px;">导出 CSV</button>
+
+  <h2>临时同步测试</h2>
+  <label>同步预备状态</label>
+  <input id="armed_status" value="未预备" readonly>
+  <div class="actions">
+    <button class="green" id="armBtn" onclick="armSyncTest()">预备同步触发</button>
+    <button class="secondary" id="disarmBtn" onclick="disarmSyncTest()" disabled>取消预备</button>
+  </div>
 </aside>
 
 <main>
@@ -668,6 +800,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 let latestStatus = null;
 let pollTimer = null;
+const POWER_SETTING_IDS = [
+  'channel', 'data_source', 'interval', 'duration', 'samples', 'rate',
+  'terminal_config', 'min_val', 'max_val', 'timeout', 'power_per_volt',
+  'zero_voltage', 'output_dir', 'api_base_url', 'allow_busy_ai',
+];
 
 function getSettings() {
   return {
@@ -729,6 +866,27 @@ async function stopMonitor() {
   }
 }
 
+async function armSyncTest() {
+  try {
+    const status = await postJson('/api/arm', getSettings());
+    updateStatus(status);
+    setStatus('功率慢漂参数已预备。现在可以到双峰页面点击同步开始。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshStatus(false);
+  }
+}
+
+async function disarmSyncTest() {
+  try {
+    const status = await postJson('/api/disarm', {});
+    updateStatus(status);
+    setStatus('已取消同步预备，可以继续修改功率慢漂参数。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
 function downloadCsv() {
   window.location.href = '/api/download';
 }
@@ -751,12 +909,22 @@ async function refreshStatus(showError = true) {
 function updateStatus(status) {
   latestStatus = status;
   const running = Boolean(status.running);
+  const armed = Boolean(status.armed);
   const point = status.latest_point;
   const error = status.error ? `错误：${status.error}` : '';
 
-  document.getElementById('startBtn').disabled = running;
+  document.getElementById('startBtn').disabled = running || armed;
   document.getElementById('stopBtn').disabled = !running;
+  document.getElementById('armBtn').disabled = running || armed;
+  document.getElementById('disarmBtn').disabled = running || !armed;
   document.getElementById('downloadBtn').disabled = !status.csv_file;
+  document.getElementById('armed_status').value = running && status.session_id
+    ? `同步记录中：${status.session_id}`
+    : (armed ? '已预备，等待双峰页面触发' : '未预备');
+  POWER_SETTING_IDS.forEach(id => {
+    const element = document.getElementById(id);
+    if (element) element.disabled = running || armed;
+  });
   document.getElementById('m_running').textContent = error || (running ? '记录中' : '停止');
   document.getElementById('m_rows').textContent = status.rows_written || 0;
 

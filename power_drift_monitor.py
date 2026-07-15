@@ -82,6 +82,8 @@ class PowerDriftPoint:
     unix_time: float
     elapsed_s: float
     index: int
+    session_id: str | None
+    source_frame_id: int | None
     channel: str
     samples: int
     rate_hz: float
@@ -255,6 +257,8 @@ class PowerDriftMonitor:
             unix_time=timestamp,
             elapsed_s=timestamp - start_time,
             index=row_index,
+            session_id=None,
+            source_frame_id=None,
             channel=str(result.get("channel", self.settings.channel)),
             samples=len(values),
             rate_hz=float(result.get("rate", self.settings.rate)),
@@ -297,6 +301,8 @@ class PowerDriftMonitor:
             unix_time=timestamp,
             elapsed_s=timestamp - start_time,
             index=row_index,
+            session_id=None,
+            source_frame_id=int(stats.get("frame_id", 0)),
             channel=str(stats.get("channel", self.settings.channel)),
             samples=samples,
             rate_hz=float(stats.get("rate", self.settings.rate)),
