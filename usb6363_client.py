@@ -9,11 +9,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import numpy as np
 
 
 # 默认连接本机的 USB-6363 API 服务。
@@ -357,6 +360,62 @@ class Usb6363Client:
 
         return self._get("/api/ai/unified/latest_frame")
 
+    def get_unified_ai_frame_batch(
+        self,
+        after_frame_id: int,
+        channels: list[str],
+        max_frames: int = 100,
+    ) -> dict[str, Any]:
+        """按 frame_id 补取统一流历史帧。
+
+        这个接口返回本机 NPZ 二进制，不会把大量浮点数展开成 JSON。
+        frames 中每帧的 values 仍保持二维形状：通道数 × 每通道点数。
+        """
+
+        if not channels:
+            raise ValueError("channels must not be empty")
+        raw = self._get_bytes(
+            "/api/ai/unified/frame_batch",
+            {
+                "after_frame_id": int(after_frame_id),
+                "channels": ",".join(str(channel) for channel in channels),
+                "max_frames": int(max_frames),
+            },
+        )
+        with np.load(io.BytesIO(raw), allow_pickle=False) as data:
+            frame_ids = data["frame_id"].astype(np.int64, copy=False)
+            segment_ids = data["segment_id"].astype(np.int64, copy=False)
+            segment_frame_ids = data["segment_frame_id"].astype(np.int64, copy=False)
+            started_at = data["started_at"].astype(np.float64, copy=False)
+            finished_at = data["finished_at"].astype(np.float64, copy=False)
+            values = data["values"].astype(np.float32, copy=False)
+            physical_channels = [str(item) for item in data["channels"].tolist()]
+
+            frames = [
+                {
+                    "frame_id": int(frame_ids[index]),
+                    "segment_id": int(segment_ids[index]),
+                    "segment_frame_id": int(segment_frame_ids[index]),
+                    "started_at": float(started_at[index]),
+                    "finished_at": float(finished_at[index]),
+                    "channels": physical_channels,
+                    "channel_count": len(physical_channels),
+                    "samples_per_channel": int(values.shape[2]),
+                    # copy() 让数组在 np.load 上下文关闭后仍然独立有效。
+                    "values": values[index].copy(),
+                }
+                for index in range(len(frame_ids))
+            ]
+            return {
+                "frames": frames,
+                "oldest_available_frame_id": int(data["oldest_available_frame_id"][0]),
+                "latest_available_frame_id": int(data["latest_available_frame_id"][0]),
+                "stream_frame_id": int(data["stream_frame_id"][0]),
+                "history_overrun": bool(data["history_overrun"][0]),
+                "missing_before_first": int(data["missing_before_first"][0]),
+                "has_more": bool(data["has_more"][0]),
+            }
+
     def get_unified_ai_latest(self, channel: str = "ai0") -> dict[str, Any]:
         """读取统一 AI 数据流中某个通道的最近一个点。"""
 
@@ -492,6 +551,18 @@ class Usb6363Client:
         try:
             with urlopen(url, timeout=self.timeout) as response:
                 return self._decode_response(response.read())
+        except HTTPError as exc:
+            raise RuntimeError(self._error_message(exc)) from exc
+
+    def _get_bytes(self, path: str, params: dict[str, Any] | None = None) -> bytes:
+        """读取二进制响应，当前用于统一流的 NPZ 历史帧。"""
+
+        url = f"{self.base_url}{path}"
+        if params:
+            url = f"{url}?{urlencode(params)}"
+        try:
+            with urlopen(url, timeout=self.timeout) as response:
+                return response.read()
         except HTTPError as exc:
             raise RuntimeError(self._error_message(exc)) from exc
 

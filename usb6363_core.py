@@ -50,6 +50,17 @@ AI_CAPTURE_OUTPUT_DIR = "data"
 # 超过这个点数时应该使用 record_ai_to_file，避免 Web/API 被巨大 JSON 拖垮。
 AI_FRAME_MAX_JSON_SAMPLES = 200_000
 
+# unified stream 的“最新帧”适合实时显示，却无法补回上层程序卡顿期间错过的帧。
+# 因此额外保留一段 float32 历史。128 MiB 是整个历史缓冲的总上限，
+# 不是每个通道各占 128 MiB。
+UNIFIED_HISTORY_MAX_BYTES = 128 * 1024 * 1024
+UNIFIED_HISTORY_MAX_FRAMES = 10_000
+
+# 二进制批量接口一次最多取 100 帧，同时限制响应中的波形数组约为 32 MiB。
+# 调用方若没有追上最新帧，可以根据 has_more 继续分批读取。
+UNIFIED_BATCH_MAX_FRAMES = 100
+UNIFIED_BATCH_MAX_BYTES = 32 * 1024 * 1024
+
 
 _AI_RE = re.compile(r"^(?:(?P<device>Dev\d+)/)?ai(?P<index>\d+)$")
 _AO_RE = re.compile(r"^(?:(?P<device>Dev\d+)/)?ao(?P<index>\d+)$")
@@ -125,6 +136,12 @@ class DaqController:
         self._unified_latest: dict[str, float] = {}
         self._unified_buffers: dict[str, deque[float]] = {}
         self._unified_sample_counts: dict[str, int] = {}
+        # 历史帧中的 values 是连续 float32 数组，用较小内存保存完整帧。
+        # 这里使用 deque 的 maxlen 自动淘汰最老帧，供上层按 frame_id 补取。
+        self._unified_frame_history: deque[dict[str, Any]] = deque()
+        self._unified_history_capacity_frames = 0
+        self._unified_history_bytes_per_frame = 0
+        self._unified_history_evicted_frames = 0
 
     # ---------------------------------------------------------------------
     # 设备信息
@@ -775,6 +792,16 @@ class DaqController:
         frame_duration_seconds = samples_per_frame / rate
         frame_duration_ms = frame_duration_seconds * 1000.0
         frame_rate_hz = rate / samples_per_frame
+        history_bytes_per_frame = (
+            len(physical_channels) * samples_per_frame * np.dtype(np.float32).itemsize
+        )
+        history_capacity_frames = max(
+            1,
+            min(
+                UNIFIED_HISTORY_MAX_FRAMES,
+                UNIFIED_HISTORY_MAX_BYTES // max(1, history_bytes_per_frame),
+            ),
+        )
 
         with self._ai_lock:
             if self._ai_active_channels or self._ai_running:
@@ -803,6 +830,9 @@ class DaqController:
                 "frame_duration_ms": frame_duration_ms,
                 "frame_rate_hz": frame_rate_hz,
                 "buffer_size": self._ai_buffer_size,
+                "history_capacity_frames": history_capacity_frames,
+                "history_bytes_per_frame": history_bytes_per_frame,
+                "history_bytes_limit": UNIFIED_HISTORY_MAX_BYTES,
             }
             stop_event = threading.Event()
             thread = threading.Thread(
@@ -824,6 +854,10 @@ class DaqController:
                 for channel in physical_channels
             }
             self._unified_sample_counts = {channel: 0 for channel in physical_channels}
+            self._unified_frame_history = deque(maxlen=history_capacity_frames)
+            self._unified_history_capacity_frames = history_capacity_frames
+            self._unified_history_bytes_per_frame = history_bytes_per_frame
+            self._unified_history_evicted_frames = 0
             self._unified_running = True
             thread.start()
 
@@ -840,6 +874,17 @@ class DaqController:
 
         with self._ai_lock:
             settings = dict(self._unified_settings or {})
+            oldest_frame_id = (
+                int(self._unified_frame_history[0]["frame_id"])
+                if self._unified_frame_history
+                else None
+            )
+            latest_history_frame_id = (
+                int(self._unified_frame_history[-1]["frame_id"])
+                if self._unified_frame_history
+                else None
+            )
+            frame_rate_hz = float(settings.get("frame_rate_hz") or 0.0)
             return {
                 "running": self._unified_running,
                 "error": self._unified_error,
@@ -851,6 +896,20 @@ class DaqController:
                 "frame_duration_ms": settings.get("frame_duration_ms"),
                 "frame_rate_hz": settings.get("frame_rate_hz"),
                 "trigger_mode": settings.get("trigger_mode", "off"),
+                "history_capacity_frames": self._unified_history_capacity_frames,
+                "history_stored_frames": len(self._unified_frame_history),
+                "history_oldest_frame_id": oldest_frame_id,
+                "history_latest_frame_id": latest_history_frame_id,
+                "history_evicted_frames": self._unified_history_evicted_frames,
+                "history_bytes_used": (
+                    len(self._unified_frame_history) * self._unified_history_bytes_per_frame
+                ),
+                "history_bytes_limit": UNIFIED_HISTORY_MAX_BYTES,
+                "history_retention_seconds": (
+                    self._unified_history_capacity_frames / frame_rate_hz
+                    if frame_rate_hz > 0
+                    else None
+                ),
                 "settings": settings,
             }
 
@@ -861,6 +920,118 @@ class DaqController:
             if self._unified_latest_frame is None:
                 raise RuntimeError("Unified AI stream has no frame yet")
             return dict(self._unified_latest_frame)
+
+    def get_unified_ai_frame_batch(
+        self,
+        after_frame_id: int,
+        channels: list[str],
+        max_frames: int = UNIFIED_BATCH_MAX_FRAMES,
+    ) -> dict[str, Any]:
+        """按 frame_id 返回统一流中尚未消费的历史帧。
+
+        返回值含有 NumPy 数组，专门交给 HTTP server 编码成 NPZ；它不是 JSON 接口。
+        上层必须检查 history_overrun，不能把已经被覆盖的历史伪装成连续数据。
+        """
+
+        if after_frame_id < 0:
+            raise ValueError("after_frame_id must be >= 0")
+        if not channels:
+            raise ValueError("channels must not be empty")
+        if not 1 <= max_frames <= UNIFIED_BATCH_MAX_FRAMES:
+            raise ValueError(
+                f"max_frames must be between 1 and {UNIFIED_BATCH_MAX_FRAMES}"
+            )
+
+        requested_channels: list[str] = []
+        for channel in channels:
+            physical_channel = self._normalize_ai_channel(channel)
+            if physical_channel not in requested_channels:
+                requested_channels.append(physical_channel)
+
+        with self._ai_lock:
+            settings = dict(self._unified_settings or {})
+            stream_channels = [str(item) for item in settings.get("channels", [])]
+            if not stream_channels:
+                raise RuntimeError("Unified AI stream has not been configured")
+
+            missing_channels = [
+                channel for channel in requested_channels if channel not in stream_channels
+            ]
+            if missing_channels:
+                raise RuntimeError(
+                    "Unified AI stream does not contain channels: "
+                    + ", ".join(missing_channels)
+                )
+
+            channel_indexes = [stream_channels.index(channel) for channel in requested_channels]
+            samples_per_frame = int(settings.get("samples_per_frame", 0))
+            selected_bytes_per_frame = (
+                len(requested_channels)
+                * samples_per_frame
+                * np.dtype(np.float32).itemsize
+            )
+            payload_limited_frames = max(
+                1,
+                UNIFIED_BATCH_MAX_BYTES // max(1, selected_bytes_per_frame),
+            )
+            effective_max_frames = min(max_frames, payload_limited_frames)
+
+            history = list(self._unified_frame_history)
+            oldest_available = int(history[0]["frame_id"]) if history else 0
+            latest_available = int(history[-1]["frame_id"]) if history else 0
+            missing_before_first = (
+                max(0, oldest_available - after_frame_id - 1) if history else 0
+            )
+            selected = [
+                frame for frame in history if int(frame["frame_id"]) > after_frame_id
+            ][:effective_max_frames]
+            stream_frame_id = self._unified_frame_id
+
+        # 数组拼接可能花费一点时间，因此离开锁以后再做，避免阻塞采集线程。
+        if selected:
+            values = np.stack(
+                [frame["values"][channel_indexes, :] for frame in selected],
+                axis=0,
+            ).astype(np.float32, copy=False)
+            returned_last_frame_id = int(selected[-1]["frame_id"])
+        else:
+            values = np.empty(
+                (0, len(requested_channels), samples_per_frame),
+                dtype=np.float32,
+            )
+            returned_last_frame_id = after_frame_id
+
+        return {
+            "frame_id": np.asarray(
+                [frame["frame_id"] for frame in selected], dtype=np.int64
+            ),
+            "segment_id": np.asarray(
+                [frame["segment_id"] for frame in selected], dtype=np.int64
+            ),
+            "segment_frame_id": np.asarray(
+                [frame["segment_frame_id"] for frame in selected], dtype=np.int64
+            ),
+            "started_at": np.asarray(
+                [frame["started_at"] for frame in selected], dtype=np.float64
+            ),
+            "finished_at": np.asarray(
+                [frame["finished_at"] for frame in selected], dtype=np.float64
+            ),
+            "values": values,
+            "channels": np.asarray(requested_channels, dtype=np.str_),
+            "oldest_available_frame_id": np.asarray([oldest_available], dtype=np.int64),
+            "latest_available_frame_id": np.asarray([latest_available], dtype=np.int64),
+            "stream_frame_id": np.asarray([stream_frame_id], dtype=np.int64),
+            "history_overrun": np.asarray(
+                [missing_before_first > 0], dtype=np.bool_
+            ),
+            "missing_before_first": np.asarray(
+                [missing_before_first], dtype=np.int64
+            ),
+            "has_more": np.asarray(
+                [returned_last_frame_id < latest_available], dtype=np.bool_
+            ),
+        }
 
     def get_unified_ai_latest(self, channel: str) -> dict[str, Any]:
         """读取统一 AI 数据流里某个通道的最近一个点。"""
@@ -1210,6 +1381,11 @@ class DaqController:
                         )
                         now = time.time()
                         segment_frame_id += 1
+                        # 转换放在状态锁之外，避免大数组复制阻塞状态查询和批量读取。
+                        history_values = np.ascontiguousarray(
+                            channel_values,
+                            dtype=np.float32,
+                        )
                         with self._ai_lock:
                             if stop_event.is_set():
                                 break
@@ -1240,6 +1416,22 @@ class DaqController:
                                 "values": channel_values,
                             }
                             self._unified_latest_frame = frame
+                            if (
+                                self._unified_frame_history.maxlen is not None
+                                and len(self._unified_frame_history)
+                                == self._unified_frame_history.maxlen
+                            ):
+                                self._unified_history_evicted_frames += 1
+                            self._unified_frame_history.append(
+                                {
+                                    "frame_id": self._unified_frame_id,
+                                    "segment_id": segment_id,
+                                    "segment_frame_id": segment_frame_id,
+                                    "started_at": now,
+                                    "finished_at": now,
+                                    "values": history_values,
+                                }
+                            )
                             for channel, values in zip(channels, channel_values):
                                 if not values:
                                     continue

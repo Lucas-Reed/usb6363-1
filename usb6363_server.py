@@ -12,11 +12,14 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import numpy as np
 
 from usb6363_core import DaqController, DEVICE_NAME
 
@@ -85,6 +88,12 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/unified/latest_frame":
                     # 读取统一 AI 数据流的最新一帧完整波形。
                     self._send_json(controller.get_unified_ai_stream_latest_frame())
+                elif parsed.path == "/api/ai/unified/frame_batch":
+                    # 按 frame_id 批量补取历史帧。波形较大，因此返回 NPZ 而不是 JSON。
+                    batch = controller.get_unified_ai_frame_batch(
+                        **_ai_frame_batch_args(query)
+                    )
+                    self._send_npz(batch)
                 elif parsed.path == "/api/ai/unified/latest":
                     # 读取统一 AI 数据流中某个通道的最近一个点。
                     self._send_json(controller.get_unified_ai_latest(**_ai_latest_args(query)))
@@ -191,6 +200,21 @@ def make_handler(controller: DaqController):
             self.end_headers()
             self.wfile.write(payload)
 
+        def _send_npz(self, arrays: dict[str, Any]) -> None:
+            """把一批 NumPy 数组编码成未压缩 NPZ 二进制响应。
+
+            二进制接口只用于本机程序间传递波形，避免把大量浮点数展开成巨大 JSON。
+            """
+
+            buffer = io.BytesIO()
+            np.savez(buffer, **arrays)
+            payload = buffer.getvalue()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-npz")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
         def _send_error(self, status: HTTPStatus, message: str) -> None:
             """用统一格式返回错误信息。"""
 
@@ -249,6 +273,20 @@ def _ai_stats_args(query: dict[str, list[str]]) -> dict[str, Any]:
     return {
         "channel": str(_first(query, "channel", "ai0")),
         "max_samples": int(_first(query, "max_samples", 10000)),
+    }
+
+
+def _ai_frame_batch_args(query: dict[str, list[str]]) -> dict[str, Any]:
+    """解析统一流历史帧接口的查询参数。"""
+
+    raw_channels = str(_first(query, "channels", "")).strip()
+    channels = [item.strip() for item in raw_channels.split(",") if item.strip()]
+    if not channels:
+        raise ValueError("channels must contain at least one AI channel")
+    return {
+        "after_frame_id": int(_first(query, "after_frame_id", 0)),
+        "channels": channels,
+        "max_frames": int(_first(query, "max_frames", 100)),
     }
 
 
