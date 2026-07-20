@@ -262,6 +262,7 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         area2_right=None if area2_right in (None, "") else int(area2_right),
         window_frames=int(body.get("window_frames", 200)),
         record_hz=float(body.get("record_hz", 1.0)),
+        duration_minutes=float(body.get("duration_minutes", 0.0) or 0.0),
         ema_alpha=float(body.get("ema_alpha", 0.02)),
         auto_track_enabled=_as_bool(body.get("auto_track_enabled", False)),
         auto_track_smooth_window=int(body.get("auto_track_smooth_window", 9)),

@@ -221,6 +221,40 @@ class TrendLoggerHistoryTests(unittest.TestCase):
         self.assertIn("期望 frame_id=2，实际得到 3", status["error"])
         self.assertEqual(status["frames_seen"], 1)
 
+    def test_duration_stops_recording_and_reports_normal_reason(self) -> None:
+        """达到设定时长后应正常收尾，而不是产生错误状态。"""
+
+        base_time = time.time()
+        frames = [_frame(frame_id, base_time) for frame_id in range(1, 4)]
+        with tempfile.TemporaryDirectory(dir=Path("data")) as temp_dir:
+            logger = AreaTrendLogger(
+                _BatchClient(frames), Path(temp_dir)
+            )  # type: ignore[arg-type]
+            logger.start(
+                analysis_channel_index=0,
+                area_left=2,
+                area_right=5,
+                window_frames=2,
+                record_hz=10.0,
+                # 约 0.03 秒，测试无需真的等待数分钟。
+                duration_minutes=0.0005,
+                poll_interval=0.001,
+                stream_source="unified_stream",
+                channels=["ai0"],
+                window_voltage_mode="a",
+                window_voltage_output_dir=Path(temp_dir) / "raw",
+                session_id="duration_test",
+            )
+            _wait_until(lambda: not logger.status()["running"])
+            status = logger.status()
+
+        self.assertIsNone(status["error"])
+        self.assertEqual(status["stop_reason"], "duration_elapsed")
+        self.assertIsNotNone(status["finished_at"])
+        self.assertGreaterEqual(status["elapsed_seconds"], 0.02)
+        self.assertIsNone(status["remaining_seconds"])
+        self.assertFalse(status["window_voltage"]["running"])
+
 
 if __name__ == "__main__":
     unittest.main()

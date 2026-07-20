@@ -288,10 +288,20 @@ class SyncTestCoordinator:
                     self._finished_at = time.time()
                     self._trend_status = trend
                     self._power_status = power
-                    stopped_side = "功率慢漂" if not power_running else "双峰窗口记录"
-                    detail = power.get("error") if not power_running else trend.get("error")
-                    self._error = f"{stopped_side}意外停止" + (f"：{detail}" if detail else "")
-                self._write_manifest("error")
+                    # 达到用户设定时长属于正常结束。同步协调器会收掉功率记录，
+                    # 但不会把一个按计划完成的实验标成“意外停止”。
+                    trend_finished_on_time = (
+                        not trend_running
+                        and trend.get("stop_reason") == "duration_elapsed"
+                        and not trend.get("error")
+                    )
+                    if trend_finished_on_time:
+                        self._error = None
+                    else:
+                        stopped_side = "功率慢漂" if not power_running else "双峰窗口记录"
+                        detail = power.get("error") if not power_running else trend.get("error")
+                        self._error = f"{stopped_side}意外停止" + (f"：{detail}" if detail else "")
+                self._write_manifest("completed" if self._error is None else "error")
                 return
             except Exception as exc:
                 consecutive_failures += 1

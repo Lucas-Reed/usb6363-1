@@ -82,6 +82,8 @@ class ViewerState:
                 "analysis_channel_index": 0,
                 "search_window_half": parameters["window_half"],
                 "measure_half": parameters["peak_avg_half"],
+                # 双峰慢漂与逐帧 NPZ 默认记录两小时；WebUI 填 0 可恢复为不限时。
+                "duration_minutes": 120.0,
             }
         )
         return parameters

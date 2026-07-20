@@ -400,6 +400,16 @@
       <input id="trend_record_hz" type="number" value="1" min="0.01" step="0.5">
     </div>
   </div>
+  <div class="grid2">
+    <div>
+      <label>自动停止 / min，0 表示不限时</label>
+      <input id="trend_duration_minutes" type="number" value="120" min="0" step="10">
+    </div>
+    <div>
+      <label>已运行 / 剩余</label>
+      <input id="trend_time_status" value="--" readonly>
+    </div>
+  </div>
   <label>面积和峰高 EMA alpha，0 表示关闭滤波</label>
   <input id="trend_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.005">
   <label class="inline">
@@ -814,6 +824,7 @@ function getTrendParams() {
     area2_right: document.getElementById('manual_area2_right').value,
     window_frames: Number(document.getElementById('trend_window_frames').value),
     record_hz: Number(document.getElementById('trend_record_hz').value),
+    duration_minutes: Number(document.getElementById('trend_duration_minutes').value),
     ema_alpha: Number(document.getElementById('trend_ema_alpha').value),
     auto_track_enabled: document.getElementById('auto_track_enabled').checked,
     auto_track_smooth_window: Number(document.getElementById('auto_track_smooth_window').value),
@@ -944,6 +955,10 @@ function applyDefaultsToUi(defaults) {
   setInputValue('trend_window_frames', defaults.window_frames || defaults.trend_window_frames);
   setInputValue('trend_record_hz', defaults.record_hz || defaults.trend_record_hz);
   setInputValue(
+    'trend_duration_minutes',
+    firstDefined(defaults.duration_minutes, defaults.trend_duration_minutes, 120),
+  );
+  setInputValue(
     'trend_ema_alpha',
     defaults.ema_alpha !== undefined ? defaults.ema_alpha : defaults.trend_ema_alpha,
   );
@@ -1060,6 +1075,17 @@ async function resetDefaults() {
 function formatNumber(value, digits = 3) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
   return Number(value).toFixed(digits);
+}
+
+function formatElapsedTime(totalSeconds) {
+  if (totalSeconds === null || totalSeconds === undefined || !Number.isFinite(Number(totalSeconds))) {
+    return '--';
+  }
+  const seconds = Math.max(0, Math.floor(Number(totalSeconds)));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
 }
 
 function updateDerivedTimingFromInputs() {
@@ -1210,7 +1236,14 @@ function updateTrendStatus(status) {
   trendRunning = running;
   latestTrendStats = Object.keys(latest).length ? latest : null;
   const error = status && status.error ? `错误：${status.error}` : '';
-  document.getElementById('trend_status').value = error || (running ? '记录中' : '停止');
+  const stoppedByDuration = status && status.stop_reason === 'duration_elapsed';
+  document.getElementById('trend_status').value = error
+    || (running ? '记录中' : (stoppedByDuration ? '已按设定时长结束' : '停止'));
+  const elapsedText = formatElapsedTime(status && status.elapsed_seconds);
+  const remainingText = formatElapsedTime(status && status.remaining_seconds);
+  document.getElementById('trend_time_status').value = running && remainingText !== '--'
+    ? `${elapsedText} / ${remainingText}`
+    : elapsedText;
   document.getElementById('trend_records').value = status && status.records_written !== undefined
     ? status.records_written
     : 0;
@@ -1446,6 +1479,10 @@ async function startAreaTrend() {
     setStatus('EMA alpha 需要在 0 到 1 之间。', 'error');
     return;
   }
+  if (!Number.isFinite(params.duration_minutes) || params.duration_minutes < 0) {
+    setStatus('自动停止时长必须 >= 0 分钟；0 表示不限时。', 'error');
+    return;
+  }
   if (!Number.isFinite(params.auto_track_smooth_window) || params.auto_track_smooth_window < 1) {
     setStatus('跟随平滑窗口必须 >= 1。', 'error');
     return;
@@ -1461,7 +1498,10 @@ async function startAreaTrend() {
   try {
     const status = await postJson('/api/trend/start', params);
     updateTrendStatus(status);
-    setStatus('慢漂记录已启动，正在写入 CSV。', 'ok');
+    const durationText = params.duration_minutes > 0
+      ? `，将在 ${params.duration_minutes} 分钟后自动停止`
+      : '，当前未设置自动停止';
+    setStatus(`慢漂记录已启动，正在写入 CSV${durationText}。`, 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
     await refreshTrendStatus(false);

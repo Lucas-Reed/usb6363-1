@@ -80,6 +80,9 @@ class AreaTrendLogger:
         self._latest_stats: dict[str, Any] | None = None
         self._recent_stats: deque[dict[str, Any]] = deque(maxlen=1000)
         self._voltage_recorder: WindowVoltageRecorder | None = None
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
+        self._stop_reason: str | None = None
 
     def start(
         self,
@@ -90,6 +93,7 @@ class AreaTrendLogger:
         area2_right: int | None = None,
         window_frames: int = 200,
         record_hz: float = 1.0,
+        duration_minutes: float = 0.0,
         ema_alpha: float = 0.02,
         auto_track_enabled: bool = False,
         auto_track_smooth_window: int = 9,
@@ -111,6 +115,7 @@ class AreaTrendLogger:
         - area2_left/area2_right：可选的第二个面积窗口，用于同时记录另一个峰。
         - window_frames：每个 CSV 点使用最近多少帧做滑动统计。
         - record_hz：每秒写几行 CSV，例如 1 Hz 表示每秒记录一次。
+        - duration_minutes：自动停止时长，单位为分钟；0 表示一直记录到手动停止。
         - poll_interval：后端检查新帧的间隔，一般保持默认即可。
         """
 
@@ -118,6 +123,8 @@ class AreaTrendLogger:
             raise ValueError("window_frames must be >= 2")
         if record_hz <= 0:
             raise ValueError("record_hz must be > 0")
+        if duration_minutes < 0:
+            raise ValueError("duration_minutes must be >= 0")
         if ema_alpha < 0 or ema_alpha > 1:
             raise ValueError("ema_alpha must be between 0 and 1")
         if auto_track_smooth_window < 1:
@@ -158,6 +165,8 @@ class AreaTrendLogger:
                 "area2_right": None if area2_right is None else int(area2_right),
                 "window_frames": int(window_frames),
                 "record_hz": float(record_hz),
+                "duration_minutes": float(duration_minutes),
+                "duration_seconds": float(duration_minutes) * 60.0,
                 "ema_alpha": float(ema_alpha),
                 "auto_track_enabled": bool(auto_track_enabled),
                 "auto_track_smooth_window": int(auto_track_smooth_window),
@@ -204,6 +213,9 @@ class AreaTrendLogger:
             self._latest_stats = None
             self._recent_stats.clear()
             self._voltage_recorder = voltage_recorder
+            self._started_at = time.time()
+            self._finished_at = None
+            self._stop_reason = None
             try:
                 thread.start()
             except Exception:
@@ -221,6 +233,8 @@ class AreaTrendLogger:
         with self._lock:
             stop_event = self._stop_event
             thread = self._thread
+            if self._running and self._stop_reason is None:
+                self._stop_reason = "manual"
             if stop_event is not None:
                 stop_event.set()
 
@@ -240,9 +254,26 @@ class AreaTrendLogger:
 
         with self._lock:
             voltage_recorder = self._voltage_recorder
+            now = time.time()
+            elapsed_seconds = (
+                max(0.0, (self._finished_at or now) - self._started_at)
+                if self._started_at is not None
+                else 0.0
+            )
+            duration_seconds = float(self._settings.get("duration_seconds", 0.0))
+            remaining_seconds = (
+                max(0.0, duration_seconds - elapsed_seconds)
+                if duration_seconds > 0 and self._running
+                else None
+            )
             result = {
                 "running": self._running,
                 "error": self._error,
+                "stop_reason": self._stop_reason,
+                "started_at": self._started_at,
+                "finished_at": self._finished_at,
+                "elapsed_seconds": elapsed_seconds,
+                "remaining_seconds": remaining_seconds,
                 "csv_file": str(self._csv_path.resolve()) if self._csv_path else None,
                 "settings": dict(self._settings),
                 "frames_seen": self._frames_seen,
@@ -288,6 +319,8 @@ class AreaTrendLogger:
         area_sum_ema: float | None = None
         peak_height_ema: float | None = None
         peak2_height_ema: float | None = None
+        duration_seconds = float(settings.get("duration_seconds", 0.0))
+        deadline = time.monotonic() + duration_seconds if duration_seconds > 0 else None
 
         try:
             with csv_path.open("w", newline="", encoding="utf-8") as file:
@@ -295,6 +328,12 @@ class AreaTrendLogger:
                 writer.writeheader()
 
                 while not stop_event.is_set():
+                    # 自动停止由后端线程执行，因此即使关闭浏览器页面，计时仍然可靠。
+                    # 达到时限后退出同一个 worker，让 CSV 和 NPZ 走统一的正常收尾流程。
+                    if deadline is not None and time.monotonic() >= deadline:
+                        with self._lock:
+                            self._stop_reason = "duration_elapsed"
+                        break
                     try:
                         status = self._get_stream_status(settings)
                         if status.get("running") is not True and not status.get("has_frame"):
@@ -414,6 +453,9 @@ class AreaTrendLogger:
             with self._lock:
                 if self._thread is threading.current_thread():
                     self._running = False
+                    self._finished_at = time.time()
+                    if self._stop_reason is None:
+                        self._stop_reason = "error" if self._error else "completed"
 
     def _get_stream_status(self, settings: dict[str, Any]) -> dict[str, Any]:
         """读取当前面积慢漂记录所依赖的数据流状态。"""
