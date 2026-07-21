@@ -39,6 +39,22 @@ class ManualAreaMeasurement:
     peak_index: int | None = None
 
 
+@dataclass
+class TopFractionMeasurement:
+    """窗口内最高百分比采样点的平均值。
+
+    这里保存本次计算真正使用的窗口、点数和比例，方便 WebUI、CSV 与离线分析
+    核对统计口径。计算始终使用传入的原始波形，不在这里做任何平滑或本底扣除。
+    """
+
+    left_index: int
+    right_index: int
+    point_count: int
+    selected_point_count: int
+    percentage: float
+    value: float
+
+
 def smooth_moving_average(signal: np.ndarray, window: int) -> np.ndarray:
     """移动平均平滑。
 
@@ -150,6 +166,58 @@ def measure_manual_area(
         right_index=right,
         point_count=int(window.size),
         value=float(np.sum(window)),
+    )
+
+
+def measure_top_fraction_mean(
+    signal: np.ndarray,
+    left_index: int,
+    right_index: int,
+    percentage: float = 10.0,
+) -> TopFractionMeasurement:
+    """计算指定窗口内最高若干百分比原始采样点的平均值。
+
+    例如窗口有 251 点、percentage=10 时，选择点数为 round(25.1)=25。
+    至少选择 1 点；percentage=100 时等价于整个窗口的算术平均值。
+
+    使用 ``np.partition`` 只划分出最大的 K 个点，不需要完整排序整个窗口。
+    这不会改变计算结果，但在窗口较大时比完整排序更直接。
+    """
+
+    data = np.asarray(signal, dtype=float)
+    if data.size == 0:
+        raise ValueError("signal must not be empty")
+
+    percent = float(percentage)
+    if not np.isfinite(percent) or percent <= 0 or percent > 100:
+        raise ValueError("percentage must be > 0 and <= 100")
+
+    left = int(round(left_index))
+    right = int(round(right_index))
+    if right < left:
+        left, right = right, left
+
+    left = max(0, min(left, data.size - 1))
+    right = max(0, min(right, data.size - 1))
+    if right <= left:
+        raise ValueError("top fraction right index must be greater than left index")
+
+    window = data[left : right + 1]
+    if not np.all(np.isfinite(window)):
+        raise ValueError("top fraction window contains non-finite values")
+
+    selected_count = max(1, int(round(window.size * percent / 100.0)))
+    selected_count = min(selected_count, int(window.size))
+    split_index = int(window.size) - selected_count
+    selected = np.partition(window, split_index)[split_index:]
+
+    return TopFractionMeasurement(
+        left_index=left,
+        right_index=right,
+        point_count=int(window.size),
+        selected_point_count=selected_count,
+        percentage=percent,
+        value=float(np.mean(selected)),
     )
 
 

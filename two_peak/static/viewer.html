@@ -388,6 +388,14 @@
       <tr><td>B</td><td>--</td><td>--</td><td>--</td></tr>
     </tbody>
   </table>
+  <h2>峰顶百分比统计（慢漂记录）</h2>
+  <table>
+    <thead><tr><th>窗口</th><th>范围/选点</th><th>当前</th><th>最近均值/标准差/EMA</th></tr></thead>
+    <tbody id="dualTopRows">
+      <tr><td>A</td><td>--</td><td>--</td><td>--</td></tr>
+      <tr><td>B</td><td>--</td><td>--</td><td>--</td></tr>
+    </tbody>
+  </table>
 
   <h2>慢漂记录</h2>
   <div class="grid2">
@@ -410,8 +418,16 @@
       <input id="trend_time_status" value="--" readonly>
     </div>
   </div>
-  <label>面积和峰高 EMA alpha，0 表示关闭滤波</label>
-  <input id="trend_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.005">
+  <div class="grid2">
+    <div>
+      <label>峰顶统计比例 / %</label>
+      <input id="top_percent" type="number" value="10" min="1" max="100" step="1">
+    </div>
+    <div>
+      <label>面积、峰高和 Top EMA alpha</label>
+      <input id="trend_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.005">
+    </div>
+  </div>
   <label class="inline">
     <input id="auto_track_enabled" type="checkbox">
     自动跟随面积窗口内最高点
@@ -470,6 +486,9 @@
   </div>
   <div class="plot" style="height:160px; margin-top:8px;">
     <canvas id="peakHeightTrendCanvas"></canvas>
+  </div>
+  <div class="plot" style="height:160px; margin-top:8px;">
+    <canvas id="topTrendCanvas"></canvas>
   </div>
   <div class="actions">
     <button class="green" id="trendStartBtn" onclick="startAreaTrend()">开始慢漂记录</button>
@@ -826,6 +845,7 @@ function getTrendParams() {
     record_hz: Number(document.getElementById('trend_record_hz').value),
     duration_minutes: Number(document.getElementById('trend_duration_minutes').value),
     ema_alpha: Number(document.getElementById('trend_ema_alpha').value),
+    top_percent: Number(document.getElementById('top_percent').value),
     auto_track_enabled: document.getElementById('auto_track_enabled').checked,
     auto_track_smooth_window: Number(document.getElementById('auto_track_smooth_window').value),
     auto_track_max_shift: Number(document.getElementById('auto_track_max_shift').value),
@@ -962,6 +982,7 @@ function applyDefaultsToUi(defaults) {
     'trend_ema_alpha',
     defaults.ema_alpha !== undefined ? defaults.ema_alpha : defaults.trend_ema_alpha,
   );
+  setInputValue('top_percent', firstDefined(defaults.top_percent, 10));
   setInputValue('auto_track_enabled', defaults.auto_track_enabled);
   setInputValue('auto_track_smooth_window', firstDefined(defaults.auto_track_smooth_window, 9));
   setInputValue('auto_track_max_shift', firstDefined(defaults.auto_track_max_shift, 5));
@@ -1283,9 +1304,11 @@ function updateTrendStatus(status) {
   }
   drawAreaTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
   drawPeakHeightTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
+  drawTopTrend(status && Array.isArray(status.recent_stats) ? status.recent_stats : []);
   updateManualAreaTable();
   updateDualAreaTable();
   updateDualPeakHeightTable();
+  updateDualTopTable();
   renderPlots();
 
   document.getElementById('trendStartBtn').disabled = running;
@@ -1355,6 +1378,21 @@ function drawPeakHeightTrend(rows) {
       {field: 'peak_height_ema', label: 'A EMA', color: '#dc2626'},
       {field: 'peak2_height_mean', label: 'B raw', color: '#16803c'},
       {field: 'peak2_height_ema', label: 'B EMA', color: '#7c3aed'},
+    ],
+  });
+}
+
+function drawTopTrend(rows) {
+  drawTrendChart({
+    canvasId: 'topTrendCanvas',
+    rows,
+    requiredField: 'top_mean',
+    waitText: '等待峰顶百分比记录...',
+    series: [
+      {field: 'top_mean', label: 'A Top mean', color: '#2563eb'},
+      {field: 'top_ema', label: 'A Top EMA', color: '#dc2626'},
+      {field: 'top2_mean', label: 'B Top mean', color: '#16803c'},
+      {field: 'top2_ema', label: 'B Top EMA', color: '#7c3aed'},
     ],
   });
 }
@@ -1477,6 +1515,10 @@ async function startAreaTrend() {
   }
   if (!Number.isFinite(params.ema_alpha) || params.ema_alpha < 0 || params.ema_alpha > 1) {
     setStatus('EMA alpha 需要在 0 到 1 之间。', 'error');
+    return;
+  }
+  if (!Number.isFinite(params.top_percent) || params.top_percent <= 0 || params.top_percent > 100) {
+    setStatus('峰顶统计比例必须大于 0%，并且不能超过 100%。', 'error');
     return;
   }
   if (!Number.isFinite(params.duration_minutes) || params.duration_minutes < 0) {
@@ -2593,6 +2635,69 @@ function updateDualPeakHeightTable() {
     <tr><td>B</td><td>${statsB.index}</td><td>${statsB.current}</td><td>${statsB.stats}</td></tr>
   `;
 }
+
+
+function trendTopStats(name) {
+  // Top 与面积、峰高读取同一条后端统计记录，三者使用完全相同的帧和动态窗口。
+  const stats = getActiveAreaStats();
+  if (!stats) return null;
+  if (name === 'A') {
+    return {
+      range: `${stats.area_left}-${stats.area_right}`,
+      pointCount: stats.top_point_count,
+      percent: stats.top_percent,
+      current: stats.top_current,
+      mean: stats.top_mean,
+      std: stats.top_std,
+      ema: stats.top_ema,
+      sampleCount: stats.sample_count,
+    };
+  }
+  if (stats.top2_current === null || stats.top2_current === undefined) return null;
+  return {
+    range: `${stats.area2_left}-${stats.area2_right}`,
+    pointCount: stats.top2_point_count,
+    percent: stats.top_percent,
+    current: stats.top2_current,
+    mean: stats.top2_mean,
+    std: stats.top2_std,
+    ema: stats.top2_ema,
+    sampleCount: stats.sample_count,
+  };
+}
+
+function formatTrendTopStats(stats) {
+  if (!stats || stats.current === null || stats.current === undefined) {
+    return {window: '--', current: '--', stats: '--'};
+  }
+  const meanText = stats.mean === null || stats.mean === undefined
+    ? '--'
+    : Number(stats.mean).toExponential(6);
+  const stdText = stats.std === null || stats.std === undefined
+    ? '--'
+    : Number(stats.std).toExponential(6);
+  const emaText = stats.ema === null || stats.ema === undefined
+    ? '--'
+    : Number(stats.ema).toExponential(6);
+  const percentText = Number(stats.percent).toFixed(3).replace(/\.?0+$/, '');
+  return {
+    window: `${stats.range} / ${stats.pointCount || 0}点 (${percentText}%)`,
+    current: Number(stats.current).toExponential(6),
+    stats: `${meanText} / ${stdText} / EMA ${emaText} / ${stats.sampleCount || 0} 帧`,
+  };
+}
+
+function updateDualTopTable() {
+  const rows = document.getElementById('dualTopRows');
+  if (!rows) return;
+  const statsA = formatTrendTopStats(trendTopStats('A'));
+  const statsB = formatTrendTopStats(trendTopStats('B'));
+  rows.innerHTML = `
+    <tr><td>A</td><td>${statsA.window}</td><td>${statsA.current}</td><td>${statsA.stats}</td></tr>
+    <tr><td>B</td><td>${statsB.window}</td><td>${statsB.current}</td><td>${statsB.stats}</td></tr>
+  `;
+}
+
 
 function updateFrameInfo() {
   if (!latestFrame) return;

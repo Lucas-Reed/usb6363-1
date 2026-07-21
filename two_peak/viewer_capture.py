@@ -264,6 +264,7 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         record_hz=float(body.get("record_hz", 1.0)),
         duration_minutes=float(body.get("duration_minutes", 0.0) or 0.0),
         ema_alpha=float(body.get("ema_alpha", 0.02)),
+        top_percent=float(body.get("top_percent", 10.0)),
         auto_track_enabled=_as_bool(body.get("auto_track_enabled", False)),
         auto_track_smooth_window=int(body.get("auto_track_smooth_window", 9)),
         auto_track_max_shift=int(body.get("auto_track_max_shift", 5)),

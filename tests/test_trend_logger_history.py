@@ -126,6 +126,7 @@ class TrendLoggerHistoryTests(unittest.TestCase):
                 area2_right=8,
                 window_frames=2,
                 record_hz=10.0,
+                top_percent=50.0,
                 poll_interval=0.001,
                 stream_source="unified_stream",
                 channels=["ai0"],
@@ -146,6 +147,16 @@ class TrendLoggerHistoryTests(unittest.TestCase):
             with csv_path.open("r", encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual([int(row["frame_id"]) for row in rows], list(range(1, 13)))
+            # A 窗口含 4 点，50% 取最高 2 点；B 窗口含 3 点，取最高 2 点。
+            # CSV 的 mean 使用最近 2 帧，验证 Top 与面积使用了同一统计窗口。
+            self.assertEqual(int(rows[-1]["top_point_count"]), 2)
+            self.assertEqual(int(rows[-1]["top2_point_count"]), 2)
+            self.assertAlmostEqual(float(rows[-1]["top_current"]), 0.57)
+            self.assertAlmostEqual(float(rows[-1]["top_mean"]), 0.565)
+            self.assertAlmostEqual(float(rows[-1]["top2_current"]), 0.87)
+            self.assertAlmostEqual(float(rows[-1]["top2_mean"]), 0.865)
+            self.assertNotEqual(rows[-1]["top_ema"], "")
+            self.assertNotEqual(rows[-1]["top2_ema"], "")
 
             chunk_path = root / "raw" / "window_voltage_history_test" / "chunk_000001.npz"
             with np.load(chunk_path, allow_pickle=False) as data:
