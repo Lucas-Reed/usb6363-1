@@ -300,6 +300,10 @@ def _read_feedback_value(latest: dict[str, Any], field: str) -> float | None:
             "area_ema": "area_mean",
             "area2_ema": "area2_mean",
             "area_sum_ema": "area_sum_mean",
+            # Top 与面积沿用相同约定：EMA alpha=0 时，锁定器退回到
+            # 最近 N 帧的 Top 均值，而不是因为滤波关闭而失去反馈。
+            "top_ema": "top_mean",
+            "top2_ema": "top2_mean",
         }.get(field)
         if fallback is not None:
             value = latest.get(fallback)
