@@ -92,6 +92,10 @@ class AreaTrendLogger:
         self._started_at: float | None = None
         self._finished_at: float | None = None
         self._stop_reason: str | None = None
+        # WebUI 的运行中边界更新先放到这里，再由记录线程在两帧之间原子应用。
+        # 这样面积、峰高、Top 和 NPZ 不会在同一帧混用新旧边界。
+        self._pending_window_update: dict[str, Any] | None = None
+        self._window_revision = 0
 
     def start(
         self,
@@ -211,6 +215,7 @@ class AreaTrendLogger:
                 "session_id": actual_session_id,
                 "trigger_unix_time": trigger_unix_time,
                 "start_after_frame_id": actual_start_after_frame_id,
+                "window_revision": 1,
             }
 
             voltage_recorder = None
@@ -246,6 +251,8 @@ class AreaTrendLogger:
             self._started_at = time.time()
             self._finished_at = None
             self._stop_reason = None
+            self._pending_window_update = None
+            self._window_revision = 1
             try:
                 thread.start()
             except Exception:
@@ -254,6 +261,75 @@ class AreaTrendLogger:
                 self._running = False
                 self._voltage_recorder = None
                 raise
+
+        return self.status()
+
+    def update_area_windows(
+        self,
+        area_left: int,
+        area_right: int,
+        area2_left: int | None,
+        area2_right: int | None,
+    ) -> dict[str, Any]:
+        """让正在运行的慢漂记录从下一帧开始使用新的 A/B 边界。
+
+        修改边界会改变测量量本身，因此记录线程会清空最近 N 帧统计并重新建立 EMA。
+        如果正在保存 A/B 逐点 NPZ，则对应窗口点数必须保持不变，保证每个 NPZ
+        数组仍是规则的二维矩阵。完整波形记录不受这个宽度限制。
+        """
+
+        new_a = _validate_window_pair(area_left, area_right, "A")
+        new_b = _validate_optional_window_pair(area2_left, area2_right, "B")
+
+        with self._lock:
+            if not self._running:
+                raise RuntimeError("面积慢漂记录没有运行")
+
+            latest = self._latest_stats or {}
+            current_a = (
+                int(latest.get("area_left", self._settings["area_left"])),
+                int(latest.get("area_right", self._settings["area_right"])),
+            )
+            current_b = _current_optional_window(self._settings, latest)
+            if (current_b is None) != (new_b is None):
+                raise ValueError("运行中不能新增或删除窗口 B，只能修改已有窗口的边界")
+
+            samples_per_frame = int(
+                (self._settings.get("source_stream_settings") or {}).get(
+                    "samples_per_frame",
+                    0,
+                )
+                or 0
+            )
+            if samples_per_frame > 0:
+                _validate_window_in_frame(new_a, samples_per_frame, "A")
+                if new_b is not None:
+                    _validate_window_in_frame(new_b, samples_per_frame, "B")
+
+            voltage_mode = str(self._settings.get("window_voltage_mode", "none"))
+            if voltage_mode in ("a", "both") and _window_width(new_a) != _window_width(current_a):
+                raise ValueError("正在保存窗口 A 逐点 NPZ，运行中只能平移 A，不能改变点数")
+            if (
+                voltage_mode in ("b", "both")
+                and current_b is not None
+                and new_b is not None
+                and _window_width(new_b) != _window_width(current_b)
+            ):
+                raise ValueError("正在保存窗口 B 逐点 NPZ，运行中只能平移 B，不能改变点数")
+
+            self._window_revision += 1
+            update = {
+                "area_left": new_a[0],
+                "area_right": new_a[1],
+                "area2_left": None if new_b is None else new_b[0],
+                "area2_right": None if new_b is None else new_b[1],
+                "window_revision": self._window_revision,
+            }
+            self._pending_window_update = update
+            self._settings.update(update)
+            # 曲线历史不能跨越统计口径变化继续连接；最新值保留到下一帧新结果产生，
+            # 避免功率锁定在这个极短间隔里因为反馈字段暂时不存在而退出。
+            self._recent_stats.clear()
 
         return self.status()
 
@@ -309,6 +385,7 @@ class AreaTrendLogger:
                 "frames_seen": self._frames_seen,
                 "records_written": self._records_written,
                 "last_frame_id": self._last_frame_id,
+                "window_revision": self._window_revision,
                 "latest_stats": dict(self._latest_stats or {}),
                 "recent_stats": [dict(row) for row in self._recent_stats],
             }
@@ -380,6 +457,23 @@ class AreaTrendLogger:
                             status,
                         )
                         for frame in frames:
+                            with self._lock:
+                                window_update = self._pending_window_update
+                                self._pending_window_update = None
+                            if window_update is not None:
+                                # 新边界会改变测量量的定义，所以最近 N 帧和所有 EMA
+                                # 都必须从头建立，不能把不同区间的数据混在一起。
+                                settings.update(window_update)
+                                samples.clear()
+                                next_record_timestamp = None
+                                area_ema = None
+                                area2_ema = None
+                                area_sum_ema = None
+                                peak_height_ema = None
+                                peak2_height_ema = None
+                                top_ema = None
+                                top2_ema = None
+
                             frame_id = int(frame.get("frame_id", 0))
                             expected_frame_id = last_seen_frame_id + 1
                             if (
@@ -412,6 +506,12 @@ class AreaTrendLogger:
                             with self._lock:
                                 self._frames_seen += 1
                                 self._last_frame_id = sample.frame_id
+                                # 自动跟随会逐帧移动局部 settings；同步回状态副本后，
+                                # WebUI 和下一次运行中更新都能看到真正的当前边界。
+                                self._settings["area_left"] = sample.area_left
+                                self._settings["area_right"] = sample.area_right
+                                self._settings["area2_left"] = sample.area2_left
+                                self._settings["area2_right"] = sample.area2_right
                                 self._error = None
 
                             # CSV 降采样使用帧自身的实验时间。即使一次补回多帧，
@@ -697,6 +797,7 @@ class AreaTrendLogger:
             "frame_id_end": frame_ids[-1],
             "session_id": str(settings.get("session_id", "")),
             "analysis_channel_index": int(settings["analysis_channel_index"]),
+            "window_revision": int(settings.get("window_revision", 1)),
             "auto_track_enabled": bool(settings.get("auto_track_enabled", False)),
             "auto_track_smooth_window": int(settings.get("auto_track_smooth_window", 9)),
             "auto_track_max_shift": int(settings.get("auto_track_max_shift", 5)),
@@ -791,6 +892,63 @@ class AreaTrendLogger:
 
         with self._lock:
             self._error = message
+
+
+def _validate_window_pair(left: int, right: int, name: str) -> tuple[int, int]:
+    """校验一个闭区间，并保留用户明确填写的左右方向。"""
+
+    normalized = (int(left), int(right))
+    if normalized[0] < 0 or normalized[1] < 0:
+        raise ValueError(f"窗口 {name} 的边界必须 >= 0")
+    if normalized[0] > normalized[1]:
+        raise ValueError(f"窗口 {name} 的左边界必须小于或等于右边界")
+    return normalized
+
+
+def _validate_optional_window_pair(
+    left: int | None,
+    right: int | None,
+    name: str,
+) -> tuple[int, int] | None:
+    """校验可选窗口；左右边界必须同时存在或同时为空。"""
+
+    if (left is None) != (right is None):
+        raise ValueError(f"窗口 {name} 的左右边界必须同时填写")
+    if left is None or right is None:
+        return None
+    return _validate_window_pair(left, right, name)
+
+
+def _validate_window_in_frame(
+    window: tuple[int, int],
+    samples_per_frame: int,
+    name: str,
+) -> None:
+    """防止运行中把窗口设置到当前波形点数之外。"""
+
+    if window[1] >= samples_per_frame:
+        raise ValueError(
+            f"窗口 {name} 的右边界必须小于每帧点数 {samples_per_frame}"
+        )
+
+
+def _current_optional_window(
+    settings: dict[str, Any],
+    latest: dict[str, Any],
+) -> tuple[int, int] | None:
+    """优先从最新统计读取自动跟随后真实的 B 窗口。"""
+
+    left = latest.get("area2_left", settings.get("area2_left"))
+    right = latest.get("area2_right", settings.get("area2_right"))
+    if left is None or right is None:
+        return None
+    return int(left), int(right)
+
+
+def _window_width(window: tuple[int, int]) -> int:
+    """返回闭区间包含的采样点数。"""
+
+    return window[1] - window[0] + 1
 
 
 def _relative_percent(std_or_delta: float, mean: float) -> float | None:
@@ -989,6 +1147,7 @@ def _csv_fieldnames() -> list[str]:
         "frame_id_end",
         "session_id",
         "analysis_channel_index",
+        "window_revision",
         "auto_track_enabled",
         "auto_track_smooth_window",
         "auto_track_max_shift",

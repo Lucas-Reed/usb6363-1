@@ -23,6 +23,7 @@ from two_peak.viewer_capture import (
     start_frame_stream,
     stop_area_trend,
     stop_frame_stream,
+    update_area_trend_windows,
 )
 from two_peak.viewer_state import ViewerState
 
@@ -107,6 +108,9 @@ def make_handler(state: ViewerState):
                     self._send_json(start_area_trend(state, body))
                 elif self.path == "/api/trend/stop":
                     self._send_json(stop_area_trend(state))
+                elif self.path == "/api/trend/update_windows":
+                    body = self._read_json()
+                    self._send_json(update_area_trend_windows(state, body))
                 elif self.path == "/api/test_sync/start":
                     body = self._read_json()
                     self._send_json(

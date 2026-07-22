@@ -496,6 +496,7 @@
   </div>
   <div class="actions">
     <button class="green" id="trendStartBtn" onclick="startAreaTrend()">开始慢漂记录</button>
+    <button class="secondary" id="trendApplyWindowsBtn" onclick="applyRunningAreaWindows()" disabled>应用运行中边界</button>
     <button class="secondary" id="trendStopBtn" onclick="stopAreaTrend()" disabled>停止慢漂记录</button>
   </div>
 
@@ -1270,8 +1271,9 @@ function updateTrendStatus(status) {
   latestTrendStats = Object.keys(latest).length ? latest : null;
   const error = status && status.error ? `错误：${status.error}` : '';
   const stoppedByDuration = status && status.stop_reason === 'duration_elapsed';
+  const windowRevision = status && status.window_revision ? Number(status.window_revision) : 0;
   document.getElementById('trend_status').value = error
-    || (running ? '记录中' : (stoppedByDuration ? '已按设定时长结束' : '停止'));
+    || (running ? `记录中（边界 v${windowRevision}）` : (stoppedByDuration ? '已按设定时长结束' : '停止'));
   const elapsedText = formatElapsedTime(status && status.elapsed_seconds);
   const remainingText = formatElapsedTime(status && status.remaining_seconds);
   document.getElementById('trend_time_status').value = running && remainingText !== '--'
@@ -1324,6 +1326,7 @@ function updateTrendStatus(status) {
   renderPlots();
 
   document.getElementById('trendStartBtn').disabled = running;
+  document.getElementById('trendApplyWindowsBtn').disabled = !running;
   document.getElementById('trendStopBtn').disabled = !running;
   if (running && trendTimer === null) {
     trendTimer = setInterval(() => refreshTrendStatus(false), 1000);
@@ -1571,6 +1574,31 @@ async function stopAreaTrend() {
     setStatus('慢漂记录已停止。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function applyRunningAreaWindows() {
+  const params = getTrendParams();
+  if (params.area_left === '' || params.area_right === '') {
+    setStatus('窗口 A 的左右边界必须同时填写。', 'error');
+    return;
+  }
+  if ((params.area2_left === '') !== (params.area2_right === '')) {
+    setStatus('窗口 B 的左右边界必须同时填写，或者同时留空。', 'error');
+    return;
+  }
+  try {
+    const status = await postJson('/api/trend/update_windows', {
+      area_left: params.area_left,
+      area_right: params.area_right,
+      area2_left: params.area2_left,
+      area2_right: params.area2_right,
+    });
+    updateTrendStatus(status);
+    setStatus(`新面积边界已提交，将从下一帧生效：v${status.window_revision}`, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshTrendStatus(false);
   }
 }
 

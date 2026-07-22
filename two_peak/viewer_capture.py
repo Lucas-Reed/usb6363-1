@@ -292,6 +292,25 @@ def stop_area_trend(state: ViewerState) -> dict[str, Any]:
     return state.trend_logger.stop()
 
 
+def update_area_trend_windows(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]:
+    """把 WebUI 新填写的 A/B 边界交给正在运行的慢漂记录器。"""
+
+    area_left = body.get("area_left")
+    area_right = body.get("area_right")
+    area2_left = body.get("area2_left")
+    area2_right = body.get("area2_right")
+    if area_left in (None, "") or area_right in (None, ""):
+        raise ValueError("area_left and area_right are required")
+    if (area2_left in (None, "")) != (area2_right in (None, "")):
+        raise ValueError("area2_left and area2_right must be set together")
+    return state.trend_logger.update_area_windows(
+        area_left=int(area_left),
+        area_right=int(area_right),
+        area2_left=None if area2_left in (None, "") else int(area2_left),
+        area2_right=None if area2_right in (None, "") else int(area2_right),
+    )
+
+
 def get_area_trend_status(state: ViewerState) -> dict[str, Any]:
     """查询手动面积慢漂记录状态。"""
 

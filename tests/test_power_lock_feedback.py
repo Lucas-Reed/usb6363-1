@@ -106,6 +106,24 @@ class PowerLockFeedbackTests(unittest.TestCase):
 
 
 class PowerLockRuntimeUpdateTests(unittest.TestCase):
+    def test_measurement_window_revision_resets_integral(self) -> None:
+        """面积边界改变后，PI 只能从新测量口径重新累计积分。"""
+
+        daq = _FakeDaq()
+        lock = PowerLockController(daq, _FakeTrendLogger())  # type: ignore[arg-type]
+        state = lock._update_one_controller(
+            _controller(kp=0.0, ki=1.0),
+            {
+                "voltage": 2.0,
+                "integral": 5.0,
+                "measurement_revision": 1,
+            },
+            {"area_ema": 8.0, "window_revision": 2},
+            dt=1.0,
+        )
+        self.assertAlmostEqual(state["integral"], 0.2)
+        self.assertEqual(state["measurement_revision"], 2)
+
     def test_runtime_update_preserves_voltage_and_uses_new_parameters(self) -> None:
         """热更新不能重写初始电压，新参数应从下一轮开始生效。"""
 

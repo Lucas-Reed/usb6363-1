@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -103,6 +104,52 @@ class _LateStartClient(_BatchClient):
         }
 
 
+class _StreamingBatchClient:
+    """允许测试逐帧加入数据，从而在两帧之间发送边界更新。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.frames: list[dict[str, Any]] = []
+
+    def append(self, frame: dict[str, Any]) -> None:
+        with self._lock:
+            self.frames.append(frame)
+
+    def get_unified_ai_stream_status(self) -> dict[str, Any]:
+        with self._lock:
+            frame_id = int(self.frames[-1]["frame_id"]) if self.frames else 0
+        return {
+            "running": True,
+            "has_frame": frame_id > 0,
+            "frame_id": frame_id,
+            "settings": {
+                "channels": ["Dev2/ai0"],
+                "rate_per_channel": 100_000.0,
+                "samples_per_frame": 10,
+            },
+        }
+
+    def get_unified_ai_frame_batch(
+        self,
+        after_frame_id: int,
+        channels: list[str],
+        max_frames: int = 100,
+    ) -> dict[str, Any]:
+        with self._lock:
+            available = [
+                frame for frame in self.frames if int(frame["frame_id"]) > after_frame_id
+            ][:max_frames]
+            latest = int(self.frames[-1]["frame_id"]) if self.frames else 0
+        return {
+            "frames": available,
+            "history_overrun": False,
+            "missing_before_first": 0,
+            "oldest_available_frame_id": 1 if self.frames else 0,
+            "latest_available_frame_id": latest,
+            "has_more": bool(available and int(available[-1]["frame_id"]) < latest),
+        }
+
+
 def _wait_until(predicate: Any, timeout: float = 3.0) -> None:
     """等待后台线程达到测试状态，超时则让测试明确失败。"""
 
@@ -115,6 +162,81 @@ def _wait_until(predicate: Any, timeout: float = 3.0) -> None:
 
 
 class TrendLoggerHistoryTests(unittest.TestCase):
+    def test_running_window_update_applies_on_next_frame_and_resets_statistics(self) -> None:
+        """新边界、统计窗口和 EMA 必须从同一条新帧重新开始。"""
+
+        base_time = time.time()
+        client = _StreamingBatchClient()
+        with tempfile.TemporaryDirectory(dir=Path("data")) as temp_dir:
+            logger = AreaTrendLogger(client, Path(temp_dir))  # type: ignore[arg-type]
+            logger.start(
+                analysis_channel_index=0,
+                area_left=2,
+                area_right=5,
+                area2_left=6,
+                area2_right=8,
+                window_frames=3,
+                record_hz=10.0,
+                poll_interval=0.001,
+                stream_source="unified_stream",
+                channels=["ai0"],
+            )
+            client.append(_frame(1, base_time))
+            _wait_until(lambda: logger.status()["records_written"] >= 1)
+
+            update_status = logger.update_area_windows(1, 6, 5, 9)
+            self.assertEqual(update_status["window_revision"], 2)
+            client.append(_frame(2, base_time))
+            _wait_until(
+                lambda: (logger.status().get("latest_stats") or {}).get(
+                    "window_revision"
+                )
+                == 2
+            )
+            status = logger.stop()
+
+        latest = status["latest_stats"]
+        self.assertEqual(latest["area_left"], 1)
+        self.assertEqual(latest["area_right"], 6)
+        self.assertEqual(latest["area2_left"], 5)
+        self.assertEqual(latest["area2_right"], 9)
+        self.assertEqual(latest["sample_count"], 1)
+        self.assertEqual(latest["window_revision"], 2)
+        self.assertTrue(
+            all(row["window_revision"] == 2 for row in status["recent_stats"])
+        )
+
+    def test_running_window_update_keeps_raw_npz_window_width(self) -> None:
+        """A/B 原始数组正在写盘时，改变点数必须在 API 层立即拒绝。"""
+
+        client = _StreamingBatchClient()
+        with tempfile.TemporaryDirectory(dir=Path("data")) as temp_dir:
+            root = Path(temp_dir)
+            logger = AreaTrendLogger(client, root / "trend")  # type: ignore[arg-type]
+            logger.start(
+                analysis_channel_index=0,
+                area_left=2,
+                area_right=5,
+                area2_left=6,
+                area2_right=8,
+                window_frames=2,
+                record_hz=10.0,
+                poll_interval=0.001,
+                stream_source="unified_stream",
+                channels=["ai0"],
+                window_voltage_mode="both",
+                window_voltage_output_dir=root / "raw",
+                session_id="window_update_width",
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "不能改变点数"):
+                    logger.update_area_windows(1, 6, 5, 9)
+                # 保持点数不变的平移仍然允许。
+                status = logger.update_area_windows(1, 4, 7, 9)
+                self.assertEqual(status["window_revision"], 2)
+            finally:
+                logger.stop()
+
     def test_all_frames_are_processed_and_written_to_npz(self) -> None:
         base_time = time.time()
         frames = [_frame(frame_id, base_time) for frame_id in range(1, 13)]

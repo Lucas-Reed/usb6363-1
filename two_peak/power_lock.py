@@ -74,6 +74,7 @@ class PowerLockController:
                         "target": controller["target"],
                         "voltage": controller["initial_voltage"],
                         "integral": 0.0,
+                        "measurement_revision": 0,
                         "measured": None,
                         "relative_error": None,
                         "command_delta": 0.0,
@@ -308,6 +309,14 @@ class PowerLockController:
 
         old_voltage = float(previous.get("voltage", controller["initial_voltage"]))
         integral = float(previous.get("integral", 0.0))
+        measurement_revision = int(latest.get("window_revision", 0) or 0)
+        previous_measurement_revision = int(
+            previous.get("measurement_revision", measurement_revision) or 0
+        )
+        if measurement_revision != previous_measurement_revision:
+            # 手动改变面积边界后，反馈量的物理定义已经变化。旧积分不能继续沿用，
+            # 否则可能在新窗口刚生效时推动 AO 突然跳变。
+            integral = 0.0
         relative_error = (target - measured) / abs(target)
         integral += relative_error * dt
 
@@ -343,6 +352,7 @@ class PowerLockController:
             "voltage": voltage,
             "command_delta": voltage - old_voltage,
             "integral": integral,
+            "measurement_revision": measurement_revision,
             "limited": limited,
         }
 
