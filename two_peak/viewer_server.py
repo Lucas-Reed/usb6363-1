@@ -149,6 +149,14 @@ def make_handler(state: ViewerState):
                             update_s=float(body.get("update_s", 1.0)),
                         )
                     )
+                elif self.path == "/api/power_lock/update":
+                    body = self._read_json()
+                    self._send_json(
+                        state.power_lock.update_parameters(
+                            controllers=body.get("controllers", []),
+                            update_s=float(body.get("update_s", 1.0)),
+                        )
+                    )
                 elif self.path == "/api/power_lock/stop":
                     self._send_json(state.power_lock.stop())
                 elif self.path == "/api/measure":

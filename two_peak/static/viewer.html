@@ -765,8 +765,9 @@
   <label>AOM 状态</label>
   <input id="power_lock_aom_status" value="--" readonly>
   <div class="actions">
-    <button class="secondary" onclick="writePowerLockInitialAo()">写入初始 AO 电压</button>
+    <button class="secondary" id="powerLockWriteInitialBtn" onclick="writePowerLockInitialAo()">写入初始 AO 电压</button>
     <button class="green" id="powerLockStartBtn" onclick="startPowerLock()">启动锁定</button>
+    <button class="secondary" id="powerLockApplyBtn" onclick="applyPowerLockParameters()" disabled>应用运行中参数</button>
     <button class="secondary" id="powerLockStopBtn" onclick="stopPowerLock()" disabled>停止锁定</button>
   </div>
 </aside>
@@ -792,6 +793,7 @@ let streamConsecutiveErrors = 0;
 let trendTimer = null;
 let aoScanTimer = null;
 let powerLockTimer = null;
+let powerLockDisplayedRevision = 0;
 let syncTestTimer = null;
 let trendRunning = false;
 let latestTrendStats = null;
@@ -1959,6 +1961,35 @@ function formatPowerLockState(state) {
   return `${state.feedback_field}=${measured}  err=${errorPercent}  AO=${voltage}${limited}`;
 }
 
+function syncPowerLockFormFromBackend(status) {
+  const revision = Number(status && status.parameter_revision) || 0;
+  if (!status || !status.running || revision === powerLockDisplayedRevision) return;
+
+  const controllers = Array.isArray(status.controllers) ? status.controllers : [];
+  const settings = status.settings || {};
+  const routes = [
+    {name: 'EOM', prefix: 'lock_eom'},
+    {name: 'AOM', prefix: 'lock_aom'},
+  ];
+  routes.forEach(route => {
+    const controller = controllers.find(item => item.name === route.name);
+    setInputValue(`${route.prefix}_enabled`, Boolean(controller));
+    if (!controller) return;
+    setInputValue(`${route.prefix}_channel`, controller.channel);
+    setInputValue(`${route.prefix}_feedback`, controller.feedback_field);
+    setInputValue(`${route.prefix}_target`, controller.target);
+    setInputValue(`${route.prefix}_initial`, controller.initial_voltage);
+    setInputValue(`${route.prefix}_min`, controller.min_voltage);
+    setInputValue(`${route.prefix}_max`, controller.max_voltage);
+    setInputValue(`${route.prefix}_direction`, controller.direction);
+    setInputValue(`${route.prefix}_max_step`, controller.max_step_v);
+    setInputValue(`${route.prefix}_kp`, controller.kp);
+    setInputValue(`${route.prefix}_ki`, controller.ki);
+  });
+  setInputValue('lock_update_s', settings.update_s);
+  powerLockDisplayedRevision = revision;
+}
+
 function updatePowerLockStatus(status) {
   const running = Boolean(status && status.running);
   const error = status && status.error ? status.error : '';
@@ -1966,7 +1997,12 @@ function updatePowerLockStatus(status) {
   const eomState = states.find(state => state.name === 'EOM') || states[0];
   const aomState = states.find(state => state.name === 'AOM') || states[1];
 
-  document.getElementById('power_lock_status').value = error || (running ? '锁定中' : '停止');
+  const revision = status && status.parameter_revision ? Number(status.parameter_revision) : 0;
+  // 只在后端参数版本变化时同步一次。用户随后在输入框里准备的新参数，
+  // 不会被每秒一次的状态轮询反复覆盖。
+  syncPowerLockFormFromBackend(status);
+  document.getElementById('power_lock_status').value = error
+    || (running ? `锁定中（参数 v${revision}）` : '停止');
   document.getElementById('power_lock_iterations').value = status && status.iterations !== undefined
     ? String(status.iterations)
     : '0';
@@ -1974,6 +2010,20 @@ function updatePowerLockStatus(status) {
   document.getElementById('power_lock_aom_status').value = formatPowerLockState(aomState);
   document.getElementById('powerLockStartBtn').disabled = running;
   document.getElementById('powerLockStopBtn').disabled = !running;
+  document.getElementById('powerLockApplyBtn').disabled = !running;
+  document.getElementById('powerLockWriteInitialBtn').disabled = running;
+
+  // 运行中只开放不会改变硬件连接和反馈物理定义的慢速 PI 参数。
+  // 目标值、Kp、Ki、单步限幅和更新周期仍可编辑，并由“应用运行中参数”提交。
+  const restartOnlyIds = [
+    'lock_eom_enabled', 'lock_eom_channel', 'lock_eom_feedback', 'lock_eom_initial',
+    'lock_eom_min', 'lock_eom_max', 'lock_eom_direction',
+    'lock_aom_enabled', 'lock_aom_channel', 'lock_aom_feedback', 'lock_aom_initial',
+    'lock_aom_min', 'lock_aom_max', 'lock_aom_direction',
+  ];
+  restartOnlyIds.forEach(id => {
+    document.getElementById(id).disabled = running;
+  });
 
   if (running && powerLockTimer === null) {
     powerLockTimer = setInterval(() => refreshPowerLockStatus(false), 1000);
@@ -2016,6 +2066,26 @@ async function startPowerLock() {
     });
     updatePowerLockStatus(status);
     setStatus('双路慢速功率锁定已启动。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+    await refreshPowerLockStatus(false);
+  }
+}
+
+async function applyPowerLockParameters() {
+  try {
+    const controllers = buildPowerLockControllers();
+    controllers.forEach(validatePowerLockController);
+    const updateS = Number(document.getElementById('lock_update_s').value);
+    if (!Number.isFinite(updateS) || updateS <= 0) {
+      throw new Error('锁定更新周期必须 > 0。');
+    }
+    const status = await postJson('/api/power_lock/update', {
+      controllers,
+      update_s: updateS,
+    });
+    updatePowerLockStatus(status);
+    setStatus(`运行中参数已应用：v${status.parameter_revision}`, 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
     await refreshPowerLockStatus(false);
