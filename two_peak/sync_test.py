@@ -70,8 +70,9 @@ class SyncTestCoordinator:
                 str(body.get("power_api_url", "http://127.0.0.1:8767"))
             )
             voltage_mode = str(body.get("window_voltage_mode", "none")).lower()
-            if voltage_mode == "none":
-                raise ValueError("同步测试必须选择窗口 A、窗口 B 或窗口 A+B 的逐点电压记录")
+            record_full_frame = bool(body.get("record_full_frame", False))
+            if voltage_mode == "none" and not record_full_frame:
+                raise ValueError("同步测试必须选择动态窗口记录或完整分析通道记录")
 
             trend_before = self._trend_logger.status()
             if trend_before.get("running"):

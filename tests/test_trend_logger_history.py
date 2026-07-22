@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import time
 import unittest
@@ -47,7 +48,11 @@ class _BatchClient:
             "running": True,
             "has_frame": frame_id > 0,
             "frame_id": frame_id,
-            "settings": {"channels": ["Dev2/ai0"]},
+            "settings": {
+                "channels": ["Dev2/ai0"],
+                "rate_per_channel": 100_000.0,
+                "samples_per_frame": 10,
+            },
         }
 
     def get_unified_ai_frame_batch(
@@ -131,6 +136,7 @@ class TrendLoggerHistoryTests(unittest.TestCase):
                 stream_source="unified_stream",
                 channels=["ai0"],
                 window_voltage_mode="both",
+                record_full_frame=True,
                 window_voltage_output_dir=root / "raw",
                 session_id="history_test",
             )
@@ -163,6 +169,16 @@ class TrendLoggerHistoryTests(unittest.TestCase):
                 np.testing.assert_array_equal(data["frame_id"], np.arange(1, 13))
                 self.assertEqual(data["a_values"].shape, (12, 4))
                 self.assertEqual(data["b_values"].shape, (12, 3))
+                self.assertEqual(data["full_values"].shape, (12, 10))
+                self.assertEqual(data["full_values"].dtype, np.float32)
+                np.testing.assert_array_equal(data["segment_frame_id"], np.arange(1, 13))
+
+            manifest_path = root / "raw" / "window_voltage_history_test" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["settings"]["source_stream_settings"]["rate_per_channel"],
+                100_000.0,
+            )
 
     def test_history_overrun_stops_with_clear_error(self) -> None:
         frames = [_frame(frame_id, time.time()) for frame_id in range(1, 11)]

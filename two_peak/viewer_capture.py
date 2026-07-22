@@ -272,6 +272,7 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         stream_source=stream_source_from_body(body),
         channels=parse_channels(body.get("channels", ["ai0", "ai1"])),
         window_voltage_mode=str(body.get("window_voltage_mode", "none")),
+        record_full_frame=_as_bool(body.get("record_full_frame", False)),
         window_voltage_output_dir=Path(
             str(body.get("window_voltage_output_dir", "data/two_peak_window_voltage"))
         ),

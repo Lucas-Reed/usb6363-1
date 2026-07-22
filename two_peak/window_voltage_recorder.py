@@ -32,7 +32,7 @@ MANIFEST_REPLACE_INITIAL_DELAY_SECONDS = 0.02
 
 
 class WindowVoltageRecorder:
-    """用后台线程把 A/B 动态窗口逐帧写成 NPZ。"""
+    """用后台线程把动态窗口和可选的完整分析通道逐帧写成 NPZ。"""
 
     def __init__(
         self,
@@ -40,12 +40,15 @@ class WindowVoltageRecorder:
         session_id: str,
         mode: str,
         metadata: dict[str, Any],
+        record_full_frame: bool = False,
         chunk_frames: int = 100,
         queue_frames: int = 500,
     ) -> None:
         normalized_mode = str(mode).strip().lower()
-        if normalized_mode not in VALID_MODES - {"none"}:
-            raise ValueError("window voltage mode must be a, b or both")
+        if normalized_mode not in VALID_MODES:
+            raise ValueError("window voltage mode must be none, a, b or both")
+        if normalized_mode == "none" and not record_full_frame:
+            raise ValueError("至少需要选择一个动态窗口，或者启用完整分析通道记录")
         if chunk_frames < 1:
             raise ValueError("window voltage chunk_frames must be >= 1")
         if queue_frames < chunk_frames:
@@ -63,6 +66,7 @@ class WindowVoltageRecorder:
         self._active_manifest_path = self._manifest_path
         self._session_id = session_id
         self._mode = normalized_mode
+        self._record_full_frame = bool(record_full_frame)
         self._chunk_frames = int(chunk_frames)
         self._metadata = dict(metadata)
         self._started_at = time.time()
@@ -155,6 +159,7 @@ class WindowVoltageRecorder:
                 "running": self._running,
                 "error": self._error,
                 "mode": self._mode,
+                "record_full_frame": self._record_full_frame,
                 "session_id": self._session_id,
                 "directory": str(self._session_dir.resolve()),
                 "manifest_file": str(self._active_manifest_path.resolve()),
@@ -208,10 +213,21 @@ class WindowVoltageRecorder:
             "frame_id": np.asarray([row["frame_id"] for row in records], dtype=np.int64),
             "finished_at": np.asarray([row["finished_at"] for row in records], dtype=np.float64),
         }
+        # 完整波形模式额外保存帧起止时间和 PFI 重同步分段信息。
+        # 这些元数据可以让离线分析把采样点索引换算成真实实验时间。
+        for field, dtype in (
+            ("started_at", np.float64),
+            ("segment_id", np.int64),
+            ("segment_frame_id", np.int64),
+        ):
+            if all(field in row for row in records):
+                arrays[field] = np.asarray([row[field] for row in records], dtype=dtype)
         if self._mode in ("a", "both"):
             arrays.update(_window_arrays(records, "a"))
         if self._mode in ("b", "both"):
             arrays.update(_window_arrays(records, "b"))
+        if self._record_full_frame:
+            arrays["full_values"] = _full_frame_array(records)
 
         with temp_path.open("wb") as file:
             np.savez(file, **arrays)
@@ -243,9 +259,14 @@ class WindowVoltageRecorder:
 
         with self._lock:
             return {
-                "format": "two_peak_window_voltage_npz_v1",
+                "format": (
+                    "two_peak_window_voltage_npz_v2"
+                    if self._record_full_frame
+                    else "two_peak_window_voltage_npz_v1"
+                ),
                 "session_id": self._session_id,
                 "mode": self._mode,
+                "record_full_frame": self._record_full_frame,
                 "dtype": "float32",
                 "chunk_frames": self._chunk_frames,
                 "started_at": datetime.fromtimestamp(self._started_at).isoformat(timespec="milliseconds"),
@@ -373,6 +394,16 @@ def _window_arrays(records: list[dict[str, Any]], prefix: str) -> dict[str, np.n
             dtype=np.int32,
         ),
     }
+
+
+def _full_frame_array(records: list[dict[str, Any]]) -> np.ndarray:
+    """整理完整分析通道波形，并拒绝一次记录中途改变每帧点数。"""
+
+    values = [np.asarray(row["full_values"], dtype=np.float32) for row in records]
+    sample_counts = {int(item.size) for item in values}
+    if len(sample_counts) != 1:
+        raise RuntimeError("完整分析通道的每帧点数在同一记录中发生了变化")
+    return np.stack(values, axis=0)
 
 
 def _optional_index(value: Any) -> int:

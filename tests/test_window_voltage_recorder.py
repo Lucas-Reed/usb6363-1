@@ -21,7 +21,11 @@ def _record(frame_id: int) -> dict[str, Any]:
 
     return {
         "frame_id": frame_id,
+        "segment_id": 2,
+        "segment_frame_id": frame_id,
+        "started_at": 999.9 + frame_id,
         "finished_at": 1000.0 + frame_id,
+        "full_values": np.arange(8, dtype=np.float32) + frame_id,
         "a_values": np.asarray([1.0, 2.0, 3.0], dtype=np.float32) + frame_id,
         "a_left": 10,
         "a_right": 12,
@@ -84,6 +88,67 @@ class WindowVoltageRecorderTests(unittest.TestCase):
                     )
                     self.assertTrue(manifest["completed"])
                     self.assertEqual(manifest["frames_written"], 3)
+
+    def test_full_analysis_channel_can_be_written_with_or_without_ab_windows(self) -> None:
+        """完整波形是独立选项，可单独记录，也可与现有 A/B 数组同时记录。"""
+
+        for mode in ("none", "both"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory(dir=Path("data")) as temp_dir:
+                    recorder = WindowVoltageRecorder(
+                        output_dir=Path(temp_dir),
+                        session_id=f"full_{mode}",
+                        mode=mode,
+                        metadata={"source_stream_settings": {"rate": 100_000.0}},
+                        record_full_frame=True,
+                        chunk_frames=2,
+                    )
+                    recorder.start()
+                    recorder.append(_record(1))
+                    recorder.append(_record(2))
+                    status = recorder.stop()
+
+                    self.assertIsNone(status["error"])
+                    self.assertTrue(status["record_full_frame"])
+                    chunk_path = Path(status["directory"]) / "chunk_000001.npz"
+                    with np.load(chunk_path, allow_pickle=False) as data:
+                        self.assertEqual(data["full_values"].shape, (2, 8))
+                        self.assertEqual(data["full_values"].dtype, np.float32)
+                        np.testing.assert_array_equal(data["segment_id"], [2, 2])
+                        if mode == "both":
+                            self.assertIn("a_values", data.files)
+                            self.assertIn("b_values", data.files)
+                        else:
+                            self.assertNotIn("a_values", data.files)
+                            self.assertNotIn("b_values", data.files)
+
+                    manifest = json.loads(
+                        Path(status["manifest_file"]).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(manifest["format"], "two_peak_window_voltage_npz_v2")
+                    self.assertTrue(manifest["record_full_frame"])
+
+    def test_full_analysis_channel_rejects_sample_count_change(self) -> None:
+        """统一流若在记录中途改变点数，必须明确失败而不是生成不规则数组。"""
+
+        with tempfile.TemporaryDirectory(dir=Path("data")) as temp_dir:
+            recorder = WindowVoltageRecorder(
+                Path(temp_dir),
+                "full_shape_change",
+                "none",
+                {},
+                record_full_frame=True,
+                chunk_frames=2,
+            )
+            recorder.start()
+            first = _record(1)
+            second = _record(2)
+            second["full_values"] = np.arange(9, dtype=np.float32)
+            recorder.append(first)
+            recorder.append(second)
+            status = recorder.stop()
+
+        self.assertIn("每帧点数", status["error"])
 
     def test_transient_manifest_permission_error_recovers(self) -> None:
         real_replace = os.replace

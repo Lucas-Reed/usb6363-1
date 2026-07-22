@@ -465,6 +465,10 @@
     <option value="b">仅窗口 B</option>
     <option value="both">窗口 A+B</option>
   </select>
+  <label class="inline">
+    <input id="record_full_frame" type="checkbox">
+    同时记录完整分析通道波形
+  </label>
   <label>NPZ 输出目录</label>
   <input id="window_voltage_output_dir" value="data/two_peak_window_voltage">
   <div class="grid2">
@@ -854,6 +858,7 @@ function getTrendParams() {
     auto_track_smooth_window: Number(document.getElementById('auto_track_smooth_window').value),
     auto_track_max_shift: Number(document.getElementById('auto_track_max_shift').value),
     window_voltage_mode: document.getElementById('window_voltage_mode').value,
+    record_full_frame: document.getElementById('record_full_frame').checked,
     window_voltage_output_dir: document.getElementById('window_voltage_output_dir').value,
   };
 }
@@ -991,6 +996,7 @@ function applyDefaultsToUi(defaults) {
   setInputValue('auto_track_smooth_window', firstDefined(defaults.auto_track_smooth_window, 9));
   setInputValue('auto_track_max_shift', firstDefined(defaults.auto_track_max_shift, 5));
   setInputValue('window_voltage_mode', firstDefined(defaults.window_voltage_mode, 'none'));
+  setInputValue('record_full_frame', firstDefined(defaults.record_full_frame, false));
   setInputValue(
     'window_voltage_output_dir',
     firstDefined(defaults.window_voltage_output_dir, 'data/two_peak_window_voltage'),
@@ -1350,7 +1356,8 @@ function formatBytes(value) {
 
 function updateWindowVoltageEstimate() {
   const mode = document.getElementById('window_voltage_mode').value;
-  if (mode === 'none') {
+  const recordFullFrame = document.getElementById('record_full_frame').checked;
+  if (mode === 'none' && !recordFullFrame) {
     document.getElementById('window_voltage_estimate').value = '--';
     return;
   }
@@ -1366,6 +1373,7 @@ function updateWindowVoltageEstimate() {
   let pointsPerFrame = 0;
   if (mode === 'a' || mode === 'both') pointsPerFrame += Number.isFinite(widthA) ? widthA : 0;
   if (mode === 'b' || mode === 'both') pointsPerFrame += Number.isFinite(widthB) ? widthB : 0;
+  if (recordFullFrame) pointsPerFrame += Number.isFinite(samples) ? samples : 0;
   const bytesPerSecond = frameRate * pointsPerFrame * 4;
   document.getElementById('window_voltage_estimate').value =
     `${formatBytes(bytesPerSecond)}/s，约 ${formatBytes(bytesPerSecond * 3600)}/h`;
@@ -1789,8 +1797,8 @@ async function startSyncTest() {
     setStatus('请先接管正在运行的统一 AI 流。', 'error');
     return;
   }
-  if (params.window_voltage_mode === 'none') {
-    setStatus('同步测试必须选择记录窗口 A、窗口 B 或窗口 A+B。', 'error');
+  if (params.window_voltage_mode === 'none' && !params.record_full_frame) {
+    setStatus('同步测试必须选择动态窗口记录或完整分析通道记录。', 'error');
     return;
   }
   if (params.area_left === '' || params.area_right === '') {
@@ -2742,6 +2750,7 @@ for (const id of ['manual_area_left', 'manual_area_right', 'manual_area2_left', 
   });
 }
 document.getElementById('window_voltage_mode').addEventListener('change', updateWindowVoltageEstimate);
+document.getElementById('record_full_frame').addEventListener('change', updateWindowVoltageEstimate);
 document.getElementById('sync_power_api_url').addEventListener('change', () => {
   refreshSyncTestStatus(false);
 });

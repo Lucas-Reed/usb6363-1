@@ -112,6 +112,7 @@ class AreaTrendLogger:
         stream_source: str = "unified_stream",
         channels: list[str] | None = None,
         window_voltage_mode: str = "none",
+        record_full_frame: bool = False,
         window_voltage_output_dir: Path | None = None,
         session_id: str | None = None,
         trigger_unix_time: float | None = None,
@@ -155,11 +156,14 @@ class AreaTrendLogger:
             raise ValueError("start_after_frame_id must be >= 0")
 
         actual_start_after_frame_id = int(start_after_frame_id)
-        if str(stream_source) == "unified_stream" and actual_start_after_frame_id == 0:
+        source_stream_settings: dict[str, Any] = {}
+        if str(stream_source) == "unified_stream":
             # 普通记录可能在统一流运行很久以后才开始。此时从“点击开始”的当前帧
             # 往后记录，而不是错误地要求补回从 frame 1 开始的全部历史。
             stream_status = self._daq.get_unified_ai_stream_status()
-            actual_start_after_frame_id = int(stream_status.get("frame_id", 0))
+            source_stream_settings = dict(stream_status.get("settings") or {})
+            if actual_start_after_frame_id == 0:
+                actual_start_after_frame_id = int(stream_status.get("frame_id", 0))
 
         with self._lock:
             if self._running:
@@ -169,9 +173,16 @@ class AreaTrendLogger:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_path = self._output_dir / f"area_trend_{timestamp}.csv"
             actual_session_id = session_id or f"{timestamp}_{uuid4().hex[:8]}"
+            configured_channels = list(channels or [])
+            analysis_channel = (
+                configured_channels[analysis_channel_index]
+                if 0 <= analysis_channel_index < len(configured_channels)
+                else None
+            )
 
             settings = {
                 "analysis_channel_index": int(analysis_channel_index),
+                "analysis_channel": analysis_channel,
                 "area_left": int(area_left),
                 "area_right": int(area_right),
                 "area2_left": None if area2_left is None else int(area2_left),
@@ -187,8 +198,12 @@ class AreaTrendLogger:
                 "auto_track_max_shift": int(auto_track_max_shift),
                 "poll_interval": float(poll_interval),
                 "stream_source": str(stream_source),
-                "channels": list(channels or []),
+                "channels": configured_channels,
                 "window_voltage_mode": voltage_mode,
+                "record_full_frame": bool(record_full_frame),
+                # 保存记录开始时的统一流参数快照，离线读取 full_values 时可据此
+                # 还原物理通道、每通道采样率和每帧点数。
+                "source_stream_settings": source_stream_settings,
                 "window_voltage_output_dir": str(
                     window_voltage_output_dir
                     or (self._output_dir.parent / "two_peak_window_voltage")
@@ -199,12 +214,13 @@ class AreaTrendLogger:
             }
 
             voltage_recorder = None
-            if voltage_mode != "none":
+            if voltage_mode != "none" or record_full_frame:
                 voltage_recorder = WindowVoltageRecorder(
                     output_dir=Path(settings["window_voltage_output_dir"]),
                     session_id=actual_session_id,
                     mode=voltage_mode,
                     metadata=settings,
+                    record_full_frame=bool(record_full_frame),
                 )
                 voltage_recorder.start()
 
@@ -303,6 +319,7 @@ class AreaTrendLogger:
                 "enabled": False,
                 "running": False,
                 "mode": "none",
+                "record_full_frame": False,
                 "frames_written": 0,
                 "source_gap_frames": 0,
                 "queue_dropped_frames": 0,
@@ -386,6 +403,9 @@ class AreaTrendLogger:
                                             settings["analysis_channel_index"]
                                         ),
                                         mode=str(settings["window_voltage_mode"]),
+                                        record_full_frame=bool(
+                                            settings.get("record_full_frame", False)
+                                        ),
                                     )
                                 )
                             last_seen_frame_id = sample.frame_id
@@ -805,6 +825,7 @@ def _build_window_voltage_record(
     sample: AreaTrendSample,
     analysis_channel_index: int,
     mode: str,
+    record_full_frame: bool = False,
 ) -> dict[str, Any]:
     """从已完成统计的同一帧中切出 A/B 原始电压窗口。"""
 
@@ -816,6 +837,13 @@ def _build_window_voltage_record(
         "frame_id": sample.frame_id,
         "finished_at": sample.timestamp,
     }
+    for field in ("started_at", "segment_id", "segment_frame_id"):
+        if frame.get(field) is not None:
+            record[field] = frame[field]
+    if record_full_frame:
+        # 必须在放入后台写盘队列前复制。这样后续采集覆盖内存时，磁盘数据仍然
+        # 对应当前 frame_id，而不会被下一帧悄悄改写。
+        record["full_values"] = np.asarray(signal, dtype=np.float32).copy()
     if mode in ("a", "both"):
         record.update(_window_record_fields("a", signal, sample, second=False))
     if mode in ("b", "both"):
