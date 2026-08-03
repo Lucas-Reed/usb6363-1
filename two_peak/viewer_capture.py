@@ -197,31 +197,39 @@ def stop_frame_stream(state: ViewerState, body: dict[str, Any] | None = None) ->
     return _status_with_source(state.daq.stop_ai_frame_stream(), "frame_stream")
 
 
-def get_frame_stream_status(state: ViewerState) -> dict[str, Any]:
-    """通过底层 API 查询固定点数分帧连续采集状态。"""
+def get_frame_stream_status(
+    state: ViewerState,
+    requested_source: str = "unified_stream",
+) -> dict[str, Any]:
+    """查询查看器明确指定的数据源状态。
 
-    frame_status = state.daq.get_ai_frame_stream_status()
-    if frame_status.get("running"):
-        return _status_with_source(frame_status, "frame_stream")
+    不能根据“哪一种底层流碰巧正在运行”自动切换来源。统一流异常停止后，
+    如果这里自动回退到旧 frame_stream，前端下一次点击开始就会误开一个旧 AI task，
+    随后统一流会因为设备被占用而无法重启。
+    """
 
-    unified_status = state.daq.get_unified_ai_stream_status()
-    if unified_status.get("running"):
-        return _status_with_source(unified_status, "unified_stream")
-
-    return _status_with_source(frame_status, "frame_stream")
+    source = stream_source_from_body({"stream_source": requested_source})
+    if source == "unified_stream":
+        status = state.daq.get_unified_ai_stream_status()
+    else:
+        status = state.daq.get_ai_frame_stream_status()
+    return _status_with_source(status, source)
 
 
 def get_frame_stream_latest(state: ViewerState, body: dict[str, Any] | None = None) -> dict[str, Any]:
     """通过底层 API 获取最新帧，并同步到查看器状态。"""
 
     requested_source = stream_source_from_body(body) if body and body.get("stream_source") else None
-    status = get_frame_stream_status(state)
+    status = get_frame_stream_status(state, requested_source or "unified_stream")
     if requested_source == "unified_stream":
         unified_status = state.daq.get_unified_ai_stream_status()
         if not unified_status.get("running") and not unified_status.get("has_frame"):
             raise RuntimeError("统一 AI 流未运行。请先在统一 AI 控制台启动统一流。")
         frame = state.daq.get_unified_ai_stream_latest_frame()
         frame["captured_by"] = "usb6363_unified_stream"
+    elif requested_source == "frame_stream":
+        frame = state.daq.get_ai_frame_stream_latest()
+        frame["captured_by"] = "usb6363_frame_stream"
     elif status.get("stream_source") == "unified_stream":
         frame = state.daq.get_unified_ai_stream_latest_frame()
         frame["captured_by"] = "usb6363_unified_stream"

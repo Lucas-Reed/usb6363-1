@@ -63,7 +63,12 @@ def make_handler(state: ViewerState):
                         }
                     )
                 elif path == "/api/stream/status":
-                    self._send_json(get_frame_stream_status(state))
+                    self._send_json(
+                        get_frame_stream_status(
+                            state,
+                            query.get("stream_source", ["unified_stream"])[0],
+                        )
+                    )
                 elif path == "/api/stream/latest":
                     self._send_json(
                         get_frame_stream_latest(
@@ -189,9 +194,13 @@ def make_handler(state: ViewerState):
                 self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
         def log_message(self, format: str, *args: Any) -> None:
-            """打印请求日志，便于调试浏览器发了什么请求。"""
+            """忽略正常 HTTP 访问日志，避免高频轮询持续写盘。
 
-            print(f"{self.address_string()} - {format % args}")
+            真正的采集错误仍会通过各状态 API 返回给 WebUI；正常情况下每秒十几次的
+            status/latest 请求没有诊断价值，长期打印反而会产生很大的日志文件。
+            """
+
+            return
 
         def _read_json(self) -> dict[str, Any]:
             """读取 POST 请求里的 JSON。"""

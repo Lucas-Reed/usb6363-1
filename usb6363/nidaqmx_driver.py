@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -22,6 +23,13 @@ _ACQUISITION_TYPE: Any | None = None
 _EDGE: Any | None = None
 _TERMINAL_CONFIGURATION: Any | None = None
 _SYSTEM: Any | None = None
+
+# 连续 AI 采集的电脑端 DAQmx 输入缓冲至少覆盖 5 秒数据。
+# 原来只按 10 个读取块分配；当前每块 0.1 秒时只有约 1 秒余量，Windows、磁盘或
+# Python 偶尔停顿就可能触发 -200279。这个缓冲位于电脑内存中，与 core 的历史帧
+# 环形缓冲不是同一个东西，也不会改变采样率、每帧点数或 PFI 触发方式。
+CONTINUOUS_AI_INPUT_BUFFER_SECONDS = 5.0
+CONTINUOUS_AI_INPUT_BUFFER_MIN_CHUNKS = 50
 
 
 def _load_nidaqmx() -> tuple[Any, Any, Any, Any, Any]:
@@ -235,11 +243,19 @@ def create_continuous_ai_task(
                 min_val=min_val,
                 max_val=max_val,
             )
+        # samps_per_chan 在连续模式下用于决定电脑端 DAQmx 输入缓冲的容量。
+        # 同时按“至少 5 秒”和“至少 50 个读取块”计算，兼容不同帧时长设置。
+        input_buffer_samples = max(
+            samples_per_read * CONTINUOUS_AI_INPUT_BUFFER_MIN_CHUNKS,
+            int(math.ceil(rate * CONTINUOUS_AI_INPUT_BUFFER_SECONDS)),
+        )
         task.timing.cfg_samp_clk_timing(
             rate=rate,
             sample_mode=acquisition_type.CONTINUOUS,
-            samps_per_chan=samples_per_read * 10,
+            samps_per_chan=input_buffer_samples,
         )
+        # 显式写入一次，避免不同 DAQmx 版本对 samps_per_chan 的自动缓冲策略不同。
+        task.in_stream.input_buf_size = input_buffer_samples
         if start_trigger_source is not None:
             task.triggers.start_trigger.cfg_dig_edge_start_trig(
                 trigger_source=start_trigger_source,

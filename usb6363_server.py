@@ -177,9 +177,14 @@ def make_handler(controller: DaqController):
                 self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
         def log_message(self, format: str, *args: Any) -> None:
-            """打印每次请求的日志，便于调试哪个子程序访问了 API。"""
+            """忽略正常请求日志，避免高速状态查询形成巨型日志文件。
 
-            print(f"{self.address_string()} - {format % args}")
+            双峰页面会高频请求 status 和 frame_batch。过去这些成功请求全部同步写到
+            stdout，长期运行会产生 GB 级日志并增加磁盘停顿。硬件错误仍保存在统一流
+            状态的 error 字段中，因此关闭访问日志不会隐藏真正的采集故障。
+            """
+
+            return
 
         def _read_json(self) -> dict[str, Any]:
             """读取 POST 请求里的 JSON 数据。"""

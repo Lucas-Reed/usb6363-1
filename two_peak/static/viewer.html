@@ -1236,7 +1236,10 @@ function stopBackendStreamUiOnly() {
 
 async function syncBackendStreamStatus(showStatus = false) {
   try {
-    const response = await fetch('/api/stream/status');
+    // 状态查询必须携带明确的数据源。否则 unified 流异常停止后，后端可能把页面
+    // 误切到兼容用的旧 frame_stream，下一次点击开始便会占用另一套 AI task。
+    const source = encodeURIComponent(document.getElementById('stream_source').value);
+    const response = await fetch(`/api/stream/status?stream_source=${source}`);
     const status = await response.json();
     if (!response.ok || status.ok === false) {
       throw new Error(status.error || '查询连续采集状态失败');

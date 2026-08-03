@@ -370,9 +370,9 @@ def make_handler(state: PowerDriftWebState):
                 self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
         def log_message(self, format: str, *args: Any) -> None:
-            """打印请求日志，方便调试。"""
+            """忽略正常轮询日志，避免长期监测产生无意义的大文件。"""
 
-            print(f"{self.address_string()} - {format % args}")
+            return
 
         def _read_json(self) -> dict[str, Any]:
             """读取 POST 请求里的 JSON。"""
