@@ -417,8 +417,12 @@ def _compact_trend_status(status: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_power_status(status: dict[str, Any]) -> dict[str, Any]:
-    """清除 recent_points，状态接口只保留会话摘要。"""
+    """清除单通道和多通道历史点，状态接口只保留会话摘要。"""
 
     if not status:
         return {}
-    return {key: value for key, value in status.items() if key != "recent_points"}
+    return {
+        key: value
+        for key, value in status.items()
+        if key not in {"recent_points", "recent_points_by_channel"}
+    }

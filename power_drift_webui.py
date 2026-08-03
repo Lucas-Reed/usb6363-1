@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -41,6 +42,37 @@ from usb6363_client import DEFAULT_BASE_URL
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8767
+
+
+@dataclass
+class PowerDriftChannelSettings:
+    """某一个 AI 通道的长漂显示、换算和脱锁判断参数。"""
+
+    channel: str
+    power_per_volt: float
+    zero_voltage: float
+    unlock_enabled: bool
+    unlock_min_v: float | None
+    unlock_max_v: float | None
+
+
+@dataclass
+class PowerDriftWebSettings:
+    """一次多通道长漂会话的公共参数和通道列表。"""
+
+    channels: list[PowerDriftChannelSettings]
+    data_source: str
+    interval: float
+    samples: int
+    rate: float
+    terminal_config: str
+    min_val: float
+    max_val: float
+    timeout: float
+    duration: float | None
+    output_dir: Path
+    api_base_url: str
+    allow_busy_ai: bool
 
 
 class PowerDriftWebState:
@@ -61,21 +93,23 @@ class PowerDriftWebState:
         self._error: str | None = None
         self._csv_path: Path | None = None
         self._metadata_path: Path | None = None
-        self._settings: PowerDriftSettings | None = None
+        self._settings: PowerDriftWebSettings | None = None
         self._started_at: float | None = None
         self._finished_at: float | None = None
         self._rows_written = 0
-        self._latest_point: PowerDriftPoint | None = None
-        self._recent_points: deque[PowerDriftPoint] = deque(maxlen=1000)
+        self._cycles_written = 0
+        self._latest_points: dict[str, dict[str, Any]] = {}
+        self._recent_points_by_channel: dict[str, deque[dict[str, Any]]] = {}
+        self._unlock_status: dict[str, dict[str, Any]] = {}
         # “预备同步触发”只保存在内存中，8767 重启后自然清除。
-        self._armed_settings: PowerDriftSettings | None = None
+        self._armed_settings: PowerDriftWebSettings | None = None
         self._session_id: str | None = None
         self._trigger_unix_time: float | None = None
         self._start_after_frame_id = 0
 
     def start(
         self,
-        settings: PowerDriftSettings,
+        settings: PowerDriftWebSettings,
         session_id: str | None = None,
         trigger_unix_time: float | None = None,
         start_after_frame_id: int = 0,
@@ -117,8 +151,14 @@ class PowerDriftWebState:
             self._started_at = time.time()
             self._finished_at = None
             self._rows_written = 0
-            self._latest_point = None
-            self._recent_points.clear()
+            self._cycles_written = 0
+            self._latest_points = {}
+            self._recent_points_by_channel = {
+                item.channel: deque(maxlen=1000) for item in settings.channels
+            }
+            self._unlock_status = {
+                item.channel: _initial_unlock_status(item) for item in settings.channels
+            }
             self._session_id = session_id
             self._trigger_unix_time = trigger_unix_time
             self._start_after_frame_id = int(start_after_frame_id)
@@ -126,7 +166,7 @@ class PowerDriftWebState:
 
         return self.status()
 
-    def arm(self, settings: PowerDriftSettings) -> dict[str, Any]:
+    def arm(self, settings: PowerDriftWebSettings) -> dict[str, Any]:
         """保存同步测试待启动参数，但此时不创建文件也不读取采集卡。"""
 
         if settings.data_source != "unified_stream":
@@ -201,6 +241,19 @@ class PowerDriftWebState:
         """返回前端需要显示的状态。"""
 
         with self._lock:
+            primary_channel = (
+                self._settings.channels[0].channel
+                if self._settings is not None and self._settings.channels
+                else None
+            )
+            latest_primary = (
+                self._latest_points.get(primary_channel) if primary_channel else None
+            )
+            recent_primary = (
+                list(self._recent_points_by_channel.get(primary_channel, ()))
+                if primary_channel
+                else []
+            )
             return {
                 "running": self._running,
                 "error": self._error,
@@ -209,9 +262,17 @@ class PowerDriftWebState:
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
                 "rows_written": self._rows_written,
+                "cycles_written": self._cycles_written,
                 "settings": _settings_for_json(self._settings) if self._settings else None,
-                "latest_point": asdict(self._latest_point) if self._latest_point else None,
-                "recent_points": [asdict(point) for point in self._recent_points],
+                # 保留旧单通道字段，避免同步测试和已有分析脚本突然失效。
+                "latest_point": latest_primary,
+                "recent_points": recent_primary,
+                "latest_points": dict(self._latest_points),
+                "recent_points_by_channel": {
+                    channel: list(points)
+                    for channel, points in self._recent_points_by_channel.items()
+                },
+                "unlock_status": dict(self._unlock_status),
                 "armed": self._armed_settings is not None,
                 "armed_settings": (
                     _settings_for_json(self._armed_settings)
@@ -233,7 +294,7 @@ class PowerDriftWebState:
 
     def _worker(
         self,
-        settings: PowerDriftSettings,
+        settings: PowerDriftWebSettings,
         csv_path: Path,
         metadata_path: Path,
         stop_event: threading.Event,
@@ -243,18 +304,33 @@ class PowerDriftWebState:
     ) -> None:
         """后台记录线程主体。"""
 
-        monitor = PowerDriftMonitor(settings)
-        fieldnames = list(PowerDriftPoint.__dataclass_fields__)
+        monitors = [
+            (item, PowerDriftMonitor(_monitor_settings(settings, item)))
+            for item in settings.channels
+        ]
+        fieldnames = list(PowerDriftPoint.__dataclass_fields__) + [
+            "unlock_enabled",
+            "unlock_min_v",
+            "unlock_max_v",
+            "outside_unlock_range",
+            "unlock_state",
+            "unlock_event_unix_time",
+            "unlock_event_iso_time",
+        ]
         start_time = time.time()
         next_start_time = start_time
         row_index = 0
+        unlock_events: dict[str, tuple[float, str] | None] = {
+            item.channel: None for item in settings.channels
+        }
 
         try:
             # 启动前检查硬件状态，避免和双峰连续采集等任务互相抢 AI。
-            monitor.check_hardware_idle()
+            for _, monitor in monitors:
+                monitor.check_hardware_idle()
             if start_after_frame_id > 0:
                 _wait_for_unified_frame_after(
-                    monitor,
+                    monitors[0][1],
                     start_after_frame_id,
                     stop_event,
                     timeout=settings.timeout,
@@ -269,7 +345,10 @@ class PowerDriftWebState:
                         "session_id": session_id,
                         "trigger_unix_time": trigger_unix_time,
                         "start_after_frame_id": start_after_frame_id,
-                        "note": "power_estimate = (mean_v - zero_voltage) * power_per_volt",
+                        "note": (
+                            "CSV 为长格式：同一 index 的多行属于同一个记录周期；"
+                            "脱锁范围判断使用该通道每周期的 mean_v。"
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -293,15 +372,38 @@ class PowerDriftWebState:
                             break
 
                     row_index += 1
-                    point = monitor.read_one_point(row_index=row_index, start_time=start_time)
-                    point.session_id = session_id
-                    writer.writerow(asdict(point))
+                    cycle_records: dict[str, dict[str, Any]] = {}
+                    cycle_unlock_status: dict[str, dict[str, Any]] = {}
+                    for channel_settings, monitor in monitors:
+                        point = monitor.read_one_point(
+                            row_index=row_index,
+                            start_time=start_time,
+                        )
+                        point.session_id = session_id
+                        record, unlock = _record_with_unlock_status(
+                            point,
+                            channel_settings,
+                            unlock_events[channel_settings.channel],
+                        )
+                        if unlock_events[channel_settings.channel] is None and unlock.get(
+                            "unlock_event_unix_time"
+                        ) is not None:
+                            unlock_events[channel_settings.channel] = (
+                                float(unlock["unlock_event_unix_time"]),
+                                str(unlock["unlock_event_iso_time"]),
+                            )
+                        writer.writerow(record)
+                        cycle_records[channel_settings.channel] = record
+                        cycle_unlock_status[channel_settings.channel] = unlock
                     file.flush()
 
                     with self._lock:
-                        self._rows_written += 1
-                        self._latest_point = point
-                        self._recent_points.append(point)
+                        self._cycles_written += 1
+                        self._rows_written += len(cycle_records)
+                        self._latest_points.update(cycle_records)
+                        for channel, record in cycle_records.items():
+                            self._recent_points_by_channel[channel].append(record)
+                        self._unlock_status.update(cycle_unlock_status)
                         self._error = None
 
                     next_start_time += settings.interval
@@ -424,11 +526,63 @@ def make_handler(state: PowerDriftWebState):
     return PowerDriftHandler
 
 
-def _settings_from_body(body: dict[str, Any]) -> PowerDriftSettings:
-    """把前端 JSON 转成 PowerDriftSettings。"""
+def _settings_from_body(body: dict[str, Any]) -> PowerDriftWebSettings:
+    """把前端 JSON 转成一次多通道长漂会话设置。
 
-    settings = PowerDriftSettings(
-        channel=str(body.get("channel", "ai2")),
+    旧页面只会发送 channel/power_per_volt/zero_voltage，仍然把它转换为一个通道，
+    因此浏览器没有强制刷新时也不会立刻失效。
+    """
+
+    raw_channels = body.get("channels")
+    if raw_channels is None:
+        raw_channels = [
+            {
+                "channel": body.get("channel", "ai2"),
+                "power_per_volt": body.get("power_per_volt", 1.0),
+                "zero_voltage": body.get("zero_voltage", 0.0),
+                "unlock_enabled": body.get("unlock_enabled", False),
+                "unlock_min_v": body.get("unlock_min_v"),
+                "unlock_max_v": body.get("unlock_max_v"),
+            }
+        ]
+    if not isinstance(raw_channels, list) or not raw_channels:
+        raise ValueError("channels must be a non-empty list")
+
+    channels: list[PowerDriftChannelSettings] = []
+    seen: set[str] = set()
+    for raw_item in raw_channels:
+        if not isinstance(raw_item, dict):
+            raise ValueError("each channels item must be an object")
+        channel = str(raw_item.get("channel", "")).strip()
+        if not channel:
+            raise ValueError("channel must not be empty")
+        channel_key = channel.lower()
+        if channel_key in seen:
+            raise ValueError(f"duplicate channel: {channel}")
+        seen.add(channel_key)
+
+        unlock_enabled = _bool_value(raw_item.get("unlock_enabled", False))
+        unlock_min_v = _optional_float(raw_item.get("unlock_min_v"))
+        unlock_max_v = _optional_float(raw_item.get("unlock_max_v"))
+        if unlock_enabled:
+            if unlock_min_v is None or unlock_max_v is None:
+                raise ValueError(f"{channel} 启用脱锁监测后必须填写最小值和最大值")
+            if unlock_min_v >= unlock_max_v:
+                raise ValueError(f"{channel} 的脱锁最小值必须小于最大值")
+
+        channels.append(
+            PowerDriftChannelSettings(
+                channel=channel,
+                power_per_volt=float(raw_item.get("power_per_volt", 1.0)),
+                zero_voltage=float(raw_item.get("zero_voltage", 0.0)),
+                unlock_enabled=unlock_enabled,
+                unlock_min_v=unlock_min_v,
+                unlock_max_v=unlock_max_v,
+            )
+        )
+
+    settings = PowerDriftWebSettings(
+        channels=channels,
         data_source=str(body.get("data_source", "unified_stream")),
         interval=float(body.get("interval", 1.0)),
         samples=int(body.get("samples", 1000)),
@@ -440,8 +594,6 @@ def _settings_from_body(body: dict[str, Any]) -> PowerDriftSettings:
         duration=_optional_float(body.get("duration")),
         output_dir=Path(str(body.get("output_dir", DEFAULT_OUTPUT_DIR))),
         api_base_url=str(body.get("api_base_url", DEFAULT_BASE_URL)),
-        power_per_volt=float(body.get("power_per_volt", 1.0)),
-        zero_voltage=float(body.get("zero_voltage", 0.0)),
         allow_busy_ai=_bool_value(body.get("allow_busy_ai", False)),
     )
     _validate_settings(settings)
@@ -466,7 +618,7 @@ def _wait_for_unified_frame_after(
         stop_event.wait(0.02)
 
 
-def _validate_settings(settings: PowerDriftSettings) -> None:
+def _validate_settings(settings: PowerDriftWebSettings) -> None:
     """检查前端传入的参数是否合理。"""
 
     if settings.interval <= 0:
@@ -483,6 +635,104 @@ def _validate_settings(settings: PowerDriftSettings) -> None:
         raise ValueError("terminal_config must be RSE, DIFF, or NRSE")
     if settings.data_source not in ("direct_read", "unified_stream"):
         raise ValueError("data_source must be direct_read or unified_stream")
+
+
+def _monitor_settings(
+    settings: PowerDriftWebSettings,
+    channel: PowerDriftChannelSettings,
+) -> PowerDriftSettings:
+    """把公共会话参数和某一路参数组合成已有的单通道读取器设置。"""
+
+    return PowerDriftSettings(
+        channel=channel.channel,
+        data_source=settings.data_source,
+        interval=settings.interval,
+        samples=settings.samples,
+        rate=settings.rate,
+        terminal_config=settings.terminal_config,
+        min_val=settings.min_val,
+        max_val=settings.max_val,
+        timeout=settings.timeout,
+        duration=settings.duration,
+        output_dir=settings.output_dir,
+        api_base_url=settings.api_base_url,
+        power_per_volt=channel.power_per_volt,
+        zero_voltage=channel.zero_voltage,
+        allow_busy_ai=settings.allow_busy_ai,
+    )
+
+
+def _initial_unlock_status(channel: PowerDriftChannelSettings) -> dict[str, Any]:
+    """构造记录尚未产生第一个点时的脱锁状态。"""
+
+    return {
+        "channel": channel.channel,
+        "enabled": channel.unlock_enabled,
+        "state": "waiting" if channel.unlock_enabled else "disabled",
+        "min_v": channel.unlock_min_v,
+        "max_v": channel.unlock_max_v,
+        "latest_mean_v": None,
+        "outside_range": False,
+        "unlock_event_unix_time": None,
+        "unlock_event_iso_time": None,
+    }
+
+
+def _record_with_unlock_status(
+    point: PowerDriftPoint,
+    channel: PowerDriftChannelSettings,
+    previous_event: tuple[float, str] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """给一个平均点附加脱锁判断，并锁存本次会话的第一次脱锁时间。"""
+
+    outside_range = False
+    event = previous_event
+    if channel.unlock_enabled:
+        # 正常入口已经验证上下限；这里再检查一次，使这个函数单独调用时也安全。
+        lower = channel.unlock_min_v
+        upper = channel.unlock_max_v
+        if lower is None or upper is None:
+            raise ValueError(f"{channel.channel} 的脱锁上下限不能为空")
+        outside_range = bool(point.mean_v < lower or point.mean_v > upper)
+        if outside_range and event is None:
+            event = (
+                point.unix_time,
+                datetime.fromtimestamp(point.unix_time).isoformat(timespec="seconds"),
+            )
+
+    if not channel.unlock_enabled:
+        state = "disabled"
+    elif event is not None:
+        state = "unlocked"
+    else:
+        state = "locked"
+
+    event_unix_time = event[0] if event is not None else None
+    event_iso_time = event[1] if event is not None else None
+    record = asdict(point)
+    record.update(
+        {
+            "unlock_enabled": channel.unlock_enabled,
+            "unlock_min_v": channel.unlock_min_v,
+            "unlock_max_v": channel.unlock_max_v,
+            "outside_unlock_range": outside_range,
+            "unlock_state": state,
+            "unlock_event_unix_time": event_unix_time,
+            "unlock_event_iso_time": event_iso_time,
+        }
+    )
+    status = {
+        "channel": channel.channel,
+        "enabled": channel.unlock_enabled,
+        "state": state,
+        "min_v": channel.unlock_min_v,
+        "max_v": channel.unlock_max_v,
+        "latest_mean_v": point.mean_v,
+        "outside_range": outside_range,
+        "unlock_event_unix_time": event_unix_time,
+        "unlock_event_iso_time": event_iso_time,
+    }
+    return record, status
 
 
 def _optional_float(value: Any) -> float | None:
@@ -505,7 +755,7 @@ def _bool_value(value: Any) -> bool:
     return False
 
 
-def _settings_for_json(settings: PowerDriftSettings | None) -> dict[str, Any] | None:
+def _settings_for_json(settings: PowerDriftWebSettings | None) -> dict[str, Any] | None:
     """把设置转换成 JSON 友好的普通字典。"""
 
     if settings is None:
@@ -553,7 +803,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     min-width: 0;
     min-height: 0;
     display: grid;
-    grid-template-rows: auto auto 1fr auto;
+    grid-template-rows: auto auto 1fr;
     gap: 10px;
     padding: 12px;
   }
@@ -632,6 +882,77 @@ HTML_PAGE = r"""<!DOCTYPE html>
     grid-template-columns: repeat(4, minmax(120px, 1fr));
     gap: 8px;
   }
+  .channel-list-row {
+    display: grid;
+    grid-template-columns: 1fr 108px;
+    gap: 8px;
+    align-items: end;
+  }
+  .channel-settings {
+    display: grid;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .channel-config {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px;
+    background: #f8fafc;
+  }
+  .channel-config-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .channel-panels {
+    min-height: 0;
+    overflow: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    align-content: start;
+    gap: 10px;
+  }
+  .channel-panel {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 10px;
+  }
+  .channel-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .channel-panel-title { font-size: 15px; font-weight: 700; }
+  .unlock-badge {
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 3px 8px;
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .unlock-badge.locked { color: var(--green); border-color: #84c798; background: #f1fbf4; }
+  .unlock-badge.unlocked { color: var(--red); border-color: #e2a0a0; background: #fff3f3; }
+  .channel-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(100px, 1fr));
+    gap: 8px;
+  }
+  .channel-metric label { margin: 0 0 3px; }
+  .channel-metric div {
+    font-family: Consolas, "SFMono-Regular", monospace;
+    font-size: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .channel-plot { height: 220px; margin-top: 8px; border-top: 1px solid var(--line); }
+  .channel-detail { margin-top: 6px; color: var(--muted); font-size: 12px; }
   .metric {
     border: 1px solid var(--line);
     background: var(--panel);
@@ -680,6 +1001,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
     aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
     .metrics { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+    .channel-panels { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -693,20 +1015,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <option value="unified_stream" selected>unified_stream：读取已经运行的统一 AI 流</option>
     <option value="direct_read">direct_read：单独慢漂监测，独占读取 AI</option>
   </select>
-  <div class="grid2">
+  <div class="channel-list-row">
     <div>
-      <label>AI 通道</label>
-      <input id="channel" value="ai2">
+      <label>AI 通道，用英文逗号分隔</label>
+      <input id="channel_list" class="setting-control" value="ai0,ai1,ai2">
     </div>
-    <div>
-      <label>接线方式</label>
-      <select id="terminal_config">
-        <option value="RSE">RSE</option>
-        <option value="DIFF">DIFF</option>
-        <option value="NRSE">NRSE</option>
-      </select>
-    </div>
+    <button id="applyChannelsBtn" class="secondary setting-control" onclick="applyChannelList()">应用通道</button>
   </div>
+  <div id="channelSettings" class="channel-settings"></div>
+  <label>接线方式</label>
+  <select id="terminal_config">
+    <option value="RSE">RSE</option>
+    <option value="DIFF" selected>DIFF</option>
+    <option value="NRSE">NRSE</option>
+  </select>
   <div class="grid2">
     <div>
       <label>记录间隔 / s</label>
@@ -740,17 +1062,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label>读取超时 / s</label>
   <input id="timeout" type="number" value="10" min="0.1" step="1">
 
-  <h2>换算</h2>
-  <div class="grid2">
-    <div>
-      <label>功率/电压系数</label>
-      <input id="power_per_volt" type="number" value="1" step="0.001">
-    </div>
-    <div>
-      <label>零功率电压 / V</label>
-      <input id="zero_voltage" type="number" value="0" step="0.001">
-    </div>
-  </div>
+  <h2>文件与服务</h2>
   <label>输出目录</label>
   <input id="output_dir" value="data/power_drift">
   <label>底层 API</label>
@@ -777,38 +1089,132 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   <div class="metrics">
     <div class="metric"><label>状态</label><div id="m_running">停止</div></div>
-    <div class="metric"><label>均值 / V</label><div id="m_mean">--</div></div>
-    <div class="metric"><label>相对标准差</label><div id="m_rel">--</div></div>
-    <div class="metric"><label>已写行数</label><div id="m_rows">0</div></div>
+    <div class="metric"><label>记录周期</label><div id="m_cycles">0</div></div>
+    <div class="metric"><label>CSV 行数</label><div id="m_rows">0</div></div>
+    <div class="metric"><label>CSV 文件</label><div id="m_csv">--</div></div>
   </div>
 
-  <div class="plot">
-    <canvas id="trendCanvas"></canvas>
-  </div>
-
-  <table>
-    <tbody id="detailRows">
-      <tr><td>CSV</td><td>--</td></tr>
-      <tr><td>最新时间</td><td>--</td></tr>
-      <tr><td>标准差 / V</td><td>--</td></tr>
-      <tr><td>峰峰值 / V</td><td>--</td></tr>
-      <tr><td>估计功率</td><td>--</td></tr>
-    </tbody>
-  </table>
+  <div id="channelPanels" class="channel-panels"></div>
 </main>
 
 <script>
 let latestStatus = null;
 let pollTimer = null;
-const POWER_SETTING_IDS = [
-  'channel', 'data_source', 'interval', 'duration', 'samples', 'rate',
-  'terminal_config', 'min_val', 'max_val', 'timeout', 'power_per_volt',
-  'zero_voltage', 'output_dir', 'api_base_url', 'allow_busy_ai',
+let channelDrafts = [];
+let panelSignature = '';
+let sidebarSessionSignature = '';
+const CHANNEL_COLORS = ['#1f6feb', '#16833a', '#b05a00', '#8b5cf6', '#c62828', '#00796b'];
+const COMMON_SETTING_IDS = [
+  'channel_list', 'applyChannelsBtn', 'data_source', 'interval', 'duration',
+  'samples', 'rate', 'terminal_config', 'min_val', 'max_val', 'timeout',
+  'output_dir', 'api_base_url', 'allow_busy_ai',
 ];
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function parseChannelList() {
+  const channels = document.getElementById('channel_list').value
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  if (!channels.length) throw new Error('请至少填写一个 AI 通道。');
+  const keys = channels.map(channel => channel.toLowerCase());
+  if (new Set(keys).size !== keys.length) throw new Error('AI 通道不能重复。');
+  return channels;
+}
+
+function readChannelDrafts() {
+  return channelDrafts.map((draft, index) => {
+    const unlockEnabled = document.getElementById(`channel_unlock_${index}`).checked;
+    return {
+      channel: draft.channel,
+      power_per_volt: Number(document.getElementById(`channel_power_${index}`).value),
+      zero_voltage: Number(document.getElementById(`channel_zero_${index}`).value),
+      unlock_enabled: unlockEnabled,
+      unlock_min_v: unlockEnabled ? document.getElementById(`channel_min_${index}`).value : '',
+      unlock_max_v: unlockEnabled ? document.getElementById(`channel_max_${index}`).value : '',
+    };
+  });
+}
+
+function renderChannelSettings() {
+  const container = document.getElementById('channelSettings');
+  container.innerHTML = channelDrafts.map((draft, index) => `
+    <section class="channel-config">
+      <div class="channel-config-title">${escapeHtml(draft.channel)}</div>
+      <div class="grid2">
+        <div>
+          <label>功率/电压系数</label>
+          <input id="channel_power_${index}" class="channel-setting" type="number"
+                 value="${escapeHtml(draft.power_per_volt ?? 1)}" step="0.001">
+        </div>
+        <div>
+          <label>零功率电压 / V</label>
+          <input id="channel_zero_${index}" class="channel-setting" type="number"
+                 value="${escapeHtml(draft.zero_voltage ?? 0)}" step="0.001">
+        </div>
+      </div>
+      <label class="inline">
+        <input id="channel_unlock_${index}" class="channel-setting" type="checkbox"
+               ${draft.unlock_enabled ? 'checked' : ''} onchange="toggleUnlock(${index})">
+        脱锁监测
+      </label>
+      <div class="grid2">
+        <div>
+          <label>允许最小值 / V</label>
+          <input id="channel_min_${index}" class="channel-setting unlock-limit" type="number"
+                 value="${draft.unlock_min_v ?? ''}" step="0.001">
+        </div>
+        <div>
+          <label>允许最大值 / V</label>
+          <input id="channel_max_${index}" class="channel-setting unlock-limit" type="number"
+                 value="${draft.unlock_max_v ?? ''}" step="0.001">
+        </div>
+      </div>
+    </section>
+  `).join('');
+  channelDrafts.forEach((_, index) => toggleUnlock(index));
+}
+
+function applyChannelList() {
+  try {
+    const oldDrafts = new Map();
+    if (channelDrafts.length && document.querySelector('.channel-setting')) {
+      readChannelDrafts().forEach(item => oldDrafts.set(item.channel.toLowerCase(), item));
+    }
+    channelDrafts = parseChannelList().map(channel => oldDrafts.get(channel.toLowerCase()) || {
+      channel,
+      power_per_volt: 1,
+      zero_voltage: 0,
+      unlock_enabled: false,
+      unlock_min_v: '',
+      unlock_max_v: '',
+    });
+    renderChannelSettings();
+    ensureChannelPanels(channelDrafts.map(item => item.channel));
+    setStatus(`已应用 ${channelDrafts.length} 个通道。`, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+function toggleUnlock(index) {
+  const enabled = document.getElementById(`channel_unlock_${index}`).checked;
+  const globallyLocked = Boolean(latestStatus && (latestStatus.running || latestStatus.armed));
+  document.getElementById(`channel_min_${index}`).disabled = globallyLocked || !enabled;
+  document.getElementById(`channel_max_${index}`).disabled = globallyLocked || !enabled;
+}
 
 function getSettings() {
   return {
-    channel: document.getElementById('channel').value,
+    channels: readChannelDrafts(),
     data_source: document.getElementById('data_source').value,
     interval: Number(document.getElementById('interval').value),
     samples: Number(document.getElementById('samples').value),
@@ -820,8 +1226,6 @@ function getSettings() {
     duration: document.getElementById('duration').value,
     output_dir: document.getElementById('output_dir').value,
     api_base_url: document.getElementById('api_base_url').value,
-    power_per_volt: Number(document.getElementById('power_per_volt').value),
-    zero_voltage: Number(document.getElementById('zero_voltage').value),
     allow_busy_ai: document.getElementById('allow_busy_ai').checked,
   };
 }
@@ -910,8 +1314,23 @@ function updateStatus(status) {
   latestStatus = status;
   const running = Boolean(status.running);
   const armed = Boolean(status.armed);
-  const point = status.latest_point;
   const error = status.error ? `错误：${status.error}` : '';
+
+  // 页面在记录期间被刷新时，从后端恢复真正运行中的通道和阈值。
+  const activeSettings = running
+    ? status.settings
+    : (armed ? status.armed_settings : null);
+  if ((running || armed) && activeSettings && Array.isArray(activeSettings.channels)) {
+    const signature = JSON.stringify(activeSettings.channels);
+    if (signature !== sidebarSessionSignature) {
+      sidebarSessionSignature = signature;
+      channelDrafts = activeSettings.channels.map(item => ({...item}));
+      document.getElementById('channel_list').value = channelDrafts.map(item => item.channel).join(',');
+      renderChannelSettings();
+    }
+  } else if (!running && !armed) {
+    sidebarSessionSignature = '';
+  }
 
   document.getElementById('startBtn').disabled = running || armed;
   document.getElementById('stopBtn').disabled = !running;
@@ -921,55 +1340,112 @@ function updateStatus(status) {
   document.getElementById('armed_status').value = running && status.session_id
     ? `同步记录中：${status.session_id}`
     : (armed ? '已预备，等待双峰页面触发' : '未预备');
-  POWER_SETTING_IDS.forEach(id => {
+  COMMON_SETTING_IDS.forEach(id => {
     const element = document.getElementById(id);
     if (element) element.disabled = running || armed;
   });
-  document.getElementById('m_running').textContent = error || (running ? '记录中' : '停止');
+  document.querySelectorAll('.channel-setting').forEach(element => {
+    element.disabled = running || armed;
+  });
+  if (!running && !armed) {
+    channelDrafts.forEach((_, index) => toggleUnlock(index));
+  }
+  const unlockedChannels = Object.values(status.unlock_status || {})
+    .filter(item => item && item.state === 'unlocked')
+    .map(item => `${item.channel} ${item.unlock_event_iso_time || '--'}`);
+  document.getElementById('m_running').textContent = error
+    || (unlockedChannels.length ? `脱锁：${unlockedChannels.join('；')}` : (running ? '记录中' : '停止'));
+  document.getElementById('m_cycles').textContent = status.cycles_written || 0;
   document.getElementById('m_rows').textContent = status.rows_written || 0;
+  const csvElement = document.getElementById('m_csv');
+  csvElement.textContent = status.csv_file ? status.csv_file.split(/[\\/]/).pop() : '--';
+  csvElement.title = status.csv_file || '';
 
-  if (point) {
-    document.getElementById('m_mean').textContent = Number(point.mean_v).toExponential(6);
-    document.getElementById('m_rel').textContent = point.rel_std_percent === null
-      ? '--'
-      : Number(point.rel_std_percent).toFixed(4) + '%';
-  } else {
-    document.getElementById('m_mean').textContent = '--';
-    document.getElementById('m_rel').textContent = '--';
-  }
-
-  updateDetails(status);
-  drawTrend();
+  const configuredChannels = activeSettings && Array.isArray(activeSettings.channels)
+    ? activeSettings.channels.map(item => typeof item === 'string' ? item : item.channel)
+    : channelDrafts.map(item => item.channel);
+  ensureChannelPanels(configuredChannels);
+  updateChannelPanels(status, configuredChannels);
 }
 
-function updateDetails(status) {
-  const point = status.latest_point;
-  const rows = document.getElementById('detailRows');
-  if (!point) {
-    rows.innerHTML = `
-      <tr><td>CSV</td><td>${status.csv_file || '--'}</td></tr>
-      <tr><td>最新时间</td><td>--</td></tr>
-      <tr><td>标准差 / V</td><td>--</td></tr>
-      <tr><td>峰峰值 / V</td><td>--</td></tr>
-      <tr><td>估计功率</td><td>--</td></tr>
-    `;
-    return;
-  }
-
-  rows.innerHTML = `
-    <tr><td>CSV</td><td class="mono">${status.csv_file || '--'}</td></tr>
-    <tr><td>最新时间</td><td>${point.iso_time}</td></tr>
-    <tr><td>标准差 / V</td><td>${Number(point.std_v).toExponential(6)}</td></tr>
-    <tr><td>峰峰值 / V</td><td>${Number(point.peak_to_peak_v).toExponential(6)}</td></tr>
-    <tr><td>估计功率</td><td>${Number(point.power_estimate).toExponential(6)}</td></tr>
-  `;
+function ensureChannelPanels(channels) {
+  const signature = JSON.stringify(channels);
+  if (signature === panelSignature) return;
+  panelSignature = signature;
+  document.getElementById('channelPanels').innerHTML = channels.map((channel, index) => `
+    <section class="channel-panel">
+      <div class="channel-panel-header">
+        <div class="channel-panel-title">${escapeHtml(channel)}</div>
+        <div id="unlock_badge_${index}" class="unlock-badge">未启用</div>
+      </div>
+      <div class="channel-metrics">
+        <div class="channel-metric"><label>均值 / V</label><div id="channel_mean_${index}">--</div></div>
+        <div class="channel-metric"><label>标准差 / V</label><div id="channel_std_${index}">--</div></div>
+        <div class="channel-metric"><label>相对标准差</label><div id="channel_rel_${index}">--</div></div>
+      </div>
+      <div class="channel-plot"><canvas id="trendCanvas_${index}"></canvas></div>
+      <div id="channel_detail_${index}" class="channel-detail">等待数据...</div>
+    </section>
+  `).join('');
 }
 
-function drawTrend() {
-  const canvas = document.getElementById('trendCanvas');
+function lookupChannelValue(values, channel) {
+  if (!values) return null;
+  if (values[channel] !== undefined) return values[channel];
+  const shortName = channel.includes('/') ? channel.split('/').pop() : channel;
+  const fullName = channel.includes('/') ? channel : `Dev2/${channel}`;
+  return values[shortName] ?? values[fullName] ?? null;
+}
+
+function formatExponential(value) {
+  return value === null || value === undefined || !Number.isFinite(Number(value))
+    ? '--'
+    : Number(value).toExponential(6);
+}
+
+function updateChannelPanels(status, channels) {
+  channels.forEach((channel, index) => {
+    const point = lookupChannelValue(status.latest_points, channel);
+    const unlock = lookupChannelValue(status.unlock_status, channel);
+    const points = lookupChannelValue(status.recent_points_by_channel, channel) || [];
+    document.getElementById(`channel_mean_${index}`).textContent = point ? formatExponential(point.mean_v) : '--';
+    document.getElementById(`channel_std_${index}`).textContent = point ? formatExponential(point.std_v) : '--';
+    document.getElementById(`channel_rel_${index}`).textContent = point && point.rel_std_percent !== null
+      ? Number(point.rel_std_percent).toFixed(4) + '%'
+      : '--';
+
+    const badge = document.getElementById(`unlock_badge_${index}`);
+    badge.className = 'unlock-badge';
+    if (!unlock || !unlock.enabled) {
+      badge.textContent = '未启用';
+    } else if (unlock.state === 'waiting') {
+      badge.textContent = '等待首点';
+    } else if (unlock.state === 'unlocked') {
+      badge.classList.add('unlocked');
+      badge.textContent = `脱锁 · ${unlock.unlock_event_iso_time || '--'}`;
+    } else {
+      badge.classList.add('locked');
+      badge.textContent = '锁定范围内';
+    }
+
+    const rangeText = unlock && unlock.enabled
+      ? `${formatExponential(unlock.min_v)} 至 ${formatExponential(unlock.max_v)} V`
+      : '未启用';
+    const currentState = unlock && unlock.enabled
+      ? (unlock.outside_range ? '本点越界' : '本点在范围内')
+      : '不判断';
+    document.getElementById(`channel_detail_${index}`).textContent = point
+      ? `时间 ${point.iso_time} · ${point.samples} 点 · 峰峰值 ${formatExponential(point.peak_to_peak_v)} V · 功率估计 ${formatExponential(point.power_estimate)} · 脱锁范围 ${rangeText} · ${currentState}`
+      : `等待数据 · 脱锁范围 ${rangeText}`;
+    drawChannelTrend(document.getElementById(`trendCanvas_${index}`), points, CHANNEL_COLORS[index % CHANNEL_COLORS.length]);
+  });
+}
+
+function drawChannelTrend(canvas, points, color) {
+  if (!canvas) return;
   const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = Math.max(400, Math.floor(rect.width * devicePixelRatio));
-  canvas.height = Math.max(260, Math.floor(rect.height * devicePixelRatio));
+  canvas.width = Math.max(360, Math.floor(rect.width * devicePixelRatio));
+  canvas.height = Math.max(220, Math.floor(rect.height * devicePixelRatio));
   const ctx = canvas.getContext('2d');
   const w = canvas.width;
   const h = canvas.height;
@@ -977,9 +1453,8 @@ function drawTrend() {
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, w, h);
 
-  const points = latestStatus && latestStatus.recent_points ? latestStatus.recent_points : [];
-  const padX = 58 * devicePixelRatio;
-  const padY = 34 * devicePixelRatio;
+  const padX = 56 * devicePixelRatio;
+  const padY = 30 * devicePixelRatio;
   const x0 = padX;
   const y0 = padY;
   const plotW = w - 2 * padX;
@@ -991,7 +1466,7 @@ function drawTrend() {
 
   ctx.fillStyle = '#657386';
   ctx.font = `${12 * devicePixelRatio}px Consolas`;
-  ctx.fillText('power_estimate / mean voltage trend', x0, 22 * devicePixelRatio);
+  ctx.fillText('mean voltage trend / V', x0, 20 * devicePixelRatio);
 
   if (points.length < 2) {
     ctx.fillText('等待数据...', x0 + 12 * devicePixelRatio, y0 + 28 * devicePixelRatio);
@@ -999,7 +1474,7 @@ function drawTrend() {
   }
 
   const xs = points.map(p => Number(p.elapsed_s));
-  const ys = points.map(p => Number(p.power_estimate));
+  const ys = points.map(p => Number(p.mean_v));
   const minX = xs[0];
   const maxX = xs[xs.length - 1];
   let minY = Math.min(...ys);
@@ -1015,11 +1490,11 @@ function drawTrend() {
   ctx.beginPath();
   points.forEach((p, i) => {
     const x = x0 + ((Number(p.elapsed_s) - minX) / Math.max(1e-12, maxX - minX)) * plotW;
-    const y = y0 + (1 - (Number(p.power_estimate) - minY) / Math.max(1e-30, maxY - minY)) * plotH;
+    const y = y0 + (1 - (Number(p.mean_v) - minY) / Math.max(1e-30, maxY - minY)) * plotH;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
-  ctx.strokeStyle = '#1f6feb';
+  ctx.strokeStyle = color;
   ctx.lineWidth = 1.6 * devicePixelRatio;
   ctx.stroke();
 
@@ -1028,7 +1503,19 @@ function drawTrend() {
   ctx.fillText(`y ${minY.toExponential(3)}-${maxY.toExponential(3)}`, x0 + 180 * devicePixelRatio, h - 10 * devicePixelRatio);
 }
 
-window.addEventListener('resize', drawTrend);
+function drawAllTrends() {
+  if (!latestStatus) return;
+  const settings = latestStatus.running
+    ? latestStatus.settings
+    : (latestStatus.armed ? latestStatus.armed_settings : null);
+  const channels = settings && Array.isArray(settings.channels)
+    ? settings.channels.map(item => typeof item === 'string' ? item : item.channel)
+    : channelDrafts.map(item => item.channel);
+  updateChannelPanels(latestStatus, channels);
+}
+
+window.addEventListener('resize', drawAllTrends);
+applyChannelList();
 refreshStatus(false);
 pollTimer = setInterval(() => refreshStatus(false), 1000);
 </script>
