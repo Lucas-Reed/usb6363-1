@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from typing import Any
 
-from two_peak.viewer_capture import get_frame_stream_status
+from two_peak.viewer_capture import get_frame_stream_status, start_area_trend
 
 
 class _FakeDaq:
@@ -25,6 +25,17 @@ class _FakeDaq:
 
     def get_ai_frame_stream_status(self) -> dict[str, Any]:
         return dict(self.frame_status)
+
+
+class _FakeTrendLogger:
+    """保存慢漂启动参数，验证后端是否覆盖浏览器缓存的旧来源。"""
+
+    def __init__(self) -> None:
+        self.arguments: dict[str, Any] = {}
+
+    def start(self, **kwargs: Any) -> dict[str, Any]:
+        self.arguments = dict(kwargs)
+        return {"running": True, "settings": dict(kwargs)}
 
 
 class ViewerStreamSourceTests(unittest.TestCase):
@@ -58,6 +69,32 @@ class ViewerStreamSourceTests(unittest.TestCase):
         self.assertTrue(status["running"])
         self.assertEqual(status["frame_id"], 5)
         self.assertEqual(status["stream_source"], "frame_stream")
+
+    def test_area_trend_ignores_stale_legacy_source_from_browser(self) -> None:
+        daq = _FakeDaq(
+            unified_status={
+                "running": True,
+                "frame_id": 20,
+                "settings": {"channels": ["Dev2/ai0", "Dev2/ai1", "Dev2/ai2"]},
+            },
+            frame_status={"running": False, "frame_id": 0},
+        )
+        trend_logger = _FakeTrendLogger()
+        state = SimpleNamespace(daq=daq, trend_logger=trend_logger)
+
+        status = start_area_trend(
+            state,
+            {
+                "stream_source": "frame_stream",
+                "channels": "ai0",
+                "area_left": 10,
+                "area_right": 20,
+            },
+        )
+
+        self.assertTrue(status["running"])
+        self.assertEqual(trend_logger.arguments["stream_source"], "unified_stream")
+        self.assertEqual(trend_logger.arguments["channels"], ["ai0"])
 
 
 if __name__ == "__main__":

@@ -262,6 +262,19 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
     if (area2_left in (None, "")) != (area2_right in (None, "")):
         raise ValueError("area2_left and area2_right must be set together")
 
+    # 双峰慢漂现在属于统一 AI 流的消费者，不能再相信浏览器隐藏字段里的旧值。
+    # 浏览器可能缓存很久以前的页面并提交 frame_stream；如果后端照单全收，就会创建
+    # 一个看似运行、实际上永远读不到统一流数据的记录线程。
+    channels = parse_channels(body.get("channels", ["ai0", "ai1"]))
+    unified_status = state.daq.get_unified_ai_stream_status()
+    if not unified_status.get("running"):
+        detail = unified_status.get("error")
+        message = "统一 AI 流未运行，请先在 8768 控制台启动统一采集"
+        if detail:
+            message += f"。底层错误：{detail}"
+        raise RuntimeError(message)
+    _ensure_unified_has_channels(unified_status, channels)
+
     return state.trend_logger.start(
         analysis_channel_index=int(body.get("analysis_channel_index", 0)),
         area_left=int(area_left),
@@ -277,8 +290,8 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
         auto_track_smooth_window=int(body.get("auto_track_smooth_window", 9)),
         auto_track_max_shift=int(body.get("auto_track_max_shift", 5)),
         poll_interval=float(body.get("poll_interval", 0.05)),
-        stream_source=stream_source_from_body(body),
-        channels=parse_channels(body.get("channels", ["ai0", "ai1"])),
+        stream_source="unified_stream",
+        channels=channels,
         window_voltage_mode=str(body.get("window_voltage_mode", "none")),
         record_full_frame=_as_bool(body.get("record_full_frame", False)),
         window_voltage_output_dir=Path(

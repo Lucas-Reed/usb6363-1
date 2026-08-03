@@ -447,9 +447,9 @@ class AreaTrendLogger:
                     try:
                         status = self._get_stream_status(settings)
                         if status.get("running") is not True and not status.get("has_frame"):
-                            self._set_error("AI stream is not running and has no frame")
-                            time.sleep(float(settings["poll_interval"]))
-                            continue
+                            # 采集源根本没有启动时继续轮询不会产生数据，却会让 WebUI
+                            # 长期显示 running=true。把它作为明确的启动/运行错误结束记录。
+                            raise RuntimeError("AI stream is not running and has no frame")
 
                         frames, has_more = self._get_stream_frames(
                             settings,
