@@ -42,6 +42,7 @@ from usb6363_client import DEFAULT_BASE_URL
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8767
+DEFAULTS_PATH = Path("data") / "power_drift_defaults.json"
 
 
 @dataclass
@@ -49,6 +50,7 @@ class PowerDriftChannelSettings:
     """某一个 AI 通道的长漂显示、换算和脱锁判断参数。"""
 
     channel: str
+    note: str
     power_per_volt: float
     zero_voltage: float
     unlock_enabled: bool
@@ -85,7 +87,7 @@ class PowerDriftWebState:
     - 后台线程中的错误信息。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, defaults_path: Path = DEFAULTS_PATH) -> None:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
@@ -106,6 +108,9 @@ class PowerDriftWebState:
         self._session_id: str | None = None
         self._trigger_unix_time: float | None = None
         self._start_after_frame_id = 0
+        # 默认值属于实验运行配置，保存在 data/ 下而不是写死到 Python 代码中。
+        self._defaults_path = defaults_path
+        self._user_defaults = self._load_user_defaults()
 
     def start(
         self,
@@ -292,6 +297,54 @@ class PowerDriftWebState:
                 raise FileNotFoundError("还没有 CSV 文件")
             return self._csv_path
 
+    def active_defaults(self) -> dict[str, Any]:
+        """返回前端启动时应加载的默认值及其来源。"""
+
+        with self._lock:
+            parameters = _factory_default_parameters()
+            parameters.update(self._user_defaults)
+            parameters["defaults_source"] = "user" if self._user_defaults else "factory"
+            parameters["defaults_file"] = str(self._defaults_path.resolve())
+            return parameters
+
+    def save_defaults(self, settings: PowerDriftWebSettings) -> dict[str, Any]:
+        """把当前完整参数保存为用户默认值，备注也随通道一起保存。"""
+
+        parameters = _settings_for_json(settings)
+        if parameters is None:
+            raise RuntimeError("没有可以保存的默认参数")
+        with self._lock:
+            self._defaults_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = self._defaults_path.with_suffix(".json.tmp")
+            temporary_path.write_text(
+                json.dumps(parameters, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            # 先完整写入临时文件再替换，避免程序意外退出时留下半截 JSON。
+            temporary_path.replace(self._defaults_path)
+            self._user_defaults = dict(parameters)
+        return self.active_defaults()
+
+    def reset_defaults(self) -> dict[str, Any]:
+        """删除用户默认值，恢复代码中提供的程序默认值。"""
+
+        with self._lock:
+            self._user_defaults = {}
+            if self._defaults_path.exists():
+                self._defaults_path.unlink()
+        return self.active_defaults()
+
+    def _load_user_defaults(self) -> dict[str, Any]:
+        """8767 启动时读取上次保存的默认参数。"""
+
+        if not self._defaults_path.exists():
+            return {}
+        try:
+            data = json.loads(self._defaults_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def _worker(
         self,
         settings: PowerDriftWebSettings,
@@ -309,6 +362,7 @@ class PowerDriftWebState:
             for item in settings.channels
         ]
         fieldnames = list(PowerDriftPoint.__dataclass_fields__) + [
+            "channel_note",
             "unlock_enabled",
             "unlock_min_v",
             "unlock_max_v",
@@ -435,6 +489,8 @@ def make_handler(state: PowerDriftWebState):
                     self._send_html(HTML_PAGE)
                 elif parsed.path == "/api/status":
                     self._send_json(state.status())
+                elif parsed.path == "/api/defaults":
+                    self._send_json(state.active_defaults())
                 elif parsed.path == "/api/download":
                     self._send_csv_file(state.latest_csv_path())
                 else:
@@ -450,6 +506,11 @@ def make_handler(state: PowerDriftWebState):
                 if parsed.path == "/api/start":
                     settings = _settings_from_body(self._read_json())
                     self._send_json(state.start(settings))
+                elif parsed.path == "/api/defaults/save":
+                    settings = _settings_from_body(self._read_json())
+                    self._send_json(state.save_defaults(settings))
+                elif parsed.path == "/api/defaults/reset":
+                    self._send_json(state.reset_defaults())
                 elif parsed.path == "/api/arm":
                     settings = _settings_from_body(self._read_json())
                     self._send_json(state.arm(settings))
@@ -538,6 +599,7 @@ def _settings_from_body(body: dict[str, Any]) -> PowerDriftWebSettings:
         raw_channels = [
             {
                 "channel": body.get("channel", "ai2"),
+                "note": body.get("note", ""),
                 "power_per_volt": body.get("power_per_volt", 1.0),
                 "zero_voltage": body.get("zero_voltage", 0.0),
                 "unlock_enabled": body.get("unlock_enabled", False),
@@ -573,6 +635,7 @@ def _settings_from_body(body: dict[str, Any]) -> PowerDriftWebSettings:
         channels.append(
             PowerDriftChannelSettings(
                 channel=channel,
+                note=str(raw_item.get("note", "")).strip(),
                 power_per_volt=float(raw_item.get("power_per_volt", 1.0)),
                 zero_voltage=float(raw_item.get("zero_voltage", 0.0)),
                 unlock_enabled=unlock_enabled,
@@ -667,6 +730,7 @@ def _initial_unlock_status(channel: PowerDriftChannelSettings) -> dict[str, Any]
 
     return {
         "channel": channel.channel,
+        "note": channel.note,
         "enabled": channel.unlock_enabled,
         "state": "waiting" if channel.unlock_enabled else "disabled",
         "min_v": channel.unlock_min_v,
@@ -712,6 +776,7 @@ def _record_with_unlock_status(
     record = asdict(point)
     record.update(
         {
+            "channel_note": channel.note,
             "unlock_enabled": channel.unlock_enabled,
             "unlock_min_v": channel.unlock_min_v,
             "unlock_max_v": channel.unlock_max_v,
@@ -723,6 +788,7 @@ def _record_with_unlock_status(
     )
     status = {
         "channel": channel.channel,
+        "note": channel.note,
         "enabled": channel.unlock_enabled,
         "state": state,
         "min_v": channel.unlock_min_v,
@@ -763,6 +829,37 @@ def _settings_for_json(settings: PowerDriftWebSettings | None) -> dict[str, Any]
     data = asdict(settings)
     data["output_dir"] = str(settings.output_dir)
     return data
+
+
+def _factory_default_parameters() -> dict[str, Any]:
+    """返回 8767 在用户尚未保存配置时使用的程序默认值。"""
+
+    return {
+        "channels": [
+            {
+                "channel": channel,
+                "note": "",
+                "power_per_volt": 1.0,
+                "zero_voltage": 0.0,
+                "unlock_enabled": False,
+                "unlock_min_v": None,
+                "unlock_max_v": None,
+            }
+            for channel in ("ai0", "ai1", "ai2")
+        ],
+        "data_source": "unified_stream",
+        "interval": 1.0,
+        "samples": 1000,
+        "rate": 1000.0,
+        "terminal_config": "DIFF",
+        "min_val": -10.0,
+        "max_val": 10.0,
+        "timeout": 10.0,
+        "duration": None,
+        "output_dir": str(DEFAULT_OUTPUT_DIR),
+        "api_base_url": DEFAULT_BASE_URL,
+        "allow_busy_ai": False,
+    }
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -928,6 +1025,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     margin-bottom: 8px;
   }
   .channel-panel-title { font-size: 15px; font-weight: 700; }
+  .channel-panel-note { margin-top: 2px; color: var(--muted); font-size: 12px; }
   .unlock-badge {
     border: 1px solid var(--line);
     border-radius: 999px;
@@ -1068,6 +1166,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label>底层 API</label>
   <input id="api_base_url" value="http://127.0.0.1:8765">
   <label class="inline"><input id="allow_busy_ai" type="checkbox"> 允许 AI 忙时继续</label>
+  <div class="actions" style="margin-top:8px;">
+    <button class="secondary" id="saveDefaultsBtn" onclick="saveDefaults()">保存为默认值</button>
+    <button class="secondary" id="resetDefaultsBtn" onclick="resetDefaults()">恢复程序默认值</button>
+  </div>
 
   <div class="actions">
     <button class="green" id="startBtn" onclick="startMonitor()">开始记录</button>
@@ -1107,7 +1209,7 @@ const CHANNEL_COLORS = ['#1f6feb', '#16833a', '#b05a00', '#8b5cf6', '#c62828', '
 const COMMON_SETTING_IDS = [
   'channel_list', 'applyChannelsBtn', 'data_source', 'interval', 'duration',
   'samples', 'rate', 'terminal_config', 'min_val', 'max_val', 'timeout',
-  'output_dir', 'api_base_url', 'allow_busy_ai',
+  'output_dir', 'api_base_url', 'allow_busy_ai', 'saveDefaultsBtn', 'resetDefaultsBtn',
 ];
 
 function escapeHtml(value) {
@@ -1135,6 +1237,7 @@ function readChannelDrafts() {
     const unlockEnabled = document.getElementById(`channel_unlock_${index}`).checked;
     return {
       channel: draft.channel,
+      note: document.getElementById(`channel_note_${index}`).value.trim(),
       power_per_volt: Number(document.getElementById(`channel_power_${index}`).value),
       zero_voltage: Number(document.getElementById(`channel_zero_${index}`).value),
       unlock_enabled: unlockEnabled,
@@ -1149,6 +1252,10 @@ function renderChannelSettings() {
   container.innerHTML = channelDrafts.map((draft, index) => `
     <section class="channel-config">
       <div class="channel-config-title">${escapeHtml(draft.channel)}</div>
+      <label>备注</label>
+      <input id="channel_note_${index}" class="channel-setting" type="text"
+             value="${escapeHtml(draft.note ?? '')}" placeholder="例如：总功率 PD"
+             oninput="updateDraftNote(${index})">
       <div class="grid2">
         <div>
           <label>功率/电压系数</label>
@@ -1191,6 +1298,7 @@ function applyChannelList() {
     }
     channelDrafts = parseChannelList().map(channel => oldDrafts.get(channel.toLowerCase()) || {
       channel,
+      note: '',
       power_per_volt: 1,
       zero_voltage: 0,
       unlock_enabled: false,
@@ -1198,11 +1306,17 @@ function applyChannelList() {
       unlock_max_v: '',
     });
     renderChannelSettings();
-    ensureChannelPanels(channelDrafts.map(item => item.channel));
+    ensureChannelPanels(channelDrafts);
     setStatus(`已应用 ${channelDrafts.length} 个通道。`, 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }
+}
+
+function updateDraftNote(index) {
+  channelDrafts[index].note = document.getElementById(`channel_note_${index}`).value.trim();
+  panelSignature = '';
+  ensureChannelPanels(channelDrafts);
 }
 
 function toggleUnlock(index) {
@@ -1247,6 +1361,79 @@ async function postJson(path, body) {
     throw new Error(data.error || '请求失败');
   }
   return data;
+}
+
+function setControlValue(id, value) {
+  const element = document.getElementById(id);
+  if (!element) return;
+  if (element.type === 'checkbox') {
+    element.checked = Boolean(value);
+  } else {
+    element.value = value === null || value === undefined ? '' : value;
+  }
+}
+
+function applyDefaultsToUi(defaults) {
+  const channels = Array.isArray(defaults.channels) && defaults.channels.length
+    ? defaults.channels
+    : [{channel: 'ai0'}, {channel: 'ai1'}, {channel: 'ai2'}];
+  channelDrafts = channels.map(item => typeof item === 'string'
+    ? {
+        channel: item,
+        note: '',
+        power_per_volt: 1,
+        zero_voltage: 0,
+        unlock_enabled: false,
+        unlock_min_v: '',
+        unlock_max_v: '',
+      }
+    : {...item, note: item.note || ''});
+  document.getElementById('channel_list').value = channelDrafts.map(item => item.channel).join(',');
+
+  [
+    'data_source', 'interval', 'duration', 'samples', 'rate', 'terminal_config',
+    'min_val', 'max_val', 'timeout', 'output_dir', 'api_base_url', 'allow_busy_ai',
+  ].forEach(id => setControlValue(id, defaults[id]));
+  renderChannelSettings();
+  panelSignature = '';
+  ensureChannelPanels(channelDrafts);
+}
+
+async function loadDefaults(showMessage = true) {
+  try {
+    const response = await fetch('/api/defaults');
+    const defaults = await response.json();
+    if (!response.ok || defaults.ok === false) {
+      throw new Error(defaults.error || '读取默认值失败');
+    }
+    applyDefaultsToUi(defaults);
+    if (showMessage) {
+      const source = defaults.defaults_source === 'user' ? '用户默认值' : '程序默认值';
+      setStatus(`已加载${source}。`, 'ok');
+    }
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function saveDefaults() {
+  try {
+    const defaults = await postJson('/api/defaults/save', getSettings());
+    applyDefaultsToUi(defaults);
+    setStatus(`当前参数和通道备注已保存为默认值：${defaults.defaults_file}`, 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function resetDefaults() {
+  try {
+    const defaults = await postJson('/api/defaults/reset', {});
+    applyDefaultsToUi(defaults);
+    setStatus('已恢复程序默认值。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
 }
 
 async function startMonitor() {
@@ -1362,20 +1549,26 @@ function updateStatus(status) {
   csvElement.title = status.csv_file || '';
 
   const configuredChannels = activeSettings && Array.isArray(activeSettings.channels)
-    ? activeSettings.channels.map(item => typeof item === 'string' ? item : item.channel)
-    : channelDrafts.map(item => item.channel);
+    ? activeSettings.channels
+    : channelDrafts;
   ensureChannelPanels(configuredChannels);
   updateChannelPanels(status, configuredChannels);
 }
 
 function ensureChannelPanels(channels) {
-  const signature = JSON.stringify(channels);
+  const channelViews = channels.map(item => typeof item === 'string'
+    ? {channel: item, note: ''}
+    : {channel: item.channel, note: item.note || ''});
+  const signature = JSON.stringify(channelViews);
   if (signature === panelSignature) return;
   panelSignature = signature;
-  document.getElementById('channelPanels').innerHTML = channels.map((channel, index) => `
+  document.getElementById('channelPanels').innerHTML = channelViews.map((item, index) => `
     <section class="channel-panel">
       <div class="channel-panel-header">
-        <div class="channel-panel-title">${escapeHtml(channel)}</div>
+        <div>
+          <div class="channel-panel-title">${escapeHtml(item.channel)}</div>
+          ${item.note ? `<div class="channel-panel-note">${escapeHtml(item.note)}</div>` : ''}
+        </div>
         <div id="unlock_badge_${index}" class="unlock-badge">未启用</div>
       </div>
       <div class="channel-metrics">
@@ -1404,7 +1597,8 @@ function formatExponential(value) {
 }
 
 function updateChannelPanels(status, channels) {
-  channels.forEach((channel, index) => {
+  channels.forEach((item, index) => {
+    const channel = typeof item === 'string' ? item : item.channel;
     const point = lookupChannelValue(status.latest_points, channel);
     const unlock = lookupChannelValue(status.unlock_status, channel);
     const points = lookupChannelValue(status.recent_points_by_channel, channel) || [];
@@ -1509,15 +1703,18 @@ function drawAllTrends() {
     ? latestStatus.settings
     : (latestStatus.armed ? latestStatus.armed_settings : null);
   const channels = settings && Array.isArray(settings.channels)
-    ? settings.channels.map(item => typeof item === 'string' ? item : item.channel)
-    : channelDrafts.map(item => item.channel);
+    ? settings.channels
+    : channelDrafts;
   updateChannelPanels(latestStatus, channels);
 }
 
 window.addEventListener('resize', drawAllTrends);
-applyChannelList();
-refreshStatus(false);
-pollTimer = setInterval(() => refreshStatus(false), 1000);
+async function initializePage() {
+  await loadDefaults(false);
+  await refreshStatus(false);
+  pollTimer = setInterval(() => refreshStatus(false), 1000);
+}
+initializePage();
 </script>
 </body>
 </html>

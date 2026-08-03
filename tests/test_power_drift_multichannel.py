@@ -69,6 +69,7 @@ class PowerDriftSettingsTests(unittest.TestCase):
                 "channels": [
                     {
                         "channel": "ai0",
+                        "note": "激光器总功率",
                         "power_per_volt": 2.0,
                         "zero_voltage": 0.1,
                         "unlock_enabled": True,
@@ -82,6 +83,7 @@ class PowerDriftSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual([item.channel for item in settings.channels], ["ai0", "ai1"])
+        self.assertEqual(settings.channels[0].note, "激光器总功率")
         self.assertEqual(settings.channels[0].power_per_volt, 2.0)
         self.assertTrue(settings.channels[0].unlock_enabled)
         self.assertIsNone(settings.channels[1].unlock_min_v)
@@ -119,6 +121,7 @@ class UnlockStatusTests(unittest.TestCase):
     def test_first_unlock_time_is_latched_after_signal_recovers(self) -> None:
         channel = PowerDriftChannelSettings(
             channel="ai0",
+            note="测试通道",
             power_per_volt=1.0,
             zero_voltage=0.0,
             unlock_enabled=True,
@@ -153,12 +156,14 @@ class MultiChannelWorkerTests(unittest.TestCase):
                     "channels": [
                         {
                             "channel": "ai0",
+                            "note": "参考功率",
                             "unlock_enabled": True,
                             "unlock_min_v": 0.0,
                             "unlock_max_v": 1.0,
                         },
                         {
                             "channel": "ai1",
+                            "note": "实验信号",
                             "unlock_enabled": True,
                             "unlock_min_v": 0.0,
                             "unlock_max_v": 1.0,
@@ -195,6 +200,46 @@ class MultiChannelWorkerTests(unittest.TestCase):
             self.assertEqual(len(rows), status["rows_written"])
             first_cycle = [row for row in rows if row["index"] == "1"]
             self.assertEqual({row["channel"] for row in first_cycle}, {"ai0", "ai1"})
+            self.assertEqual(
+                {row["channel_note"] for row in first_cycle},
+                {"参考功率", "实验信号"},
+            )
+
+
+class PowerDriftDefaultsTests(unittest.TestCase):
+    """默认值必须写入磁盘，并能在模拟服务重启后恢复。"""
+
+    def test_channel_notes_survive_state_recreation(self) -> None:
+        Path("data").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=Path("data")) as temp_dir:
+            defaults_path = Path(temp_dir) / "power_drift_defaults.json"
+            settings = _settings_from_body(
+                {
+                    "channels": [
+                        {
+                            "channel": "ai2",
+                            "note": "腔后功率探测器",
+                            "power_per_volt": 2.5,
+                        }
+                    ],
+                    "interval": 2.0,
+                }
+            )
+
+            first_state = PowerDriftWebState(defaults_path=defaults_path)
+            saved = first_state.save_defaults(settings)
+            recreated_state = PowerDriftWebState(defaults_path=defaults_path)
+            loaded = recreated_state.active_defaults()
+
+            self.assertEqual(saved["defaults_source"], "user")
+            self.assertEqual(loaded["defaults_source"], "user")
+            self.assertEqual(loaded["channels"][0]["note"], "腔后功率探测器")
+            self.assertEqual(loaded["channels"][0]["power_per_volt"], 2.5)
+            self.assertEqual(loaded["interval"], 2.0)
+
+            reset = recreated_state.reset_defaults()
+            self.assertEqual(reset["defaults_source"], "factory")
+            self.assertFalse(defaults_path.exists())
 
 
 if __name__ == "__main__":
