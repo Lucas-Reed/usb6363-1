@@ -761,7 +761,8 @@ def _record_with_unlock_status(
         if outside_range and event is None:
             event = (
                 point.unix_time,
-                datetime.fromtimestamp(point.unix_time).isoformat(timespec="seconds"),
+                # 带 UTC 偏移的 ISO 时间可以明确表示绝对时刻，避免只看到相对秒数。
+                _local_iso_time(point.unix_time),
             )
 
     if not channel.unlock_enabled:
@@ -807,6 +808,15 @@ def _optional_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _local_iso_time(timestamp: float) -> str:
+    """把 Unix 时间转换为带本地 UTC 偏移的绝对时间字符串。"""
+
+    # Windows 对很早年份的历史时区转换支持不一致；固定使用当前本地时区对象，
+    # 对实验中的当前时间和测试构造的旧时间戳都能稳定工作。
+    local_timezone = datetime.now().astimezone().tzinfo
+    return datetime.fromtimestamp(timestamp, tz=local_timezone).isoformat(timespec="seconds")
 
 
 def _bool_value(value: Any) -> bool:
@@ -1006,7 +1016,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     min-height: 0;
     overflow: auto;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    /* 每个通道独占一整行，图高仍由 .channel-plot 保持为 220 px。 */
+    grid-template-columns: minmax(0, 1fr);
     align-content: start;
     gap: 10px;
   }
@@ -1036,6 +1047,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .unlock-badge.locked { color: var(--green); border-color: #84c798; background: #f1fbf4; }
   .unlock-badge.unlocked { color: var(--red); border-color: #e2a0a0; background: #fff3f3; }
+  .unlock-time {
+    margin: 6px 0 2px;
+    color: var(--red);
+    font-size: 13px;
+    font-weight: 700;
+  }
   .channel-metrics {
     display: grid;
     grid-template-columns: repeat(3, minmax(100px, 1fr));
@@ -1539,7 +1556,7 @@ function updateStatus(status) {
   }
   const unlockedChannels = Object.values(status.unlock_status || {})
     .filter(item => item && item.state === 'unlocked')
-    .map(item => `${item.channel} ${item.unlock_event_iso_time || '--'}`);
+    .map(item => `${item.channel} 脱锁于 ${formatAbsoluteTime(item)}`);
   document.getElementById('m_running').textContent = error
     || (unlockedChannels.length ? `脱锁：${unlockedChannels.join('；')}` : (running ? '记录中' : '停止'));
   document.getElementById('m_cycles').textContent = status.cycles_written || 0;
@@ -1576,6 +1593,7 @@ function ensureChannelPanels(channels) {
         <div class="channel-metric"><label>标准差 / V</label><div id="channel_std_${index}">--</div></div>
         <div class="channel-metric"><label>相对标准差</label><div id="channel_rel_${index}">--</div></div>
       </div>
+      <div id="unlock_time_${index}" class="unlock-time" hidden></div>
       <div class="channel-plot"><canvas id="trendCanvas_${index}"></canvas></div>
       <div id="channel_detail_${index}" class="channel-detail">等待数据...</div>
     </section>
@@ -1596,6 +1614,24 @@ function formatExponential(value) {
     : Number(value).toExponential(6);
 }
 
+function formatAbsoluteTime(unlock) {
+  if (!unlock) return '--';
+  const unixTime = Number(unlock.unlock_event_unix_time);
+  if (Number.isFinite(unixTime)) {
+    return new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    }).format(new Date(unixTime * 1000));
+  }
+  return unlock.unlock_event_iso_time || '--';
+}
+
 function updateChannelPanels(status, channels) {
   channels.forEach((item, index) => {
     const channel = typeof item === 'string' ? item : item.channel;
@@ -1609,14 +1645,19 @@ function updateChannelPanels(status, channels) {
       : '--';
 
     const badge = document.getElementById(`unlock_badge_${index}`);
+    const unlockTime = document.getElementById(`unlock_time_${index}`);
     badge.className = 'unlock-badge';
+    unlockTime.hidden = true;
+    unlockTime.textContent = '';
     if (!unlock || !unlock.enabled) {
       badge.textContent = '未启用';
     } else if (unlock.state === 'waiting') {
       badge.textContent = '等待首点';
     } else if (unlock.state === 'unlocked') {
       badge.classList.add('unlocked');
-      badge.textContent = `脱锁 · ${unlock.unlock_event_iso_time || '--'}`;
+      badge.textContent = '脱锁';
+      unlockTime.hidden = false;
+      unlockTime.textContent = `脱锁时间（本地绝对时间）：${formatAbsoluteTime(unlock)}`;
     } else {
       badge.classList.add('locked');
       badge.textContent = '锁定范围内';

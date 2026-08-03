@@ -139,6 +139,9 @@ class UnlockStatusTests(unittest.TestCase):
 
         self.assertEqual(locked["state"], "locked")
         self.assertEqual(unlocked["state"], "unlocked")
+        self.assertIsNotNone(
+            datetime.fromisoformat(str(unlocked["unlock_event_iso_time"])).tzinfo
+        )
         self.assertEqual(recovered["state"], "unlocked")
         self.assertFalse(recovered["outside_range"])
         self.assertEqual(recovered["unlock_event_unix_time"], event[0])
