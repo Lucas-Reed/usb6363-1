@@ -17,6 +17,34 @@ two_peak_viewer.py / power_drift_webui.py / 其他子程序
 
 ## 正常启动顺序
 
+### 一键启动或重启
+
+Windows 下推荐使用项目根目录的服务管理脚本。它统一管理 8765–8768，
+并把后台输出保存到 `data/runtime_logs/`：
+
+```powershell
+# 启动尚未运行的服务
+powershell -ExecutionPolicy Bypass -File .\manage_services.ps1 -Action Start
+
+# 安全停止任务后重启全部服务
+powershell -ExecutionPolicy Bypass -File .\manage_services.ps1 -Action Restart
+
+# 只查看状态
+powershell -ExecutionPolicy Bypass -File .\manage_services.ps1 -Action Status
+
+# 停止全部服务
+powershell -ExecutionPolicy Bypass -File .\manage_services.ps1 -Action Stop
+```
+
+不熟悉 PowerShell 时，可以直接双击 `restart_services.cmd`。它会执行一次完整重启，
+并在窗口中显示四个服务的端口和 PID。
+
+重启前如果 unified AI stream 正在健康运行，脚本会临时记住它的通道、采样率、
+点数和 PFI 参数，并在 8765 重启后恢复。功率锁定、AO 扫描、双峰记录和功率慢漂
+不会自动恢复，避免无人确认时继续输出 AO 或写实验文件。
+
+### 手动启动顺序
+
 1. 检查硬件是否能被 NI-DAQmx 看到：
 
 ```powershell
