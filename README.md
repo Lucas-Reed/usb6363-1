@@ -43,6 +43,18 @@ powershell -ExecutionPolicy Bypass -File .\manage_services.ps1 -Action Stop
 点数和 PFI 参数，并在 8765 重启后恢复。功率锁定、AO 扫描、双峰记录和功率慢漂
 不会自动恢复，避免无人确认时继续输出 AO 或写实验文件。
 
+脚本不仅检查端口，还会实际请求每个服务的 HTTP 健康地址。`Status` 中各状态含义：
+
+```text
+RUNNING    进程存在，并且 HTTP 接口能够正常响应
+UNHEALTHY  正确的程序仍占用端口，但 HTTP 接口已经失去响应
+STOPPED    端口没有服务
+FOREIGN    端口被本项目以外的程序占用
+```
+
+执行 `Start` 时如果发现 `UNHEALTHY`，脚本会替换失去响应的进程；执行 `Restart`
+则会先尽力停止记录和 AO 任务，再按 8765、8766、8767、8768 的顺序重新启动。
+
 ### 手动启动顺序
 
 1. 检查硬件是否能被 NI-DAQmx 看到：

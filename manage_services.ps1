@@ -15,12 +15,14 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogDirectory = Join-Path $ProjectRoot "data\runtime_logs"
 $PythonExecutable = (Get-Command python -ErrorAction Stop).Source
 
-# 端口和入口文件是双重身份检查。停止进程前两者必须同时匹配，避免误杀其他软件。
+# 端口、入口文件和 HTTP 健康地址共同描述一个服务。
+# 停止进程前仍要求端口和入口文件同时匹配，避免误杀其他软件；
+# 判断“能不能使用”时还会请求 HealthPath，避免把只占着端口的僵死服务当成正常服务。
 $Services = @(
-    [pscustomobject]@{ Name = "usb6363-core"; Port = 8765; Script = "usb6363_server.py" };
-    [pscustomobject]@{ Name = "two-peak-viewer"; Port = 8766; Script = "two_peak_viewer.py" };
-    [pscustomobject]@{ Name = "power-drift-webui"; Port = 8767; Script = "power_drift_webui.py" };
-    [pscustomobject]@{ Name = "ai-stream-console"; Port = 8768; Script = "ai_stream_console.py" }
+    [pscustomobject]@{ Name = "usb6363-core"; Port = 8765; Script = "usb6363_server.py"; HealthPath = "/health" };
+    [pscustomobject]@{ Name = "two-peak-viewer"; Port = 8766; Script = "two_peak_viewer.py"; HealthPath = "/" };
+    [pscustomobject]@{ Name = "power-drift-webui"; Port = 8767; Script = "power_drift_webui.py"; HealthPath = "/api/status" };
+    [pscustomobject]@{ Name = "ai-stream-console"; Port = 8768; Script = "ai_stream_console.py"; HealthPath = "/api/status" }
 )
 
 function Get-PortProcessInfo {
@@ -55,6 +57,27 @@ function Test-PortListening {
         -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
+function Test-ServiceHealthy {
+    param(
+        [Parameter(Mandatory)]$Service,
+        [int]$TimeoutSeconds = 2
+    )
+
+    try {
+        # 直接请求 HTTP，不先依赖 Get-NetTCPConnection。这样即使当前 PowerShell
+        # 没有读取系统 TCP 表的权限，也仍然能判断网页服务是否真的可用。
+        # 这里不解析具体业务字段；只要服务能及时返回 2xx，就说明 HTTP 线程仍能处理请求。
+        $response = Invoke-WebRequest `
+            -UseBasicParsing `
+            -Uri "http://127.0.0.1:$($Service.Port)$($Service.HealthPath)" `
+            -TimeoutSec $TimeoutSeconds
+        return [int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 300
+    }
+    catch {
+        return $false
+    }
+}
+
 function Invoke-OptionalPost {
     param(
         [Parameter(Mandatory)][string]$Url,
@@ -80,7 +103,11 @@ function Invoke-OptionalPost {
 
 function Get-UnifiedRestoreSettings {
     # 只保存健康运行中的统一流。已经停止或带错误的流不会被自动重新启动。
-    if (-not (Test-PortListening -Port 8765)) {
+    $coreService = $Services | Where-Object { $_.Port -eq 8765 } | Select-Object -First 1
+    if (-not (Test-ServiceHealthy -Service $coreService)) {
+        if (Test-PortListening -Port 8765) {
+            Write-Warning "usb6363-core is listening, but its HTTP API is unresponsive; unified settings cannot be restored."
+        }
         return $null
     }
 
@@ -114,20 +141,20 @@ function Get-UnifiedRestoreSettings {
 
 function Stop-RunningTasks {
     # 先停可能写 AO 的任务，再停记录器，最后才释放底层 AI task。
-    if (Test-PortListening -Port 8766) {
+    $viewerService = $Services | Where-Object { $_.Port -eq 8766 } | Select-Object -First 1
+    $powerService = $Services | Where-Object { $_.Port -eq 8767 } | Select-Object -First 1
+    $coreService = $Services | Where-Object { $_.Port -eq 8765 } | Select-Object -First 1
+
+    if (Test-ServiceHealthy -Service $viewerService) {
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/power_lock/stop"
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/ao_scan/stop"
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/test_sync/stop"
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/trend/stop"
-        # unified_stream 模式下，这个接口只让查看器脱离，不会提前停止统一流。
-        Invoke-OptionalPost `
-            -Url "http://127.0.0.1:8766/api/stream/stop" `
-            -Body @{ stream_source = "unified_stream" }
     }
-    if (Test-PortListening -Port 8767) {
+    if (Test-ServiceHealthy -Service $powerService) {
         Invoke-OptionalPost -Url "http://127.0.0.1:8767/api/stop" -TimeoutSeconds 12
     }
-    if (Test-PortListening -Port 8765) {
+    if (Test-ServiceHealthy -Service $coreService) {
         Invoke-OptionalPost -Url "http://127.0.0.1:8765/api/ai/unified/stop" -TimeoutSeconds 12
         Invoke-OptionalPost -Url "http://127.0.0.1:8765/api/ai/frame_stream/stop" -TimeoutSeconds 12
         Invoke-OptionalPost -Url "http://127.0.0.1:8765/api/ai/clear" -TimeoutSeconds 12
@@ -157,7 +184,7 @@ function Stop-LabServices {
     }
 }
 
-function Wait-ServicePort {
+function Wait-ServiceReady {
     param(
         [Parameter(Mandatory)]$Service,
         [int]$TimeoutSeconds = 12
@@ -165,7 +192,7 @@ function Wait-ServicePort {
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        if (Test-PortListening -Port $Service.Port) {
+        if (Test-ServiceHealthy -Service $Service) {
             return $true
         }
         Start-Sleep -Milliseconds 150
@@ -178,11 +205,23 @@ function Start-LabService {
 
     $existing = Get-PortProcessInfo -Service $Service
     if ($null -ne $existing) {
-        if ($existing.Expected) {
-            Write-Host "[--] $($Service.Name) is already running (PID $($existing.ProcessId))."
-            return
+        if (-not $existing.Expected) {
+            throw "Port $($Service.Port) is owned by an unexpected process: $($existing.CommandLine)"
         }
-        throw "Port $($Service.Port) is owned by an unexpected process: $($existing.CommandLine)"
+    }
+
+    if (Test-ServiceHealthy -Service $Service) {
+        $pidText = if ($null -eq $existing) { "unknown" } else { [string]$existing.ProcessId }
+        Write-Host "[--] $($Service.Name) is already running (PID $pidText)."
+        return
+    }
+
+    if ($null -ne $existing) {
+        # 入口文件正确但 HTTP 不响应，说明这个进程已经不能继续提供服务。
+        # Start 也会修复这种“假运行”状态，不必要求用户先手动 Stop。
+        Write-Warning "$($Service.Name) owns port $($Service.Port), but its HTTP API is unresponsive; replacing PID $($existing.ProcessId)."
+        Stop-Process -Id $existing.ProcessId -Force
+        Start-Sleep -Milliseconds 500
     }
 
     New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
@@ -198,19 +237,23 @@ function Start-LabService {
         -RedirectStandardError $stderrPath `
         -PassThru
 
-    if (-not (Wait-ServicePort -Service $Service)) {
+    if (-not (Wait-ServiceReady -Service $Service)) {
         $errorTail = if (Test-Path $stderrPath) {
             (Get-Content -LiteralPath $stderrPath -Tail 20 -ErrorAction SilentlyContinue) -join [Environment]::NewLine
         } else {
             "No error log was created."
         }
-        throw "$($Service.Name) did not listen on port $($Service.Port).`n$errorTail"
+        Stop-Process -Id $processObject.Id -Force -ErrorAction SilentlyContinue
+        throw "$($Service.Name) did not become HTTP healthy on port $($Service.Port).`n$errorTail"
     }
     Write-Host "[OK] Started $($Service.Name) on http://127.0.0.1:$($Service.Port) (PID $($processObject.Id))."
 }
 
 function Start-LabServices {
-    param($UnifiedRestoreSettings)
+    param(
+        $UnifiedRestoreSettings,
+        [bool]$RestoreWasChecked = $false
+    )
 
     foreach ($service in @($Services | Sort-Object Port)) {
         Start-LabService -Service $service
@@ -231,24 +274,39 @@ function Start-LabServices {
             Write-Warning "Services are running, but unified stream restore failed: $($_.Exception.Message)"
         }
     }
-    else {
-        Write-Host "[--] Unified AI stream was not running before this action; it was not auto-started."
+    elseif ($RestoreWasChecked) {
+        Write-Host "[--] Unified AI stream was not healthy/running before restart; it was not auto-started."
     }
 }
 
 function Show-LabServiceStatus {
     $rows = foreach ($service in $Services) {
         $info = Get-PortProcessInfo -Service $service
+        $healthy = Test-ServiceHealthy -Service $service
+        $state = if ($null -ne $info -and -not $info.Expected) {
+            "FOREIGN"
+        }
+        elseif ($healthy) {
+            "RUNNING"
+        }
+        elseif ($null -ne $info) {
+            "UNHEALTHY"
+        }
+        else {
+            "STOPPED"
+        }
+
         [pscustomobject]@{
             Service = $service.Name
             Port = $service.Port
-            State = if ($null -eq $info) { "STOPPED" } elseif ($info.Expected) { "RUNNING" } else { "FOREIGN" }
+            State = $state
             PID = if ($null -eq $info) { "--" } else { $info.ProcessId }
         }
     }
     $rows | Format-Table -AutoSize
 
-    if (Test-PortListening -Port 8765) {
+    $coreService = $Services | Where-Object { $_.Port -eq 8765 } | Select-Object -First 1
+    if (Test-ServiceHealthy -Service $coreService) {
         try {
             $unified = Invoke-RestMethod `
                 -Uri "http://127.0.0.1:8765/api/ai/unified/status" `
@@ -266,13 +324,13 @@ Write-Host "USB-6363 service manager: $Action"
 
 switch ($Action) {
     "Start" {
-        Start-LabServices -UnifiedRestoreSettings $null
+        Start-LabServices -UnifiedRestoreSettings $null -RestoreWasChecked $false
         Show-LabServiceStatus
     }
     "Restart" {
         $restoreSettings = Get-UnifiedRestoreSettings
         Stop-LabServices
-        Start-LabServices -UnifiedRestoreSettings $restoreSettings
+        Start-LabServices -UnifiedRestoreSettings $restoreSettings -RestoreWasChecked $true
         Show-LabServiceStatus
     }
     "Stop" {
