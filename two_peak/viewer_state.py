@@ -49,6 +49,9 @@ class ViewerState:
         self.power_lock = PowerLockController(
             daq=self.daq,
             trend_logger=self.trend_logger,
+            # 每次锁定单独记录采样峰、锁定峰、实际比值、PI 误差和 AO 输出，
+            # 便于实验结束后判断稳定效果以及排查达到限幅的时段。
+            output_dir=sample_dir.parent / "power_lock_runs",
         )
         # 临时同步测试只协调现有记录器，不直接接触采集卡。
         self.sync_test = SyncTestCoordinator(

@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import csv
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from typing import Any
 
-from two_peak.power_lock import PowerLockController, _read_feedback_value
+from two_peak.power_lock import (
+    RATIO_TARGET_MODE,
+    PowerLockController,
+    _read_feedback_value,
+    _validate_controller,
+)
 
 
 class _FakeDaq:
@@ -34,12 +42,65 @@ class _FakeDaq:
 
 
 class _FakeTrendLogger:
-    """始终提供一个有效面积反馈值。"""
+    """每次查询都提供一个新的有效面积统计点。"""
+
+    def __init__(self) -> None:
+        self._frame_id = 0
+        self._lock = threading.Lock()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            self._frame_id += 1
+            frame_id = self._frame_id
+        return {
+            "running": True,
+            "settings": {"record_hz": 100.0},
+            "latest_stats": {
+                "frame_id": frame_id,
+                "unix_time": 1000.0 + frame_id * 0.01,
+                "window_revision": 1,
+                "area_ema": 8.0,
+            },
+        }
+
+
+class _FixedFrameTrendLogger:
+    """始终返回同一个 frame_id，用来验证旧数据不会被重复积分。"""
 
     def status(self) -> dict[str, Any]:
         return {
             "running": True,
-            "latest_stats": {"area_ema": 8.0},
+            "settings": {"record_hz": 1.0},
+            "latest_stats": {
+                "frame_id": 1,
+                "unix_time": 1001.0,
+                "window_revision": 1,
+                "area_ema": 8.0,
+            },
+        }
+
+
+class _RatioTrendLogger:
+    """提供同一时刻的 A/B 双峰统计，供比例锁定线程测试。"""
+
+    def __init__(self) -> None:
+        self._frame_id = 0
+        self._lock = threading.Lock()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            self._frame_id += 1
+            frame_id = self._frame_id
+        return {
+            "running": True,
+            "settings": {"record_hz": 100.0},
+            "latest_stats": {
+                "frame_id": frame_id,
+                "unix_time": 1000.0 + frame_id * 0.01,
+                "window_revision": 1,
+                "area_ema": 8.0,
+                "area2_ema": 3.0,
+            },
         }
 
 
@@ -50,6 +111,9 @@ def _controller(**overrides: Any) -> dict[str, Any]:
         "name": "EOM",
         "channel": "ao0",
         "feedback_field": "area_ema",
+        "target_mode": "fixed",
+        "reference_field": "",
+        "follow_ratio": 1.0,
         "target": 10.0,
         "initial_voltage": 2.0,
         "min_voltage": 1.0,
@@ -104,8 +168,64 @@ class PowerLockFeedbackTests(unittest.TestCase):
         self.assertIsNone(_read_feedback_value({}, "top_ema"))
         self.assertIsNone(_read_feedback_value({}, "top2_ema"))
 
+    def test_peak_height_ema_falls_back_to_recent_mean(self) -> None:
+        """峰高 EMA 关闭时也应退回最近 N 帧均值。"""
+
+        latest = {
+            "peak_height_ema": None,
+            "peak_height_mean": 0.052,
+            "peak2_height_ema": None,
+            "peak2_height_mean": 0.031,
+        }
+        self.assertAlmostEqual(_read_feedback_value(latest, "peak_height_ema"), 0.052)
+        self.assertAlmostEqual(_read_feedback_value(latest, "peak2_height_ema"), 0.031)
+
+    def test_ratio_mode_rejects_mismatched_measurement_types(self) -> None:
+        """面积锁定峰不能错误引用采样峰的 Top 或峰高。"""
+
+        with self.assertRaisesRegex(ValueError, "reference_field"):
+            _validate_controller(
+                _controller(
+                    feedback_field="area2_ema",
+                    target_mode=RATIO_TARGET_MODE,
+                    reference_field="top_ema",
+                    follow_ratio=0.5,
+                )
+            )
+
 
 class PowerLockRuntimeUpdateTests(unittest.TestCase):
+    def test_ratio_lock_uses_reference_peak_without_writing_a_second_ao(self) -> None:
+        """比例模式只根据采样峰计算动态目标，并只写锁定峰的一路 AO。"""
+
+        daq = _FakeDaq()
+        lock = PowerLockController(daq, _FakeTrendLogger())  # type: ignore[arg-type]
+        controller = _controller(
+            name="AOM",
+            channel="ao1",
+            feedback_field="area2_ema",
+            target_mode=RATIO_TARGET_MODE,
+            reference_field="area_ema",
+            follow_ratio=0.5,
+        )
+        state = lock._update_one_controller(
+            controller,
+            {"voltage": 2.0, "integral": 0.0, "measurement_revision": 1},
+            {
+                "frame_id": 12,
+                "window_revision": 1,
+                "area_ema": 8.0,
+                "area2_ema": 3.0,
+            },
+            dt=1.0,
+        )
+
+        self.assertAlmostEqual(state["reference_value"], 8.0)
+        self.assertAlmostEqual(state["target"], 4.0)
+        self.assertAlmostEqual(state["actual_ratio"], 0.375)
+        self.assertAlmostEqual(state["relative_error"], 0.25)
+        self.assertEqual([row["channel"] for row in daq.snapshot()], ["ao1"])
+
     def test_measurement_window_revision_resets_integral(self) -> None:
         """面积边界改变后，PI 只能从新测量口径重新累计积分。"""
 
@@ -178,6 +298,107 @@ class PowerLockRuntimeUpdateTests(unittest.TestCase):
         lock = PowerLockController(_FakeDaq(), _FakeTrendLogger())  # type: ignore[arg-type]
         with self.assertRaisesRegex(RuntimeError, "not running"):
             lock.update_parameters([_controller()], update_s=1.0)
+
+    def test_same_stats_frame_is_not_applied_twice(self) -> None:
+        """轮询快于统计频率时，同一个 frame_id 只能触发一次 PI 更新。"""
+
+        daq = _FakeDaq()
+        lock = PowerLockController(daq, _FixedFrameTrendLogger())  # type: ignore[arg-type]
+        lock.start([_controller()], update_s=0.01)
+        try:
+            _wait_until(lambda: lock.status()["iterations"] >= 1)
+            time.sleep(0.08)
+            self.assertEqual(lock.status()["iterations"], 1)
+            # 第一次是启动时写初始值，第二次才是 frame_id=1 的 PI 更新。
+            self.assertEqual(len(daq.snapshot()), 2)
+        finally:
+            lock.stop()
+
+    def test_follow_ratio_can_be_changed_while_running(self) -> None:
+        """运行中改变目标比值应保留 AO 电压，并从下一条新统计点生效。"""
+
+        daq = _FakeDaq()
+        lock = PowerLockController(daq, _RatioTrendLogger())  # type: ignore[arg-type]
+        controller = _controller(
+            name="AOM",
+            channel="ao1",
+            feedback_field="area2_ema",
+            target_mode=RATIO_TARGET_MODE,
+            reference_field="area_ema",
+            follow_ratio=0.5,
+            kp=0.0,
+            ki=0.0,
+        )
+        lock.start([controller], update_s=0.01)
+        try:
+            _wait_until(lambda: lock.status()["iterations"] >= 1)
+            voltage_before = float(lock.status()["states"][0]["voltage"])
+            updated_controller = dict(controller)
+            updated_controller["follow_ratio"] = 0.6
+            updated = lock.update_parameters([updated_controller], update_s=0.005)
+            self.assertEqual(updated["parameter_revision"], 2)
+            self.assertAlmostEqual(updated["states"][0]["voltage"], voltage_before)
+
+            old_iterations = updated["iterations"]
+            _wait_until(lambda: lock.status()["iterations"] > old_iterations)
+            state = lock.status()["states"][0]
+            self.assertAlmostEqual(state["follow_ratio"], 0.6)
+            self.assertAlmostEqual(state["target"], 4.8)
+            self.assertTrue(all(row["channel"] == "ao1" for row in daq.snapshot()))
+        finally:
+            lock.stop()
+
+    def test_lock_updates_are_written_to_analysis_csv(self) -> None:
+        """锁定日志应包含比值、误差、AO 和源 frame_id。"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daq = _FakeDaq()
+            lock = PowerLockController(
+                daq,
+                _RatioTrendLogger(),  # type: ignore[arg-type]
+                output_dir=Path(temp_dir),
+            )
+            controller = _controller(
+                name="AOM",
+                channel="ao1",
+                feedback_field="area2_ema",
+                target_mode=RATIO_TARGET_MODE,
+                reference_field="area_ema",
+                follow_ratio=0.5,
+                kp=0.0,
+                ki=0.0,
+            )
+            lock.start([controller], update_s=0.01)
+            try:
+                _wait_until(lambda: lock.status()["records_written"] >= 2)
+            finally:
+                status = lock.stop()
+
+            csv_path = Path(status["csv_file"])
+            self.assertTrue(csv_path.is_file())
+            with csv_path.open("r", newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            self.assertGreaterEqual(len(rows), 2)
+            self.assertEqual(rows[0]["target_mode"], RATIO_TARGET_MODE)
+            self.assertEqual(rows[0]["reference_field"], "area_ema")
+            self.assertAlmostEqual(float(rows[0]["actual_ratio"]), 0.375)
+            self.assertGreater(int(rows[0]["frame_id"]), 0)
+
+    def test_log_directory_failure_does_not_leave_false_running_state(self) -> None:
+        """日志目录不可用时，启动必须完整失败而不是留下半初始化状态。"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_instead_of_directory = Path(temp_dir) / "not_a_directory"
+            file_instead_of_directory.write_text("occupied", encoding="utf-8")
+            lock = PowerLockController(
+                _FakeDaq(),
+                _FakeTrendLogger(),  # type: ignore[arg-type]
+                output_dir=file_instead_of_directory,
+            )
+            with self.assertRaises(OSError):
+                lock.start([_controller()], update_s=0.01)
+            self.assertFalse(lock.status()["running"])
+            self.assertEqual(lock.status()["iterations"], 0)
 
 
 if __name__ == "__main__":
