@@ -24,7 +24,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("buffered_pfi_report.json"))
     args = parser.parse_args()
 
-    channels = [item.strip() for item in args.channels.split(",") if item.strip()]
+    channels = []
+    for item in args.channels.split(","):
+        channel = item.strip()
+        if not channel:
+            continue
+        if "/" not in channel:
+            channel = f"{args.device}/{channel}"
+        channels.append(channel.lstrip("/"))
     print("Starting buffered PFI diagnostic...")
     print(f"device={args.device} channels={channels} rate={args.rate:g} Hz")
     print("PFI0=RISING, PFI1=FALLING")
