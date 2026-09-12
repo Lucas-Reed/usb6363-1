@@ -268,6 +268,125 @@ def create_continuous_ai_task(
         raise
 
 
+def verify_buffered_pfi_with_ai_clock(
+    device_name: str,
+    physical_channels: list[str],
+    rate: float,
+    seconds: float,
+    terminal_config_name: str = "DIFF",
+    min_val: float = -5.0,
+    max_val: float = 5.0,
+    pfi0_counter: str = "ctr0",
+    pfi1_counter: str = "ctr1",
+    block_samples: int = 1000,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Check whether PFI counters can be buffered by the AI sample clock.
+
+    This is a hardware diagnostic only. It does not change the production AI
+    stream. Both counter tasks return one cumulative count per AI sample.
+    """
+    if not physical_channels:
+        raise ValueError("physical_channels must not be empty")
+    if rate <= 0 or seconds <= 0 or block_samples <= 0:
+        raise ValueError("rate, seconds and block_samples must be positive")
+
+    _get_device(device_name)
+    config = _terminal_config(terminal_config_name)
+    nidaqmx_module, acquisition_type, _, _, _ = _load_nidaqmx()
+    ai_task = nidaqmx_module.Task()
+    counter_tasks: list[Any] = []
+    try:
+        for channel in physical_channels:
+            ai_task.ai_channels.add_ai_voltage_chan(
+                channel, terminal_config=config, min_val=min_val, max_val=max_val
+            )
+        input_buffer_samples = max(block_samples * 20, int(rate * 2.0))
+        ai_task.timing.cfg_samp_clk_timing(
+            rate=rate,
+            sample_mode=acquisition_type.CONTINUOUS,
+            samps_per_chan=input_buffer_samples,
+        )
+        ai_task.in_stream.input_buf_size = input_buffer_samples
+        ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+            trigger_source=f"/{device_name}/PFI0",
+            trigger_edge=_edge("RISING"),
+        )
+
+        for counter_name, terminal, edge_name in (
+            (pfi0_counter, f"/{device_name}/PFI0", "RISING"),
+            (pfi1_counter, f"/{device_name}/PFI1", "FALLING"),
+        ):
+            counter_task = nidaqmx_module.Task()
+            channel = counter_task.ci_channels.add_ci_count_edges_chan(
+                f"/{device_name}/{counter_name}",
+                edge=_edge(edge_name),
+                initial_count=0,
+            )
+            channel.ci_count_edges_term = terminal
+            counter_task.timing.cfg_samp_clk_timing(
+                rate=rate,
+                source=f"/{device_name}/ai/SampleClock",
+                sample_mode=acquisition_type.CONTINUOUS,
+                samps_per_chan=block_samples,
+            )
+            counter_tasks.append(counter_task)
+
+        for counter_task in counter_tasks:
+            counter_task.start()
+        ai_task.start()
+
+        total_samples = 0
+        pfi0_changes: list[dict[str, int]] = []
+        pfi1_changes: list[dict[str, int]] = []
+        previous_counts = [None, None]
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            ai_task.read(
+                number_of_samples_per_channel=block_samples,
+                timeout=timeout,
+            )
+            for index, counter_task in enumerate(counter_tasks):
+                raw = counter_task.read(
+                    number_of_samples_per_channel=block_samples,
+                    timeout=timeout,
+                )
+                counts = [int(value) for value in raw]
+                previous = previous_counts[index]
+                if previous is not None:
+                    changes = pfi0_changes if index == 0 else pfi1_changes
+                    for offset, value in enumerate(counts):
+                        if value != previous:
+                            changes.append({
+                                "sample_index": total_samples + offset,
+                                "count": value,
+                            })
+                        previous = value
+                elif counts:
+                    previous = counts[-1]
+                previous_counts[index] = previous
+            total_samples += block_samples
+
+        return {
+            "device": device_name,
+            "channels": physical_channels,
+            "rate_per_channel": rate,
+            "samples_checked": total_samples,
+            "pfi0_changes": pfi0_changes,
+            "pfi1_changes": pfi1_changes,
+            "pfi0_change_count": len(pfi0_changes),
+            "pfi1_change_count": len(pfi1_changes),
+            "aligned_sample_clock": True,
+        }
+    finally:
+        for counter_task in counter_tasks:
+            try:
+                counter_task.close()
+            except Exception:
+                pass
+        ai_task.close()
+
+
 def write_ao_voltage(
     device_name: str,
     physical_channel: str,
