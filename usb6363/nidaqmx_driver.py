@@ -296,18 +296,22 @@ def verify_buffered_pfi_with_ai_clock(
     nidaqmx_module, acquisition_type, _, _, _ = _load_nidaqmx()
     ai_task = nidaqmx_module.Task()
     counter_tasks: list[Any] = []
+    stage = "create AI task"
     try:
+        stage = "add AI channels"
         for channel in physical_channels:
             ai_task.ai_channels.add_ai_voltage_chan(
                 channel, terminal_config=config, min_val=min_val, max_val=max_val
             )
         input_buffer_samples = max(block_samples * 20, int(rate * 2.0))
+        stage = "configure AI timing"
         ai_task.timing.cfg_samp_clk_timing(
             rate=rate,
             sample_mode=acquisition_type.CONTINUOUS,
             samps_per_chan=input_buffer_samples,
         )
         ai_task.in_stream.input_buf_size = input_buffer_samples
+        stage = "configure PFI0 AI start trigger"
         ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
             trigger_source=f"/{device_name}/PFI0",
             trigger_edge=_edge("RISING"),
@@ -317,13 +321,16 @@ def verify_buffered_pfi_with_ai_clock(
             (pfi0_counter, f"/{device_name}/PFI0", "RISING"),
             (pfi1_counter, f"/{device_name}/PFI1", "FALLING"),
         ):
+            stage = f"create {counter_name} counter channel"
             counter_task = nidaqmx_module.Task()
             channel = counter_task.ci_channels.add_ci_count_edges_chan(
                 f"{device_name}/{counter_name}",
                 edge=_edge(edge_name),
                 initial_count=0,
             )
+            stage = f"route {counter_name} counter terminal"
             channel.ci_count_edges_term = terminal
+            stage = f"configure {counter_name} counter sample clock"
             counter_task.timing.cfg_samp_clk_timing(
                 rate=rate,
                 source=f"/{device_name}/ai/SampleClock",
@@ -332,8 +339,10 @@ def verify_buffered_pfi_with_ai_clock(
             )
             counter_tasks.append(counter_task)
 
+        stage = "start counter tasks"
         for counter_task in counter_tasks:
             counter_task.start()
+        stage = "start AI task"
         ai_task.start()
 
         total_samples = 0
@@ -342,11 +351,13 @@ def verify_buffered_pfi_with_ai_clock(
         previous_counts = [None, None]
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            stage = "read AI block"
             ai_task.read(
                 number_of_samples_per_channel=block_samples,
                 timeout=timeout,
             )
             for index, counter_task in enumerate(counter_tasks):
+                stage = f"read counter block {index}"
                 raw = counter_task.read(
                     number_of_samples_per_channel=block_samples,
                     timeout=timeout,
@@ -378,6 +389,8 @@ def verify_buffered_pfi_with_ai_clock(
             "pfi1_change_count": len(pfi1_changes),
             "aligned_sample_clock": True,
         }
+    except Exception as exc:
+        raise RuntimeError(f"{stage}: {exc}") from exc
     finally:
         for counter_task in counter_tasks:
             try:
