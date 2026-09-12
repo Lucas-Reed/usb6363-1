@@ -304,6 +304,7 @@ def start_area_trend(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
             else float(body["trigger_unix_time"])
         ),
         start_after_frame_id=int(body.get("start_after_frame_id", 0)),
+        exclude_pfi1_frames=_as_bool(body.get("exclude_pfi1_frames", False)),
     )
 
 
@@ -347,6 +348,15 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
     frame = state.latest_frame
     if frame is None:
         raise RuntimeError("No frame has been captured yet")
+    if bool(frame.get("pfi1_triggered", False)):
+        return {
+            "excluded": True,
+            "reason": "PFI1 trigger occurred inside this frame",
+            "frame_id": frame.get("frame_id"),
+            "measurements": [],
+            "manual_area": None,
+            "manual_areas": [],
+        }
 
     values = np.asarray(frame["values"], dtype=float)
     if values.ndim != 2 or values.shape[0] < 1:
@@ -551,6 +561,11 @@ def frame_summary(frame: dict[str, Any] | None) -> dict[str, Any] | None:
         "resync_every_frames": frame.get("resync_every_frames"),
         "segment_id": frame.get("segment_id"),
         "segment_frame_id": frame.get("segment_frame_id"),
+        "sample_start": frame.get("sample_start"),
+        "sample_end": frame.get("sample_end"),
+        "pfi0_events": frame.get("pfi0_events", []),
+        "pfi1_events": frame.get("pfi1_events", []),
+        "pfi1_triggered": bool(frame.get("pfi1_triggered", False)),
         "frame_duration_seconds": frame.get("frame_duration_seconds"),
         "frame_duration_ms": frame.get("frame_duration_ms"),
         "frame_rate_hz": frame.get("frame_rate_hz"),

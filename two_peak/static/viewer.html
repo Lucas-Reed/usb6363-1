@@ -290,6 +290,8 @@
   <select id="pick_target">
     <option value="0">P1</option>
     <option value="1">P2</option>
+    <option value="calibration_carrier">EOM 载波</option>
+    <option value="calibration_aom_zero">AOM 零级</option>
     <option value="area_left">面积左零点</option>
     <option value="area_right">面积右零点</option>
     <option value="area2_left">面积 B 左零点</option>
@@ -356,6 +358,39 @@
     <button class="secondary" onclick="measurePeaks()">重新测峰</button>
     <button class="secondary" onclick="clearPeaks()">清空标记</button>
   </div>
+
+  <h2>EOM/AOM 手动校准（仅标注）</h2>
+  <div class="grid2">
+    <div>
+      <label>载波索引</label>
+      <input id="calibration_carrier_index" type="number" step="1" placeholder="点击波形后填入">
+    </div>
+    <div>
+      <label>AOM 零级索引</label>
+      <input id="calibration_aom_zero_index" type="number" step="1" placeholder="点击波形后填入">
+    </div>
+  </div>
+  <div class="grid2">
+    <div>
+      <label>AOM-载波频差 / MHz</label>
+      <input id="calibration_frequency_difference_mhz" type="number" step="0.001" value="110">
+    </div>
+    <div>
+      <label>FSR / MHz</label>
+      <input id="calibration_fsr_mhz" type="number" step="0.001" value="80">
+    </div>
+  </div>
+  <label>分段断点索引（逗号分隔）</label>
+  <input id="calibration_breakpoints" value="2500,7500">
+  <div class="actions">
+    <button class="secondary" onclick="saveCalibration()">保存校准模型</button>
+    <button class="secondary" onclick="generateCalibrationCandidates()">生成候选边带</button>
+  </div>
+  <div id="calibration_status" class="status">未加载校准模型。</div>
+  <table>
+    <thead><tr><th>标注</th><th>索引</th><th>频偏 / MHz</th><th>范围</th></tr></thead>
+    <tbody id="calibrationRows"><tr><td colspan="4">--</td></tr></tbody>
+  </table>
 
   <h2>结果</h2>
   <table>
@@ -431,6 +466,10 @@
   <label class="inline">
     <input id="auto_track_enabled" type="checkbox">
     自动跟随面积窗口内最高点
+  </label>
+  <label class="inline">
+    <input id="exclude_pfi1_frames" type="checkbox" checked>
+    PFI1 触发帧不进入双峰/慢漂统计
   </label>
   <div class="grid2">
     <div>
@@ -818,6 +857,46 @@
     <button class="secondary" id="powerLockApplyBtn" onclick="applyPowerLockParameters()" disabled>应用运行中参数</button>
     <button class="secondary" id="powerLockStopBtn" onclick="stopPowerLock()" disabled>停止锁定</button>
   </div>
+
+  <h2>PFI1 后续窗口与长漂反馈</h2>
+  <div class="grid2">
+    <div><label>PD AI 通道</label><input id="pfi1_pd_channel" value="ai2"></div>
+    <div><label>延迟 / ms</label><input id="pfi1_delay_ms" type="number" value="1" min="0" step="0.1"></div>
+  </div>
+  <div class="grid2">
+    <div><label>窗口点数</label><input id="pfi1_window_samples" type="number" value="200" min="1" step="1"></div>
+    <div><label>脉冲阈值 / V</label><input id="pfi1_threshold" type="number" value="0" step="0.001"></div>
+  </div>
+  <div class="grid2">
+    <div><label>脉冲极性</label><select id="pfi1_polarity"><option value="positive">正脉冲</option><option value="negative">负脉冲</option></select></div>
+    <div><label>EMA alpha</label><input id="pfi1_ema_alpha" type="number" value="0.02" min="0" max="1" step="0.01"></div>
+  </div>
+  <div class="grid2">
+    <div><label>反馈 AO</label><input id="pfi1_ao_channel" value="ao0"></div>
+    <div><label>目标值</label><input id="pfi1_target" type="number" value="0" step="0.001"></div>
+  </div>
+  <div class="grid2">
+    <div><label>初始 AO / V</label><input id="pfi1_initial_voltage" type="number" value="0" step="0.01"></div>
+    <div><label>AO 最小值 / V</label><input id="pfi1_min_voltage" type="number" value="-10" step="0.01"></div>
+  </div>
+  <div class="grid2">
+    <div><label>AO 最大值 / V</label><input id="pfi1_max_voltage" type="number" value="10" step="0.01"></div>
+    <div><label>控制方向</label><select id="pfi1_direction"><option value="1">+1</option><option value="-1">-1</option></select></div>
+  </div>
+  <div class="grid2">
+    <div><label>单步限幅 / V</label><input id="pfi1_max_step_v" type="number" value="0.01" min="0" step="0.001"></div>
+    <div><label>更新间隔 / s</label><input id="pfi1_update_interval" type="number" value="0.05" min="0.001" step="0.01"></div>
+  </div>
+  <div class="grid2">
+    <div><label>Kp</label><input id="pfi1_kp" type="number" value="0" step="0.001"></div>
+    <div><label>Ki</label><input id="pfi1_ki" type="number" value="0" step="0.001"></div>
+  </div>
+  <label>PFI1 反馈状态</label><input id="pfi1_feedback_status" value="停止" readonly>
+  <label>最近窗口结果</label><input id="pfi1_feedback_result" value="--" readonly>
+  <div class="actions">
+    <button class="green" id="pfi1FeedbackStartBtn" onclick="startPfi1Feedback()">启动 PFI1 反馈</button>
+    <button class="secondary" id="pfi1FeedbackStopBtn" onclick="stopPfi1Feedback()" disabled>停止 PFI1 反馈</button>
+  </div>
 </aside>
 
 <main>
@@ -834,6 +913,7 @@ let latestFrame = null;
 let latestMeasurement = null;
 let plotCanvases = [];
 let streamRunning = false;
+let pfi1FeedbackTimer = null;
 let streamTimer = null;
 let streamLastFrameId = 0;
 let streamPollInFlight = false;
@@ -849,6 +929,7 @@ let xViewStart = null;
 let xViewEnd = null;
 let manualAreaHistory = [];
 let manualArea2History = [];
+let calibrationCandidates = [];
 
 function getCaptureParams() {
   return {
@@ -885,6 +966,16 @@ function getMeasureParams() {
   };
 }
 
+function getCalibrationParams() {
+  return {
+    carrier_index: Number(document.getElementById('calibration_carrier_index').value),
+    aom_zero_index: Number(document.getElementById('calibration_aom_zero_index').value),
+    frequency_difference_mhz: Number(document.getElementById('calibration_frequency_difference_mhz').value),
+    fsr_mhz: Number(document.getElementById('calibration_fsr_mhz').value),
+    breakpoints: document.getElementById('calibration_breakpoints').value,
+  };
+}
+
 function getViewParams() {
   return {
     x_start: document.getElementById('x_start').value,
@@ -907,6 +998,7 @@ function getTrendParams() {
     auto_track_enabled: document.getElementById('auto_track_enabled').checked,
     auto_track_smooth_window: Number(document.getElementById('auto_track_smooth_window').value),
     auto_track_max_shift: Number(document.getElementById('auto_track_max_shift').value),
+    exclude_pfi1_frames: document.getElementById('exclude_pfi1_frames').checked,
     window_voltage_mode: document.getElementById('window_voltage_mode').value,
     record_full_frame: document.getElementById('record_full_frame').checked,
     window_voltage_output_dir: document.getElementById('window_voltage_output_dir').value,
@@ -1125,6 +1217,81 @@ async function postJson(path, body) {
   return data;
 }
 
+function setCalibrationStatus(text, kind = '') {
+  const el = document.getElementById('calibration_status');
+  el.textContent = text;
+  el.className = 'status' + (kind ? ` ${kind}` : '');
+}
+
+function applyCalibrationModel(model) {
+  if (!model) return;
+  setInputValue('calibration_carrier_index', model.carrier_index);
+  setInputValue('calibration_aom_zero_index', model.aom_zero_index);
+  setInputValue('calibration_frequency_difference_mhz', model.frequency_difference_mhz);
+  setInputValue('calibration_fsr_mhz', model.fsr_mhz);
+  setInputValue('calibration_breakpoints', (model.breakpoints || [2500, 7500]).join(','));
+}
+
+function updateCalibrationRows(data) {
+  const rows = document.getElementById('calibrationRows');
+  const entries = [];
+  if (data && data.carrier) entries.push(data.carrier);
+  if (data && data.aom_zero) entries.push(data.aom_zero);
+  if (data && Array.isArray(data.candidates)) entries.push(...data.candidates);
+  calibrationCandidates = entries;
+  if (!entries.length) {
+    rows.innerHTML = '<tr><td colspan="4">暂无候选标注</td></tr>';
+    renderPlots();
+    return;
+  }
+  rows.innerHTML = entries.map(item => `
+    <tr><td>${item.label || item.kind}</td><td>${item.index}</td>
+      <td>${Number(item.frequency_offset_mhz).toFixed(3)}</td>
+      <td>${item.in_range === false ? '超出当前帧' : '当前帧'}</td></tr>
+  `).join('');
+  renderPlots();
+}
+
+async function loadCalibration() {
+  try {
+    const response = await fetch('/api/calibration');
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || '读取校准模型失败');
+    if (data.model) {
+      applyCalibrationModel(data.model);
+      setCalibrationStatus('已加载校准模型。', 'ok');
+      await generateCalibrationCandidates(false);
+    } else {
+      setCalibrationStatus('未加载校准模型。');
+    }
+  } catch (err) {
+    setCalibrationStatus(String(err.message || err), 'error');
+  }
+}
+
+async function saveCalibration() {
+  try {
+    const data = await postJson('/api/calibration/save', getCalibrationParams());
+    applyCalibrationModel(data.model);
+    setCalibrationStatus('校准模型已保存；候选标注仅用于显示。', 'ok');
+    await generateCalibrationCandidates(false);
+  } catch (err) {
+    setCalibrationStatus(String(err.message || err), 'error');
+  }
+}
+
+async function generateCalibrationCandidates(showStatus = true) {
+  try {
+    const body = {sample_count: latestFrame && latestFrame.values ? latestFrame.values[0].length : null};
+    const data = await postJson('/api/calibration/candidates', body);
+    applyCalibrationModel(data.model);
+    updateCalibrationRows(data);
+    if (showStatus) setCalibrationStatus('已生成候选边带标注（仅显示，不驱动锁定）。', 'ok');
+  } catch (err) {
+    if (showStatus) setCalibrationStatus(String(err.message || err), 'error');
+  }
+}
+
 async function loadDefaults() {
   try {
     const response = await fetch('/api/defaults');
@@ -1341,6 +1508,9 @@ function updateTrendStatus(status) {
   document.getElementById('trend_records').value = status && status.records_written !== undefined
     ? status.records_written
     : 0;
+  if (!error && status && status.excluded_pfi1_frames) {
+    document.getElementById('trend_status').value += `，排除 PFI1=${status.excluded_pfi1_frames}`;
+  }
   document.getElementById('trend_file').value = status && status.csv_file ? status.csv_file : '';
   const voltage = status && status.window_voltage ? status.window_voltage : {};
   const voltageError = voltage.error ? `错误：${voltage.error}` : '';
@@ -2645,6 +2815,23 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
     ctx.fillText(edge.label, x + 4 * devicePixelRatio, y0 + 32 * devicePixelRatio);
   });
 
+  calibrationCandidates.forEach(item => {
+    const idx = Number(item.index);
+    if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
+    const x = x0 + ((idx - range.start) / Math.max(1, range.end - range.start)) * plotW;
+    ctx.strokeStyle = item.kind === 'carrier' ? '#7c3aed' : item.kind === 'aom_zero' ? '#0891b2' : '#6b7280';
+    ctx.lineWidth = 1.1 * devicePixelRatio;
+    ctx.setLineDash([4 * devicePixelRatio, 3 * devicePixelRatio]);
+    ctx.beginPath();
+    ctx.moveTo(x, y0);
+    ctx.lineTo(x, y0 + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = `${11 * devicePixelRatio}px Segoe UI`;
+    ctx.fillText(item.label || item.kind, x + 3 * devicePixelRatio, y0 + 48 * devicePixelRatio);
+  });
+
   if (latestMeasurement && latestMeasurement.measurements) {
     latestMeasurement.measurements.forEach((m, i) => {
       const idx = m.index;
@@ -2681,6 +2868,11 @@ function handlePlotClick(event, channelIndex) {
     document.getElementById('manual_area2_right').value = idx;
     document.getElementById('pick_target').value = 'area2_left';
     manualArea2History = [];
+  } else if (target === 'calibration_carrier' || target === 'calibration_aom_zero') {
+    document.getElementById(target === 'calibration_carrier'
+      ? 'calibration_carrier_index'
+      : 'calibration_aom_zero_index').value = idx;
+    setCalibrationStatus(`已从波形点击设置${target === 'calibration_carrier' ? '载波' : 'AOM 零级'}索引。`, 'ok');
   } else {
     document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
     document.getElementById('pick_target').value = target === '0' ? '1' : '0';
@@ -2992,6 +3184,80 @@ function updateDualTopTable() {
   `;
 }
 
+function pfi1FeedbackSettings() {
+  const number = id => Number(document.getElementById(id).value);
+  return {
+    pd_channel: document.getElementById('pfi1_pd_channel').value.trim(),
+    sample_rate_hz: Number(document.getElementById('rate').value),
+    delay_ms: number('pfi1_delay_ms'),
+    window_samples: Math.round(number('pfi1_window_samples')),
+    threshold: number('pfi1_threshold'),
+    polarity: document.getElementById('pfi1_polarity').value,
+    ema_alpha: number('pfi1_ema_alpha'),
+    ao_channel: document.getElementById('pfi1_ao_channel').value.trim(),
+    target: number('pfi1_target'),
+    initial_voltage: number('pfi1_initial_voltage'),
+    min_voltage: number('pfi1_min_voltage'),
+    max_voltage: number('pfi1_max_voltage'),
+    direction: Number(document.getElementById('pfi1_direction').value),
+    max_step_v: number('pfi1_max_step_v'),
+    kp: number('pfi1_kp'),
+    ki: number('pfi1_ki'),
+    update_interval: number('pfi1_update_interval'),
+  };
+}
+
+function updatePfi1FeedbackStatus(status) {
+  const running = Boolean(status && status.running);
+  const error = status && status.error ? status.error : '';
+  const result = status && status.latest_result ? status.latest_result : null;
+  document.getElementById('pfi1_feedback_status').value = error || (running ? `运行中，事件 ${status.events_seen || 0}，窗口 ${status.windows_done || 0}` : '停止');
+  document.getElementById('pfi1_feedback_result').value = result
+    ? `value=${formatNumber(result.value, 6)}  EMA=${formatNumber(result.ema, 6)}  pulse=${result.pulse_detected ? 'yes' : 'no'}  AO=${formatNumber(status.ao_value, 5)}`
+    : '--';
+  document.getElementById('pfi1FeedbackStartBtn').disabled = running;
+  document.getElementById('pfi1FeedbackStopBtn').disabled = !running;
+  if (running && pfi1FeedbackTimer === null) {
+    pfi1FeedbackTimer = setInterval(() => refreshPfi1FeedbackStatus(false), 1000);
+  }
+  if (!running && pfi1FeedbackTimer !== null) {
+    clearInterval(pfi1FeedbackTimer);
+    pfi1FeedbackTimer = null;
+  }
+}
+
+async function refreshPfi1FeedbackStatus(showStatus = false) {
+  try {
+    const response = await fetch('/api/pfi1_feedback/status');
+    const status = await response.json();
+    if (!response.ok || status.ok === false) throw new Error(status.error || '查询 PFI1 反馈状态失败');
+    updatePfi1FeedbackStatus(status);
+    if (showStatus && status.running) setStatus('PFI1 长漂反馈正在运行。', 'ok');
+  } catch (err) {
+    if (showStatus) setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function startPfi1Feedback() {
+  try {
+    const status = await postJson('/api/pfi1_feedback/start', pfi1FeedbackSettings());
+    updatePfi1FeedbackStatus(status);
+    setStatus('PFI1 后续窗口反馈已启动。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
+async function stopPfi1Feedback() {
+  try {
+    const status = await postJson('/api/pfi1_feedback/stop', {});
+    updatePfi1FeedbackStatus(status);
+    setStatus('PFI1 后续窗口反馈已停止。', 'ok');
+  } catch (err) {
+    setStatus(String(err.message || err), 'error');
+  }
+}
+
 
 function updateFrameInfo() {
   if (!latestFrame) return;
@@ -3043,6 +3309,7 @@ updatePeakTable();
 updateManualAreaTable();
 updateDualAreaTable();
 loadDefaults();
+loadCalibration();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
 refreshTrendStatus(true);

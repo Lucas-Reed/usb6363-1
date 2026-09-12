@@ -84,6 +84,7 @@ class AreaTrendLogger:
         self._csv_path: Path | None = None
         self._settings: dict[str, Any] = {}
         self._frames_seen = 0
+        self._excluded_pfi1_frames = 0
         self._records_written = 0
         self._last_frame_id = 0
         self._latest_stats: dict[str, Any] | None = None
@@ -121,6 +122,7 @@ class AreaTrendLogger:
         session_id: str | None = None,
         trigger_unix_time: float | None = None,
         start_after_frame_id: int = 0,
+        exclude_pfi1_frames: bool = False,
     ) -> dict[str, Any]:
         """启动长期记录。
 
@@ -215,6 +217,7 @@ class AreaTrendLogger:
                 "session_id": actual_session_id,
                 "trigger_unix_time": trigger_unix_time,
                 "start_after_frame_id": actual_start_after_frame_id,
+                "exclude_pfi1_frames": bool(exclude_pfi1_frames),
                 "window_revision": 1,
             }
 
@@ -243,6 +246,7 @@ class AreaTrendLogger:
             self._csv_path = csv_path
             self._settings = dict(settings)
             self._frames_seen = 0
+            self._excluded_pfi1_frames = 0
             self._records_written = 0
             self._last_frame_id = 0
             self._latest_stats = None
@@ -383,6 +387,7 @@ class AreaTrendLogger:
                 "csv_file": str(self._csv_path.resolve()) if self._csv_path else None,
                 "settings": dict(self._settings),
                 "frames_seen": self._frames_seen,
+                "excluded_pfi1_frames": self._excluded_pfi1_frames,
                 "records_written": self._records_written,
                 "last_frame_id": self._last_frame_id,
                 "window_revision": self._window_revision,
@@ -485,6 +490,19 @@ class AreaTrendLogger:
                                     f"期望 frame_id={expected_frame_id}，实际得到 {frame_id}。"
                                     "记录已停止，避免生成带有隐藏缺口的数据。"
                                 )
+
+                            # PFI1 后续窗口帧是另一套测量业务；启用排除时必须在
+                            # _measure_frame 前拦截，避免进入滑动统计、CSV 或 NPZ。
+                            # 无论是否测量，历史游标都要推进，否则下一轮会反复取到该帧。
+                            if settings.get("exclude_pfi1_frames") and bool(
+                                frame.get("pfi1_triggered", False)
+                            ):
+                                last_seen_frame_id = frame_id
+                                with self._lock:
+                                    self._excluded_pfi1_frames += 1
+                                    self._last_frame_id = frame_id
+                                    self._error = None
+                                continue
 
                             sample = self._measure_frame(frame, settings)
                             samples.append(sample)

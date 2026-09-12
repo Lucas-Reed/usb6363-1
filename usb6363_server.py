@@ -100,6 +100,9 @@ def make_handler(controller: DaqController):
                 elif parsed.path == "/api/ai/unified/buffer":
                     # 读取统一 AI 数据流中某个通道最近的一段缓存。
                     self._send_json(controller.get_unified_ai_buffer(**_ai_buffer_args(query)))
+                elif parsed.path == "/api/ai/unified/range":
+                    # 读取统一连续流中的绝对样本区间，供 PFI1 后续窗口使用。
+                    self._send_json(controller.get_unified_ai_range(**_ai_range_args(query)))
                 elif parsed.path == "/api/ai/unified/stats":
                     # 读取统一 AI 数据流中某个通道最近缓存的统计量。
                     self._send_json(controller.get_unified_ai_stats(**_ai_stats_args(query)))
@@ -164,7 +167,10 @@ def make_handler(controller: DaqController):
                 # LEGACY frame_stream routes: 旧双峰连续采集模型，仅保留兼容。
                 elif parsed.path == "/api/ai/frame_stream/start":
                     # 启动固定点数分帧连续采集。
-                    self._send_json(controller.start_ai_frame_stream(**_ai_frame_stream_body(body)))
+                    legacy_args = _ai_frame_stream_body(body)
+                    for key in ("event_timeline_enabled", "pfi0_counter", "pfi1_counter", "pfi1_edge"):
+                        legacy_args.pop(key, None)
+                    self._send_json(controller.start_ai_frame_stream(**legacy_args))
                 elif parsed.path == "/api/ai/frame_stream/stop":
                     # 停止固定点数分帧连续采集。
                     self._send_json(controller.stop_ai_frame_stream())
@@ -272,6 +278,16 @@ def _ai_buffer_args(query: dict[str, list[str]]) -> dict[str, Any]:
     }
 
 
+def _ai_range_args(query: dict[str, list[str]]) -> dict[str, Any]:
+    """解析统一流绝对样本区间读取参数。"""
+
+    return {
+        "channel": str(_first(query, "channel", "ai0")),
+        "start_sample": int(_first(query, "start_sample", 0)),
+        "end_sample": int(_first(query, "end_sample", 0)),
+    }
+
+
 def _ai_stats_args(query: dict[str, list[str]]) -> dict[str, Any]:
     """把 URL 参数转换成 get_ai_stats 需要的参数类型。"""
 
@@ -369,6 +385,10 @@ def _ai_frame_stream_body(body: dict[str, Any]) -> dict[str, Any]:
         "trigger_source": str(body.get("trigger_source", "PFI0")),
         "trigger_edge": str(body.get("trigger_edge", "RISING")),
         "resync_every_frames": int(body.get("resync_every_frames", 0)),
+        "event_timeline_enabled": _bool_value(body.get("event_timeline_enabled", False)),
+        "pfi0_counter": str(body.get("pfi0_counter", "ctr0")),
+        "pfi1_counter": str(body.get("pfi1_counter", "ctr1")),
+        "pfi1_edge": str(body.get("pfi1_edge", "FALLING")),
     }
 
 

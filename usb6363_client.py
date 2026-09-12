@@ -321,6 +321,10 @@ class Usb6363Client:
         trigger_source: str = "PFI0",
         trigger_edge: str = "RISING",
         resync_every_frames: int = 0,
+        event_timeline_enabled: bool = False,
+        pfi0_counter: str = "ctr0",
+        pfi1_counter: str = "ctr1",
+        pfi1_edge: str = "FALLING",
     ) -> dict[str, Any]:
         """启动统一 AI 数据流。
 
@@ -342,6 +346,10 @@ class Usb6363Client:
                 "trigger_source": trigger_source,
                 "trigger_edge": trigger_edge,
                 "resync_every_frames": resync_every_frames,
+                "event_timeline_enabled": event_timeline_enabled,
+                "pfi0_counter": pfi0_counter,
+                "pfi1_counter": pfi1_counter,
+                "pfi1_edge": pfi1_edge,
             },
         )
 
@@ -390,6 +398,11 @@ class Usb6363Client:
             finished_at = data["finished_at"].astype(np.float64, copy=False)
             values = data["values"].astype(np.float32, copy=False)
             physical_channels = [str(item) for item in data["channels"].tolist()]
+            sample_starts = data["sample_start"].astype(np.int64, copy=False) if "sample_start" in data else np.zeros(len(frame_ids), dtype=np.int64)
+            sample_ends = data["sample_end"].astype(np.int64, copy=False) if "sample_end" in data else sample_starts + values.shape[2]
+            pfi0_json = data["pfi0_events_json"].tolist() if "pfi0_events_json" in data else ["[]"] * len(frame_ids)
+            pfi1_json = data["pfi1_events_json"].tolist() if "pfi1_events_json" in data else ["[]"] * len(frame_ids)
+            pfi1_flags = data["pfi1_triggered"].astype(np.bool_, copy=False) if "pfi1_triggered" in data else np.zeros(len(frame_ids), dtype=np.bool_)
 
             frames = [
                 {
@@ -398,6 +411,11 @@ class Usb6363Client:
                     "segment_frame_id": int(segment_frame_ids[index]),
                     "started_at": float(started_at[index]),
                     "finished_at": float(finished_at[index]),
+                    "sample_start": int(sample_starts[index]),
+                    "sample_end": int(sample_ends[index]),
+                    "pfi0_events": json.loads(str(pfi0_json[index])),
+                    "pfi1_events": json.loads(str(pfi1_json[index])),
+                    "pfi1_triggered": bool(pfi1_flags[index]),
                     "channels": physical_channels,
                     "channel_count": len(physical_channels),
                     "samples_per_channel": int(values.shape[2]),
@@ -415,6 +433,23 @@ class Usb6363Client:
                 "missing_before_first": int(data["missing_before_first"][0]),
                 "has_more": bool(data["has_more"][0]),
             }
+
+    def get_unified_ai_range(
+        self,
+        channel: str,
+        start_sample: int,
+        end_sample: int,
+    ) -> dict[str, Any]:
+        """读取统一连续流中一个绝对 sample index 区间 [start, end)。"""
+
+        return self._get(
+            "/api/ai/unified/range",
+            {
+                "channel": channel,
+                "start_sample": int(start_sample),
+                "end_sample": int(end_sample),
+            },
+        )
 
     def get_unified_ai_latest(self, channel: str = "ai0") -> dict[str, Any]:
         """读取统一 AI 数据流中某个通道的最近一个点。"""

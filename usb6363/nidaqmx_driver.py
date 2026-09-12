@@ -222,6 +222,7 @@ def create_continuous_ai_task(
     max_val: float = 10.0,
     start_trigger_source: str | None = None,
     start_trigger_edge_name: str = "RISING",
+    start_task: bool = True,
 ) -> Any:
     """创建并启动连续 AI Task。
 
@@ -230,6 +231,8 @@ def create_continuous_ai_task(
 
     start_trigger_source 不为 None 时，连续采集会等待这个数字边沿后启动。
     注意：这是“启动触发”，不是每一帧都重新触发。
+    start_task=False 时只配置并返回 task，由调用方负责在相关从属 task
+    （例如共享 AI sample clock 的 buffered counter）启动后调用 task.start()。
     """
 
     config = _terminal_config(terminal_config_name)
@@ -261,11 +264,63 @@ def create_continuous_ai_task(
                 trigger_source=start_trigger_source,
                 trigger_edge=_edge(start_trigger_edge_name),
             )
+        if start_task:
+            task.start()
+        return task
+    except Exception:
+        task.close()
+        raise
+
+
+def create_buffered_pfi_counter_task(
+    device_name: str,
+    physical_counter: str,
+    terminal: str,
+    edge_name: str,
+    sample_clock_source: str,
+    rate: float,
+    samples_per_read: int,
+) -> Any:
+    """Create a counter task that returns cumulative counts on an AI clock."""
+    _get_device(device_name)
+    if rate <= 0 or samples_per_read < 1:
+        raise ValueError("rate must be positive and samples_per_read must be positive")
+    nidaqmx_module, acquisition_type, _, _, _ = _load_nidaqmx()
+    task = nidaqmx_module.Task()
+    try:
+        counter_channel = str(physical_counter)
+        if "/" not in counter_channel:
+            counter_channel = f"{device_name}/{counter_channel}"
+        channel = task.ci_channels.add_ci_count_edges_chan(
+            counter_channel,
+            edge=_edge(edge_name),
+            initial_count=0,
+        )
+        channel.ci_count_edges_term = terminal
+        task.timing.cfg_samp_clk_timing(
+            rate=rate,
+            source=sample_clock_source,
+            sample_mode=acquisition_type.CONTINUOUS,
+            samps_per_chan=samples_per_read,
+        )
         task.start()
         return task
     except Exception:
         task.close()
         raise
+
+
+def read_buffered_pfi_counts(task: Any, samples_per_read: int, timeout: float) -> list[int]:
+    """Read one cumulative counter block sampled by the configured clock."""
+    raw = task.read(number_of_samples_per_channel=samples_per_read, timeout=timeout)
+    if isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        try:
+            values = list(raw)
+        except TypeError:
+            values = [raw]
+    return [int(value) for value in values]
 
 
 def verify_buffered_pfi_with_ai_clock(

@@ -147,6 +147,7 @@ function Stop-RunningTasks {
 
     if (Test-ServiceHealthy -Service $viewerService) {
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/power_lock/stop"
+        Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/pfi1_feedback/stop"
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/ao_scan/stop"
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/test_sync/stop"
         Invoke-OptionalPost -Url "http://127.0.0.1:8766/api/trend/stop"

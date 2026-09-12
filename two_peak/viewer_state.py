@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from two_peak.ao_scan_calibrator import AoScanCalibrator
 from two_peak.config import TwoPeakSettings
+from two_peak.eom_identification import CalibrationModel
 from two_peak.power_lock import PowerLockController
+from two_peak.pfi1_feedback import Pfi1FeedbackController
 from two_peak.sync_test import SyncTestCoordinator
 from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
@@ -28,7 +31,9 @@ class ViewerState:
         # 用户在 WebUI 里点击“保存为默认值”后，会写到这个 JSON 文件。
         # 它放在 data/ 下面，属于实验运行时配置，不进入 git。
         self.defaults_path = sample_dir.parent / "two_peak_defaults.json"
+        self.calibration_path = sample_dir.parent / "eom_aom_calibration.json"
         self.user_defaults = self._load_user_defaults()
+        self.calibration_model = self._load_calibration()
         self.latest_frame: dict[str, Any] | None = None
         self.latest_measurement: dict[str, Any] | None = None
         # 慢漂记录器会在后端线程里读取底层 frame_stream 最新帧并写 CSV。
@@ -53,6 +58,8 @@ class ViewerState:
             # 便于实验结束后判断稳定效果以及排查达到限幅的时段。
             output_dir=sample_dir.parent / "power_lock_runs",
         )
+        # PFI1 后续窗口反馈是可选的独立消费者，默认不运行，不影响已有双峰锁定。
+        self.pfi1_feedback = Pfi1FeedbackController(self.daq)
         # 临时同步测试只协调现有记录器，不直接接触采集卡。
         self.sync_test = SyncTestCoordinator(
             daq=self.daq,
@@ -137,3 +144,95 @@ class ViewerState:
         if not isinstance(data, dict):
             return {}
         return data
+
+    def calibration_status(self) -> dict[str, Any]:
+        """返回当前 EOM/AOM 标定，不包含任何硬件控制状态。"""
+
+        return {
+            "configured": self.calibration_model is not None,
+            "model": self.calibration_model.to_dict() if self.calibration_model else None,
+            "file": str(self.calibration_path.resolve()),
+        }
+
+    def save_calibration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """保存用户手动确认的标定模型。"""
+
+        model_payload = payload.get("model", payload)
+        model_data = dict(model_payload)
+        model_data["updated_at"] = time.time()
+        model = CalibrationModel.from_dict(model_data)
+        sample_count = _frame_sample_count(self.latest_frame)
+        model.validate(sample_count=sample_count)
+        self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
+        self.calibration_path.write_text(
+            json.dumps(model.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.calibration_model = model
+        return self.calibration_status()
+
+    def reset_calibration(self) -> dict[str, Any]:
+        self.calibration_model = None
+        if self.calibration_path.exists():
+            self.calibration_path.unlink()
+        return self.calibration_status()
+
+    def calibration_candidates(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """基于标定模型返回候选边带；该接口不会启动锁定。"""
+
+        if self.calibration_model is None:
+            raise ValueError("no EOM/AOM calibration model has been saved")
+        body = payload or {}
+        sample_count = body.get("sample_count")
+        if sample_count in (None, ""):
+            sample_count = _frame_sample_count(self.latest_frame)
+        sample_count = None if sample_count in (None, "") else int(sample_count)
+        orders = body.get("orders", (-2, -1, 1, 2))
+        if orders in (None, ""):
+            orders = (-2, -1, 1, 2)
+        if isinstance(orders, str):
+            orders = [item.strip() for item in orders.split(",") if item.strip()]
+        candidates = self.calibration_model.candidate_sidebands(
+            sample_count=sample_count,
+            orders=orders,
+        )
+        return {
+            "ok": True,
+            "model": self.calibration_model.to_dict(),
+            "sample_count": sample_count,
+            "candidates": candidates,
+            "carrier": {
+                "kind": "carrier",
+                "label": "EOM carrier",
+                "index": self.calibration_model.carrier_index,
+                "frequency_offset_mhz": 0.0,
+                "in_range": sample_count is None or 0 <= self.calibration_model.carrier_index < sample_count,
+            },
+            "aom_zero": {
+                "kind": "aom_zero",
+                "label": "AOM zero",
+                "index": self.calibration_model.aom_zero_index,
+                "frequency_offset_mhz": self.calibration_model.frequency_difference_mhz,
+                "in_range": sample_count is None or 0 <= self.calibration_model.aom_zero_index < sample_count,
+            },
+            "display_only": True,
+        }
+
+    def _load_calibration(self) -> CalibrationModel | None:
+        if not self.calibration_path.exists():
+            return None
+        try:
+            payload = json.loads(self.calibration_path.read_text(encoding="utf-8"))
+            return CalibrationModel.from_dict(payload)
+        except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+
+def _frame_sample_count(frame: dict[str, Any] | None) -> int | None:
+    if not frame:
+        return None
+    values = frame.get("values")
+    if isinstance(values, list) and values and isinstance(values[0], list):
+        return len(values[0])
+    value = frame.get("samples_per_channel")
+    return int(value) if value not in (None, "") else None

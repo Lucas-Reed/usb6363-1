@@ -235,6 +235,26 @@ HTML_PAGE = r"""<!doctype html>
       <label for="resync_every_frames">每隔 N 帧重新等待触发，0 表示关闭</label>
       <input id="resync_every_frames" type="number" value="0" min="0" step="1" />
 
+      <div class="row">
+        <input id="event_timeline_enabled" type="checkbox" />
+        <label for="event_timeline_enabled" style="margin:0;color:var(--text)">启用 buffered PFI 样本时间轴</label>
+      </div>
+      <div class="grid2">
+        <div>
+          <label for="pfi0_counter">PFI0 计数器</label>
+          <input id="pfi0_counter" value="ctr0" />
+        </div>
+        <div>
+          <label for="pfi1_counter">PFI1 计数器</label>
+          <input id="pfi1_counter" value="ctr1" />
+        </div>
+      </div>
+      <label for="pfi1_edge">PFI1 边沿</label>
+      <select id="pfi1_edge">
+        <option value="FALLING">FALLING</option>
+        <option value="RISING">RISING</option>
+      </select>
+
       <div class="actions">
         <button class="primary" id="startBtn" onclick="startStream()">启动统一流</button>
         <button class="danger" id="stopBtn" onclick="stopStream()">停止统一流</button>
@@ -283,6 +303,10 @@ HTML_PAGE = r"""<!doctype html>
         trigger_source: document.getElementById("trigger_source").value.trim(),
         trigger_edge: document.getElementById("trigger_edge").value,
         resync_every_frames: numberValue("resync_every_frames"),
+        event_timeline_enabled: document.getElementById("event_timeline_enabled").checked,
+        pfi0_counter: document.getElementById("pfi0_counter").value.trim(),
+        pfi1_counter: document.getElementById("pfi1_counter").value.trim(),
+        pfi1_edge: document.getElementById("pfi1_edge").value,
       };
     }
 
@@ -396,6 +420,10 @@ def _start_body_to_kwargs(body: dict[str, Any]) -> dict[str, Any]:
         "trigger_source": str(body.get("trigger_source", "PFI0")),
         "trigger_edge": str(body.get("trigger_edge", "RISING")),
         "resync_every_frames": int(body.get("resync_every_frames", 0)),
+        "event_timeline_enabled": bool(body.get("event_timeline_enabled", False)),
+        "pfi0_counter": str(body.get("pfi0_counter", "ctr0")),
+        "pfi1_counter": str(body.get("pfi1_counter", "ctr1")),
+        "pfi1_edge": str(body.get("pfi1_edge", "FALLING")),
     }
 
 

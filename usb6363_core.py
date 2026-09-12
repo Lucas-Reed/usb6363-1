@@ -50,6 +50,21 @@ AI_CAPTURE_OUTPUT_DIR = "data"
 # 超过这个点数时应该使用 record_ai_to_file，避免 Web/API 被巨大 JSON 拖垮。
 AI_FRAME_MAX_JSON_SAMPLES = 200_000
 
+
+def _counter_transition_samples(
+    counts: list[int], previous: int | None, absolute_start: int
+) -> tuple[list[dict[str, int]], int | None]:
+    """Convert a cumulative buffered counter block to absolute sample events."""
+    if not counts:
+        return [], previous
+    events: list[dict[str, int]] = []
+    last = previous
+    for offset, value in enumerate(counts):
+        if last is not None and value != last:
+            events.append({"sample_index": absolute_start + offset, "count": value})
+        last = value
+    return events, last
+
 # unified stream 的“最新帧”适合实时显示，却无法补回上层程序卡顿期间错过的帧。
 # 因此额外保留一段 float32 历史。128 MiB 是整个历史缓冲的总上限，
 # 不是每个通道各占 128 MiB。
@@ -142,6 +157,10 @@ class DaqController:
         self._unified_history_capacity_frames = 0
         self._unified_history_bytes_per_frame = 0
         self._unified_history_evicted_frames = 0
+        # Absolute-sample ring buffers used by event-timeline consumers.  The
+        # existing latest/buffer fields remain unchanged for legacy callers.
+        self._unified_range_buffers: dict[str, deque[float]] = {}
+        self._unified_sample_cursor = 0
 
     # ---------------------------------------------------------------------
     # 设备信息
@@ -750,6 +769,10 @@ class DaqController:
         trigger_source: str = "PFI0",
         trigger_edge: str = "RISING",
         resync_every_frames: int = 0,
+        event_timeline_enabled: bool = False,
+        pfi0_counter: str = "ctr0",
+        pfi1_counter: str = "ctr1",
+        pfi1_edge: str = "FALLING",
     ) -> dict[str, Any]:
         """启动统一 AI 数据流。
 
@@ -769,6 +792,10 @@ class DaqController:
             raise ValueError("resync_every_frames must be >= 0")
         if resync_every_frames > 0 and not trigger_enabled:
             raise ValueError("resync_every_frames requires trigger_enabled=True")
+        if event_timeline_enabled and not trigger_enabled:
+            raise ValueError("event_timeline_enabled requires trigger_enabled=True")
+        if event_timeline_enabled and resync_every_frames > 0:
+            raise ValueError("event_timeline_enabled cannot be combined with periodic resync")
 
         physical_channels: list[str] = []
         for channel in channels:
@@ -781,6 +808,15 @@ class DaqController:
         physical_trigger_source = None
         if trigger_enabled:
             physical_trigger_source = self._normalize_pfi_terminal(trigger_source)
+
+        physical_pfi0_counter = str(pfi0_counter)
+        physical_pfi1_counter = str(pfi1_counter)
+        normalized_pfi1_edge = str(pfi1_edge).strip().upper()
+        if event_timeline_enabled:
+            physical_pfi0_counter = self._normalize_counter(pfi0_counter)
+            physical_pfi1_counter = self._normalize_counter(pfi1_counter)
+            if normalized_pfi1_edge not in {"RISING", "FALLING"}:
+                raise ValueError("pfi1_edge must be RISING or FALLING")
 
         total_json_samples = len(physical_channels) * samples_per_frame
         if total_json_samples > AI_FRAME_MAX_JSON_SAMPLES:
@@ -826,6 +862,11 @@ class DaqController:
                 "trigger_edge": trigger_edge,
                 "trigger_mode": "periodic_start" if resync_every_frames > 0 else ("start_only" if trigger_enabled else "off"),
                 "resync_every_frames": int(resync_every_frames),
+                "event_timeline_enabled": bool(event_timeline_enabled),
+                "pfi0_counter": physical_pfi0_counter,
+                "pfi1_counter": physical_pfi1_counter,
+                "pfi0_edge": "RISING",
+                "pfi1_edge": normalized_pfi1_edge,
                 "frame_duration_seconds": frame_duration_seconds,
                 "frame_duration_ms": frame_duration_ms,
                 "frame_rate_hz": frame_rate_hz,
@@ -858,6 +899,11 @@ class DaqController:
             self._unified_history_capacity_frames = history_capacity_frames
             self._unified_history_bytes_per_frame = history_bytes_per_frame
             self._unified_history_evicted_frames = 0
+            self._unified_range_buffers = {
+                channel: deque(maxlen=self._ai_buffer_size)
+                for channel in physical_channels
+            }
+            self._unified_sample_cursor = 0
             self._unified_running = True
             thread.start()
 
@@ -910,8 +956,67 @@ class DaqController:
                     if frame_rate_hz > 0
                     else None
                 ),
+                "sample_range_start": max(
+                    0, self._unified_sample_cursor - self._range_buffer_length()
+                ),
+                "sample_range_end": self._unified_sample_cursor,
                 "settings": settings,
             }
+
+    def _range_buffer_length(self) -> int:
+        """Return the current retained sample count for the unified stream."""
+
+        if not self._unified_range_buffers:
+            return 0
+        return min(len(values) for values in self._unified_range_buffers.values())
+
+    def read_unified_ai_range(
+        self, channel: str, start: int, end: int
+    ) -> dict[str, Any]:
+        """Read a half-open absolute sample range from the unified ring buffer."""
+
+        if start < 0 or end <= start:
+            raise ValueError("sample range must satisfy 0 <= start < end")
+        physical_channel = self._normalize_ai_channel(channel)
+        with self._ai_lock:
+            values_buffer = self._unified_range_buffers.get(physical_channel)
+            if values_buffer is None:
+                raise RuntimeError(f"{physical_channel} is not in unified AI stream")
+            stream_end = self._unified_sample_cursor
+            stream_start = max(0, stream_end - len(values_buffer))
+            if start < stream_start or end > stream_end:
+                raise RuntimeError(
+                    f"sample range [{start}, {end}) is unavailable; "
+                    f"retained range is [{stream_start}, {stream_end})"
+                )
+            offset_start = start - stream_start
+            offset_end = end - stream_start
+            values = list(values_buffer)[offset_start:offset_end]
+            settings = dict(self._unified_settings or {})
+            return {
+                "device": self.device_name,
+                "channel": physical_channel,
+                "rate": settings.get("rate_per_channel", 0.0),
+                "sample_start": start,
+                "sample_end": end,
+                "samples": len(values),
+                "values": values,
+                "stream_sample_end": stream_end,
+            }
+
+    def get_unified_ai_range(
+        self, channel: str, start_sample: int, end_sample: int
+    ) -> dict[str, Any]:
+        """Compatibility wrapper for the HTTP/client range API."""
+
+        return self.read_unified_ai_range(channel, start_sample, end_sample)
+
+    def get_unified_ai_range(
+        self, channel: str, start_sample: int, end_sample: int
+    ) -> dict[str, Any]:
+        """HTTP-facing alias for reading an absolute sample range."""
+
+        return self.read_unified_ai_range(channel, start_sample, end_sample)
 
     def get_unified_ai_stream_latest_frame(self) -> dict[str, Any]:
         """返回统一 AI 数据流的最新一帧完整波形。"""
@@ -1010,6 +1115,43 @@ class DaqController:
             ),
             "segment_frame_id": np.asarray(
                 [frame["segment_frame_id"] for frame in selected], dtype=np.int64
+            ),
+            "sample_start": np.asarray(
+                [frame.get("sample_start", 0) for frame in selected], dtype=np.int64
+            ),
+            "sample_end": np.asarray(
+                [frame.get("sample_end", samples_per_frame) for frame in selected],
+                dtype=np.int64,
+            ),
+            "pfi1_triggered": np.asarray(
+                [bool(frame.get("pfi1_triggered", False)) for frame in selected],
+                dtype=np.bool_,
+            ),
+            "pfi0_events_json": np.asarray(
+                [
+                    json.dumps(frame.get("pfi0_events", []), separators=(",", ":"))
+                    for frame in selected
+                ],
+                dtype=np.str_,
+            ),
+            "pfi1_events_json": np.asarray(
+                [
+                    json.dumps(frame.get("pfi1_events", []), separators=(",", ":"))
+                    for frame in selected
+                ],
+                dtype=np.str_,
+            ),
+            "pfi0_events_json": np.asarray(
+                [json.dumps(frame.get("pfi0_events", []), separators=(",", ":")) for frame in selected],
+                dtype=np.str_,
+            ),
+            "pfi1_events_json": np.asarray(
+                [json.dumps(frame.get("pfi1_events", []), separators=(",", ":")) for frame in selected],
+                dtype=np.str_,
+            ),
+            "pfi1_triggered": np.asarray(
+                [bool(frame.get("pfi1_triggered", False)) for frame in selected],
+                dtype=np.bool_,
             ),
             "started_at": np.asarray(
                 [frame["started_at"] for frame in selected], dtype=np.float64
@@ -1356,21 +1498,72 @@ class DaqController:
         channels = list(settings["channels"])
         samples_per_frame = int(settings["samples_per_frame"])
         resync_every_frames = int(settings.get("resync_every_frames", 0))
+        event_timeline_enabled = bool(settings.get("event_timeline_enabled", False))
+        sample_cursor = 0
         segment_id = 0
         try:
             while not stop_event.is_set():
                 segment_id += 1
                 segment_frame_id = 0
-                task = nidaqmx_driver.create_continuous_ai_task(
-                    channels=channels,
-                    rate=float(settings["rate_per_channel"]),
-                    samples_per_read=samples_per_frame,
-                    terminal_config_name=str(settings["terminal_config"]),
-                    min_val=float(settings["min_val"]),
-                    max_val=float(settings["max_val"]),
-                    start_trigger_source=settings["trigger_source"],
-                    start_trigger_edge_name=str(settings["trigger_edge"]),
-                )
+                previous_pfi0_count: int | None = None
+                previous_pfi1_count: int | None = None
+                counter_tasks: list[Any] = []
+                if event_timeline_enabled:
+                    task = nidaqmx_driver.create_continuous_ai_task(
+                        channels=channels,
+                        rate=float(settings["rate_per_channel"]),
+                        samples_per_read=samples_per_frame,
+                        terminal_config_name=str(settings["terminal_config"]),
+                        min_val=float(settings["min_val"]),
+                        max_val=float(settings["max_val"]),
+                        start_trigger_source=settings["trigger_source"],
+                        start_trigger_edge_name=str(settings["trigger_edge"]),
+                        start_task=False,
+                    )
+                    try:
+                        sample_clock_source = f"/{self.device_name}/ai/SampleClock"
+                        counter_tasks = [
+                            nidaqmx_driver.create_buffered_pfi_counter_task(
+                                device_name=self.device_name,
+                                physical_counter=str(settings.get("pfi0_counter", f"{self.device_name}/ctr0")),
+                                terminal=f"/{self.device_name}/PFI0",
+                                edge_name="RISING",
+                                sample_clock_source=sample_clock_source,
+                                rate=float(settings["rate_per_channel"]),
+                                samples_per_read=samples_per_frame,
+                            ),
+                            nidaqmx_driver.create_buffered_pfi_counter_task(
+                                device_name=self.device_name,
+                                physical_counter=str(settings.get("pfi1_counter", f"{self.device_name}/ctr1")),
+                                terminal=f"/{self.device_name}/PFI1",
+                                edge_name=str(settings.get("pfi1_edge", "FALLING")),
+                                sample_clock_source=sample_clock_source,
+                                rate=float(settings["rate_per_channel"]),
+                                samples_per_read=samples_per_frame,
+                            ),
+                        ]
+                        # Counter tasks must already be armed when AI starts so
+                        # their first samples share the AI clock timeline.
+                        task.start()
+                    except Exception:
+                        for counter_task in counter_tasks:
+                            try:
+                                counter_task.close()
+                            except Exception:
+                                pass
+                        task.close()
+                        raise
+                else:
+                    task = nidaqmx_driver.create_continuous_ai_task(
+                        channels=channels,
+                        rate=float(settings["rate_per_channel"]),
+                        samples_per_read=samples_per_frame,
+                        terminal_config_name=str(settings["terminal_config"]),
+                        min_val=float(settings["min_val"]),
+                        max_val=float(settings["max_val"]),
+                        start_trigger_source=settings["trigger_source"],
+                        start_trigger_edge_name=str(settings["trigger_edge"]),
+                    )
                 try:
                     while not stop_event.is_set():
                         channel_values = nidaqmx_driver.read_continuous_ai_chunk(
@@ -1379,6 +1572,26 @@ class DaqController:
                             channel_count=len(channels),
                             timeout=float(settings["timeout"]),
                         )
+                        samples_this_frame = (
+                            len(channel_values[0]) if channel_values else samples_per_frame
+                        )
+                        sample_start = sample_cursor
+                        sample_end = sample_start + samples_this_frame
+                        pfi0_events: list[dict[str, int]] = []
+                        pfi1_events: list[dict[str, int]] = []
+                        if event_timeline_enabled:
+                            pfi0_counts = nidaqmx_driver.read_buffered_pfi_counts(
+                                counter_tasks[0], samples_this_frame, float(settings["timeout"])
+                            )
+                            pfi1_counts = nidaqmx_driver.read_buffered_pfi_counts(
+                                counter_tasks[1], samples_this_frame, float(settings["timeout"])
+                            )
+                            pfi0_events, previous_pfi0_count = _counter_transition_samples(
+                                pfi0_counts, previous_pfi0_count, sample_start
+                            )
+                            pfi1_events, previous_pfi1_count = _counter_transition_samples(
+                                pfi1_counts, previous_pfi1_count, sample_start
+                            )
                         now = time.time()
                         segment_frame_id += 1
                         # 转换放在状态锁之外，避免大数组复制阻塞状态查询和批量读取。
@@ -1394,7 +1607,7 @@ class DaqController:
                                 "device": self.device_name,
                                 "channels": channels,
                                 "channel_count": len(channels),
-                                "samples_per_channel": samples_per_frame,
+                                "samples_per_channel": samples_this_frame,
                                 "rate_per_channel": float(settings["rate_per_channel"]),
                                 "aggregate_rate": float(settings["aggregate_rate"]),
                                 "terminal_config": str(settings["terminal_config"]),
@@ -1411,6 +1624,11 @@ class DaqController:
                                 "frame_duration_ms": float(settings["frame_duration_ms"]),
                                 "frame_rate_hz": float(settings["frame_rate_hz"]),
                                 "frame_id": self._unified_frame_id,
+                                "sample_start": sample_start,
+                                "sample_end": sample_end,
+                                "pfi0_events": pfi0_events,
+                                "pfi1_events": pfi1_events,
+                                "pfi1_triggered": bool(pfi1_events),
                                 "started_at": now,
                                 "finished_at": now,
                                 "values": channel_values,
@@ -1427,6 +1645,11 @@ class DaqController:
                                     "frame_id": self._unified_frame_id,
                                     "segment_id": segment_id,
                                     "segment_frame_id": segment_frame_id,
+                                    "sample_start": sample_start,
+                                    "sample_end": sample_end,
+                                    "pfi0_events": pfi0_events,
+                                    "pfi1_events": pfi1_events,
+                                    "pfi1_triggered": bool(pfi1_events),
                                     "started_at": now,
                                     "finished_at": now,
                                     "values": history_values,
@@ -1440,17 +1663,30 @@ class DaqController:
                                     channel,
                                     deque(maxlen=self._ai_buffer_size),
                                 ).extend(values)
+                                self._unified_range_buffers.setdefault(
+                                    channel,
+                                    deque(maxlen=self._ai_buffer_size),
+                                ).extend(values)
                                 self._unified_sample_counts[channel] = (
                                     self._unified_sample_counts.get(channel, 0) + len(values)
                                 )
                             self._unified_last_update = now
                             self._unified_error = None
 
+                        sample_cursor = sample_end
+                        with self._ai_lock:
+                            self._unified_sample_cursor = sample_cursor
+
                         # 周期重对齐：关闭当前 task，外层循环会新建 task 并重新等待 PFI 边沿。
                         if resync_every_frames > 0 and segment_frame_id >= resync_every_frames:
                             break
                 finally:
                     task.close()
+                    for counter_task in counter_tasks:
+                        try:
+                            counter_task.close()
+                        except Exception:
+                            pass
         except Exception as exc:
             with self._ai_lock:
                 self._unified_error = str(exc)
