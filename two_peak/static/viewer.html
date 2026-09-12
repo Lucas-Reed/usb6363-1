@@ -3333,7 +3333,7 @@ async function refreshPfi1FeedbackStatus(showStatus = false) {
     const status = await response.json();
     if (!response.ok || status.ok === false) throw new Error(status.error || '查询 PFI1 反馈状态失败');
     updatePfi1FeedbackStatus(status);
-    if (showStatus && status.running) setStatus('PFI1 长漂反馈正在运行。', 'ok');
+    if (showStatus && status.running) setStatus('PFI1 后续窗口监测正在运行。', 'ok');
   } catch (err) {
     if (showStatus) setStatus(String(err.message || err), 'error');
   }
@@ -3353,7 +3353,7 @@ async function stopPfi1Feedback() {
   try {
     const status = await postJson('/api/pfi1_feedback/stop', {});
     updatePfi1FeedbackStatus(status);
-    setStatus('PFI1 后续窗口反馈已停止。', 'ok');
+    setStatus('PFI1 后续窗口监测已停止。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
   }
