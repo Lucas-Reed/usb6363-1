@@ -25,31 +25,50 @@ class Pfi1FeedbackController:
         self._settings: dict[str, Any] = {}
         self._processor: Pfi1FollowupWindow | None = None
         self._pending: deque[int] = deque()
-        self._seen_events: set[int] = set()
+        self._last_event_sample = -1
         self._last_frame_id = 0
         self._events_seen = 0
         self._windows_done = 0
+        self._expired_events = 0
+        self._stale_events = 0
+        self._skipped_backlog_events = 0
         self._latest_result: dict[str, Any] | None = None
+        self._history: deque[dict[str, Any]] = deque(maxlen=200)
         self._ao_value: float | None = None
         self._integral = 0.0
-        self._last_control_time: float | None = None
+        self._last_result_time: float | None = None
 
     def start(self, settings: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             if self._running:
                 raise RuntimeError("PFI1 feedback is already running")
             normalized = self._validate_settings(settings)
+            stream_status = self._daq.get_unified_ai_stream_status()
+            if not stream_status.get("running"):
+                raise RuntimeError("unified AI stream must be running before PFI1 monitoring")
+            stream_settings = stream_status.get("settings") or {}
+            if not stream_settings.get("event_timeline_enabled"):
+                raise RuntimeError("unified AI stream must enable the buffered PFI event timeline")
+            stream_rate = float(stream_settings.get("rate_per_channel") or 0.0)
+            if stream_rate > 0:
+                normalized["sample_rate_hz"] = stream_rate
+            if "start_after_frame_id" not in settings:
+                normalized["start_after_frame_id"] = int(stream_status.get("frame_id") or 0)
             self._settings = normalized
             self._error = None
             self._pending.clear()
-            self._seen_events.clear()
+            self._last_event_sample = -1
             self._last_frame_id = int(normalized.get("start_after_frame_id", 0))
             self._events_seen = 0
             self._windows_done = 0
+            self._expired_events = 0
+            self._stale_events = 0
+            self._skipped_backlog_events = 0
             self._latest_result = None
+            self._history.clear()
             self._ao_value = float(normalized["initial_voltage"])
             self._integral = 0.0
-            self._last_control_time = None
+            self._last_result_time = None
             self._processor = Pfi1FollowupWindow(
                 read_samples=self._read_samples,
                 sample_rate_hz=float(normalized["sample_rate_hz"]),
@@ -59,13 +78,13 @@ class Pfi1FeedbackController:
                 polarity=str(normalized["polarity"]),
                 ema_alpha=float(normalized["ema_alpha"]),
             )
-            # 只有显式启动反馈时才写 AO 初值。
-            self._daq.write_ao(
-                channel=str(normalized["ao_channel"]),
-                value=float(normalized["initial_voltage"]),
-                min_val=float(normalized["min_voltage"]),
-                max_val=float(normalized["max_voltage"]),
-            )
+            if normalized["ao_feedback_enabled"]:
+                self._daq.write_ao(
+                    channel=str(normalized["ao_channel"]),
+                    value=float(normalized["initial_voltage"]),
+                    min_val=float(normalized["min_voltage"]),
+                    max_val=float(normalized["max_voltage"]),
+                )
             stop_event = threading.Event()
             self._stop_event = stop_event
             self._running = True
@@ -94,6 +113,18 @@ class Pfi1FeedbackController:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            age = None if self._last_result_time is None else max(0.0, time.time() - self._last_result_time)
+            pause_after = max(1.0, 2.0 * float(self._settings.get("integral_dt_s", 0.5)))
+            feedback_enabled = bool(self._settings.get("ao_feedback_enabled"))
+            holding = feedback_enabled and age is not None and age >= pause_after
+            if not feedback_enabled:
+                feedback_state = "disabled"
+            elif age is None:
+                feedback_state = "waiting"
+            elif holding:
+                feedback_state = "holding"
+            else:
+                feedback_state = "active"
             return {
                 "running": self._running,
                 "error": self._error,
@@ -101,10 +132,17 @@ class Pfi1FeedbackController:
                 "last_frame_id": self._last_frame_id,
                 "events_seen": self._events_seen,
                 "windows_done": self._windows_done,
+                "expired_events": self._expired_events,
+                "stale_events": self._stale_events,
+                "skipped_backlog_events": self._skipped_backlog_events,
                 "pending_events": len(self._pending),
                 "latest_result": dict(self._latest_result) if self._latest_result else None,
+                "history": [dict(item) for item in self._history],
                 "ao_value": self._ao_value,
                 "integral": self._integral,
+                "last_measurement_age_s": age,
+                "holding_last_ao": holding,
+                "feedback_state": feedback_state,
             }
 
     def _validate_settings(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -120,6 +158,7 @@ class Pfi1FeedbackController:
             "polarity": str(raw.get("polarity", "positive")),
             "ema_alpha": f("ema_alpha", 0.02),
             "ao_channel": str(raw.get("ao_channel", "ao0")),
+            "ao_feedback_enabled": bool(raw.get("ao_feedback_enabled", False)),
             "target": f("target", 0.0),
             "initial_voltage": f("initial_voltage", 0.0),
             "min_voltage": f("min_voltage", -10.0),
@@ -129,6 +168,8 @@ class Pfi1FeedbackController:
             "kp": f("kp", 0.0),
             "ki": f("ki", 0.0),
             "update_interval": f("update_interval", 0.05),
+            "integral_dt_s": f("integral_dt_s", 0.5),
+            "stale_event_after_s": f("stale_event_after_s", 0.5),
             "start_after_frame_id": int(raw.get("start_after_frame_id", 0)),
         }
         if result["sample_rate_hz"] <= 0 or result["delay_ms"] < 0:
@@ -143,8 +184,13 @@ class Pfi1FeedbackController:
             raise ValueError("initial_voltage must be inside AO limits")
         if result["direction"] not in (-1, 1):
             raise ValueError("direction must be -1 or 1")
-        if result["max_step_v"] < 0 or result["update_interval"] <= 0:
-            raise ValueError("max_step_v must be >= 0 and update_interval must be > 0")
+        if (
+            result["max_step_v"] < 0
+            or result["update_interval"] <= 0
+            or result["integral_dt_s"] <= 0
+            or result["stale_event_after_s"] <= 0
+        ):
+            raise ValueError("max_step_v must be >= 0; timing values must be > 0")
         if result["start_after_frame_id"] < 0:
             raise ValueError("start_after_frame_id must be >= 0")
         return result
@@ -175,8 +221,8 @@ class Pfi1FeedbackController:
                     events = frame.get("pfi1_events") or []
                     for event in events:
                         sample = int(event.get("sample_index", event.get("event_sample", -1)))
-                        if sample >= 0 and sample not in self._seen_events:
-                            self._seen_events.add(sample)
+                        if sample > self._last_event_sample:
+                            self._last_event_sample = sample
                             self._pending.append(sample)
                             self._events_seen += 1
                 self._drain_pending()
@@ -190,35 +236,76 @@ class Pfi1FeedbackController:
         processor = self._processor
         if processor is None:
             return
+        if not self._pending:
+            return
+        stream_status = self._daq.get_unified_ai_stream_status()
+        retained_start = int(stream_status.get("sample_range_start") or 0)
+        retained_end = int(stream_status.get("sample_range_end") or 0)
+        # At the expected sub-Hz/few-Hz trigger rate there is normally one event.
+        # After a software/network stall, use only the newest measurement so old
+        # errors cannot produce a burst of AO updates.
+        if len(self._pending) > 1:
+            skipped = len(self._pending) - 1
+            newest = self._pending[-1]
+            self._pending.clear()
+            self._pending.append(newest)
+            with self._lock:
+                self._skipped_backlog_events += skipped
         remaining: deque[int] = deque()
         while self._pending:
             event = self._pending.popleft()
+            window_start = event + int(
+                round(
+                    float(self._settings["delay_ms"])
+                    * float(self._settings["sample_rate_hz"])
+                    / 1000.0
+                )
+            )
+            window_end = window_start + int(self._settings["window_samples"])
+            if window_start < retained_start:
+                with self._lock:
+                    self._expired_events += 1
+                continue
+            if window_end > retained_end:
+                remaining.append(event)
+                continue
+            event_age_s = (
+                retained_end - window_end
+            ) / float(self._settings["sample_rate_hz"])
+            if event_age_s > float(self._settings["stale_event_after_s"]):
+                with self._lock:
+                    self._stale_events += 1
+                continue
             try:
                 result = processor.process_event(event)
             except Exception as exc:
-                message = str(exc).lower()
-                # 窗口尾端尚未进入环形缓冲时，HTTP 层通常只返回 400；
-                # 保留事件并在下一轮重试，避免把一次正常的采集延迟误当成坏事件。
-                if "range" in message or "available" in message or "future" in message or "http error 400" in message:
-                    remaining.append(event)
-                    continue
                 with self._lock:
                     self._error = str(exc)
                 continue
             result_dict = result.as_dict()
-            self._latest_result = result_dict
-            self._windows_done += 1
+            event_time = time.time()
             self._apply_control(float(result.ema if result.ema is not None else result.value))
+            with self._lock:
+                self._windows_done += 1
+                result_dict["event_number"] = self._windows_done
+                result_dict["event_time"] = event_time
+                self._latest_result = result_dict
+                self._last_result_time = event_time
+                summary = {key: value for key, value in result_dict.items() if key != "samples"}
+                summary["ao_value"] = self._ao_value
+                self._history.append(summary)
+                self._error = None
         self._pending = remaining
 
     def _apply_control(self, measured: float) -> None:
+        if not bool(self._settings.get("ao_feedback_enabled", False)):
+            return
         target = float(self._settings["target"])
         if abs(target) <= 1e-12:
             return
-        now = time.monotonic()
-        previous = self._last_control_time
-        dt = float(self._settings["update_interval"] if previous is None else max(1e-6, now - previous))
-        self._last_control_time = now
+        # The feedback is event driven.  Use a fixed per-event integration time
+        # so a several-second trigger pause does not integrate a stale error.
+        dt = float(self._settings["integral_dt_s"])
         error = (target - measured) / abs(target)
         integral_before = self._integral
         self._integral += error * dt

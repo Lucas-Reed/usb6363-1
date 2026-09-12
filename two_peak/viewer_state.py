@@ -9,7 +9,7 @@ from typing import Any
 
 from two_peak.ao_scan_calibrator import AoScanCalibrator
 from two_peak.config import TwoPeakSettings
-from two_peak.eom_identification import CalibrationModel
+from two_peak.eom_identification import CalibrationModel, identify_eom_aom_spectrum
 from two_peak.power_lock import PowerLockController
 from two_peak.pfi1_feedback import Pfi1FeedbackController
 from two_peak.sync_test import SyncTestCoordinator
@@ -36,6 +36,7 @@ class ViewerState:
         self.calibration_model = self._load_calibration()
         self.latest_frame: dict[str, Any] | None = None
         self.latest_measurement: dict[str, Any] | None = None
+        self.latest_eom_identification: dict[str, Any] | None = None
         # 慢漂记录器会在后端线程里读取底层 frame_stream 最新帧并写 CSV。
         # 它不依赖浏览器是否一直打开。
         self.trend_logger = AreaTrendLogger(
@@ -217,6 +218,37 @@ class ViewerState:
             },
             "display_only": True,
         }
+
+    def identify_eom_aom(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run width-filtered automatic identification on the latest waveform."""
+
+        frame = self.latest_frame
+        if not frame or not frame.get("values"):
+            raise RuntimeError("capture or load a waveform before automatic identification")
+        channel_index = int(payload.get("analysis_channel_index", 0))
+        values = frame["values"]
+        if channel_index < 0 or channel_index >= len(values):
+            raise ValueError("analysis_channel_index is out of range")
+        raw_breakpoints = payload.get("breakpoints", (2500, 7500))
+        if isinstance(raw_breakpoints, str):
+            raw_breakpoints = [item.strip() for item in raw_breakpoints.split(",") if item.strip()]
+        breakpoints = tuple(int(item) for item in raw_breakpoints)
+        result = identify_eom_aom_spectrum(
+            values[channel_index],
+            spacing_samples=float(payload.get("spacing_samples", 400.0)),
+            spacing_mhz=float(payload.get("spacing_mhz", 190.0)),
+            spacing_tolerance_samples=float(payload.get("spacing_tolerance_samples", 30.0)),
+            eom_frequency_mhz=float(payload.get("eom_frequency_mhz", 6800.0)),
+            fsr_mhz=float(payload.get("fsr_mhz", 2500.0)),
+            breakpoints=breakpoints,  # type: ignore[arg-type]
+            max_eom_order=int(payload.get("max_eom_order", 4)),
+            residual_tolerance_mhz=float(payload.get("residual_tolerance_mhz", 35.0)),
+        )
+        result["frame_id"] = frame.get("frame_id")
+        result["analysis_channel_index"] = channel_index
+        result["analysis_channel"] = frame.get("channels", [None] * len(values))[channel_index]
+        self.latest_eom_identification = result
+        return result
 
     def _load_calibration(self) -> CalibrationModel | None:
         if not self.calibration_path.exists():

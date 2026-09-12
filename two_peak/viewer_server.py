@@ -106,6 +106,8 @@ def make_handler(state: ViewerState):
                             }
                         )
                     )
+                elif path == "/api/eom/identification":
+                    self._send_json(state.latest_eom_identification or {"configured": False})
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:
@@ -214,6 +216,9 @@ def make_handler(state: ViewerState):
                 elif self.path == "/api/calibration/candidates":
                     body = self._read_json()
                     self._send_json(state.calibration_candidates(body))
+                elif self.path == "/api/eom/identify":
+                    body = self._read_json()
+                    self._send_json(state.identify_eom_aom(body))
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:

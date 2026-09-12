@@ -9,8 +9,376 @@ import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+import numpy as np
+
 
 DEFAULT_BREAKPOINTS = (2500, 7500)
+
+
+def folded_scan_coordinate(
+    indices: np.ndarray | Iterable[float],
+    breakpoints: tuple[int, int] = DEFAULT_BREAKPOINTS,
+) -> np.ndarray:
+    """Map the three sawtooth branches onto one monotonic scan coordinate.
+
+    With the default turning points this maps 0..2500 to 2500..5000,
+    2500..7500 to 5000..0, and 7500..10000 to 0..2500.
+    """
+
+    first, second = (int(value) for value in breakpoints)
+    if first <= 0 or second <= first:
+        raise ValueError("breakpoints must satisfy 0 < first < second")
+    span = float(second - first)
+    half = span / 2.0
+    x = np.asarray(indices, dtype=float)
+    return np.where(x < first, half + x, np.where(x < second, second - x, x - second))
+
+
+def scan_segment(index: int, breakpoints: tuple[int, int]) -> int:
+    first, second = breakpoints
+    return 0 if index < first else (1 if index < second else 2)
+
+
+def find_physical_peaks(
+    signal: np.ndarray | Iterable[float],
+    *,
+    min_separation: int = 45,
+    min_width: int = 8,
+    max_width: int = 70,
+    local_radius: int = 120,
+) -> list[dict[str, Any]]:
+    """Find independently broadened FP resonances and reject broad shoulders."""
+
+    values = np.asarray(signal, dtype=float).reshape(-1)
+    if values.size < 5 or not np.all(np.isfinite(values)):
+        raise ValueError("signal must contain at least five finite samples")
+    base = float(np.percentile(values, 10))
+    median = float(np.median(values))
+    noise = 1.4826 * float(np.median(np.abs(values - median)))
+    threshold = base + max(3.0 * noise, 0.02 * float(np.ptp(values)))
+    local = np.flatnonzero(
+        (values[1:-1] >= values[:-2])
+        & (values[1:-1] > values[2:])
+        & (values[1:-1] >= threshold)
+    ) + 1
+    kept: list[int] = []
+    for index in sorted(local.tolist(), key=lambda item: values[item], reverse=True):
+        if all(abs(index - other) >= min_separation for other in kept):
+            kept.append(index)
+
+    peaks: list[dict[str, Any]] = []
+    for index in sorted(kept):
+        left_bound = max(0, index - local_radius)
+        right_bound = min(values.size, index + local_radius + 1)
+        local_base = float(np.percentile(values[left_bound:right_bound], 10))
+        prominence = float(values[index] - local_base)
+        half_level = local_base + prominence / 2.0
+        left = index
+        right = index
+        while left > left_bound and values[left] > half_level:
+            left -= 1
+        while right < right_bound - 1 and values[right] > half_level:
+            right += 1
+        width = right - left - 1
+        independent = (
+            min_width <= width <= max_width
+            and index - left >= 2
+            and right - index >= 2
+            and left > left_bound
+            and right < right_bound - 1
+        )
+        if independent:
+            peaks.append(
+                {
+                    "index": int(index),
+                    "value": float(values[index]),
+                    "prominence": prominence,
+                    "width_samples": int(width),
+                }
+            )
+    return peaks
+
+
+def _frequency_match(
+    frequency: float,
+    *,
+    eom_frequency_mhz: float,
+    aom_frequency_mhz: float,
+    fsr_mhz: float,
+    max_eom_order: int,
+) -> dict[str, Any]:
+    best: dict[str, Any] | None = None
+    for eom_order in range(-max_eom_order, max_eom_order + 1):
+        for aom_order in (0, 1):
+            optical = eom_order * eom_frequency_mhz + aom_order * aom_frequency_mhz
+            cavity_order = int(round((frequency - optical) / fsr_mhz))
+            residual = frequency - optical - cavity_order * fsr_mhz
+            candidate = {
+                "eom_order": eom_order,
+                "aom_order": aom_order,
+                "cavity_order": cavity_order,
+                "frequency_offset_mhz": optical,
+                "residual_mhz": float(residual),
+            }
+            if best is None or abs(residual) < abs(float(best["residual_mhz"])):
+                best = candidate
+    assert best is not None
+    return best
+
+
+def identify_eom_aom_spectrum(
+    signal: np.ndarray | Iterable[float],
+    *,
+    spacing_samples: float,
+    spacing_mhz: float,
+    spacing_tolerance_samples: float = 30.0,
+    eom_frequency_mhz: float = 6800.0,
+    fsr_mhz: float = 2500.0,
+    breakpoints: tuple[int, int] = DEFAULT_BREAKPOINTS,
+    max_eom_order: int = 4,
+    residual_tolerance_mhz: float = 35.0,
+) -> dict[str, Any]:
+    """Identify the carrier/AOM pair, fit the folded scan, and label peaks.
+
+    The supplied spacing calibration fixes the linear scan scale. Each
+    same-branch peak pair near ``spacing_samples`` is tried as carrier and AOM
+    first order. The pair anchors the folded quadratic frequency model used by
+    the reference analysis, and the remaining peaks independently validate it
+    against ``n*EOM + a*AOM + m*FSR``.
+    """
+
+    if spacing_samples <= 0 or spacing_mhz <= 0:
+        raise ValueError("spacing_samples and spacing_mhz must be > 0")
+    if spacing_tolerance_samples <= 0 or eom_frequency_mhz <= 0 or fsr_mhz <= 0:
+        raise ValueError("tolerances and RF/FSR values must be > 0")
+    points = tuple(int(value) for value in breakpoints)
+    if len(points) != 2:
+        raise ValueError("exactly two scan breakpoints are required")
+    values = np.asarray(signal, dtype=float).reshape(-1)
+    if points[0] <= 0 or points[1] <= points[0] or points[1] >= values.size:
+        raise ValueError("scan breakpoints must lie inside the current waveform")
+    peaks = find_physical_peaks(values)
+    if len(peaks) < 2:
+        raise ValueError("fewer than two independently broadened peaks were found")
+
+    alpha = float(spacing_mhz / spacing_samples)
+    span = float(points[1] - points[0])
+    scan_amplitude = alpha * span
+    indices = np.asarray([peak["index"] for peak in peaks], dtype=float)
+    coords = folded_scan_coordinate(indices, points)
+    shape = coords * (coords - span) / span
+    pair_fits: list[dict[str, Any]] = []
+    for left_index in range(len(peaks) - 1):
+        for right_index in range(left_index + 1, len(peaks)):
+            first_peak = peaks[left_index]
+            second_peak = peaks[right_index]
+            if scan_segment(first_peak["index"], points) != scan_segment(second_peak["index"], points):
+                continue
+            raw_spacing = abs(second_peak["index"] - first_peak["index"])
+            spacing_error = abs(raw_spacing - spacing_samples)
+            if spacing_error > spacing_tolerance_samples:
+                continue
+            pair = sorted((left_index, right_index), key=lambda item: coords[item])
+            carrier_i, aom_i = pair[0], pair[1]
+            delta_shape = shape[aom_i] - shape[carrier_i]
+            if abs(delta_shape) < 1e-12:
+                curvature = 0.0
+            else:
+                curvature = (
+                    spacing_mhz - alpha * (coords[aom_i] - coords[carrier_i])
+                ) / delta_shape
+            # End-point slopes alpha-curvature and alpha+curvature must keep
+            # the folded frequency coordinate monotonic.
+            if abs(curvature) >= alpha:
+                continue
+            offset = (-alpha * coords[carrier_i] - curvature * shape[carrier_i]) % fsr_mhz
+            fitted = offset + alpha * coords + curvature * shape
+            matches = [
+                _frequency_match(
+                    float(frequency),
+                    eom_frequency_mhz=eom_frequency_mhz,
+                    aom_frequency_mhz=spacing_mhz,
+                    fsr_mhz=fsr_mhz,
+                    max_eom_order=max_eom_order,
+                )
+                for frequency in fitted
+            ]
+            carrier_cavity = int(round(float(fitted[carrier_i]) / fsr_mhz))
+            matches[carrier_i] = {
+                "eom_order": 0,
+                "aom_order": 0,
+                "cavity_order": carrier_cavity,
+                "frequency_offset_mhz": 0.0,
+                "residual_mhz": float(fitted[carrier_i] - carrier_cavity * fsr_mhz),
+            }
+            matches[aom_i] = {
+                "eom_order": 0,
+                "aom_order": 1,
+                "cavity_order": carrier_cavity,
+                "frequency_offset_mhz": float(spacing_mhz),
+                "residual_mhz": float(
+                    fitted[aom_i] - spacing_mhz - carrier_cavity * fsr_mhz
+                ),
+            }
+            residuals = np.asarray([match["residual_mhz"] for match in matches])
+            accepted = np.abs(residuals) <= residual_tolerance_mhz
+            validation_mask = np.ones(len(peaks), dtype=bool)
+            validation_mask[[carrier_i, aom_i]] = False
+            validation_accepted = validation_mask & accepted
+            validation_count = int(np.count_nonzero(validation_mask))
+            independent_matches = int(np.count_nonzero(validation_accepted))
+            validation_rms = (
+                float(np.sqrt(np.mean(np.square(residuals[validation_accepted]))))
+                if independent_matches
+                else None
+            )
+            collisions: list[list[int]] = []
+            assigned: dict[tuple[int, int, int, int], int] = {}
+            for peak_index, peak, match, is_accepted in zip(
+                range(len(peaks)), peaks, matches, accepted
+            ):
+                if not bool(is_accepted):
+                    continue
+                key = (
+                    scan_segment(int(peak["index"]), points),
+                    int(match["eom_order"]),
+                    int(match["aom_order"]),
+                    int(match["cavity_order"]),
+                )
+                previous = assigned.get(key)
+                if previous is not None:
+                    collisions.append([int(peaks[previous]["index"]), int(peak["index"])])
+                else:
+                    assigned[key] = peak_index
+            strength = float(first_peak["prominence"] + second_peak["prominence"])
+            pair_fits.append(
+                {
+                    "spacing_error_samples": float(spacing_error),
+                    "carrier_i": carrier_i,
+                    "aom_i": aom_i,
+                    "offset_mhz": float(offset),
+                    "curvature_mhz_per_sample": float(curvature),
+                    "frequencies": fitted,
+                    "matches": matches,
+                    "accepted": accepted,
+                    "validation_rms_mhz": validation_rms,
+                    "validation_peak_count": validation_count,
+                    "independent_match_count": independent_matches,
+                    "coverage": (
+                        independent_matches / validation_count if validation_count else 0.0
+                    ),
+                    "collisions": collisions,
+                    "strength": strength,
+                }
+            )
+    if not pair_fits:
+        raise ValueError("no same-branch peak pair matches the calibrated spacing")
+    max_strength = max(float(item["strength"]) for item in pair_fits)
+    for item in pair_fits:
+        residual_cost = (
+            1.5
+            if item["validation_rms_mhz"] is None
+            else min(3.0, float(item["validation_rms_mhz"]) / residual_tolerance_mhz)
+        )
+        strength_quality = float(item["strength"]) / max(max_strength, 1e-12)
+        item["strength_quality"] = strength_quality
+        item["score"] = (
+            float(item["spacing_error_samples"]) / spacing_tolerance_samples
+            + 0.8 * residual_cost
+            + 0.5 * (1.0 - float(item["coverage"]))
+            + 0.75 * len(item["collisions"])
+            + 0.25 * (1.0 - strength_quality)
+        )
+    pair_fits.sort(key=lambda item: float(item["score"]))
+    best = pair_fits[0]
+    labeled: list[dict[str, Any]] = []
+    for peak, coordinate, frequency, match, accepted in zip(
+        peaks, coords, best["frequencies"], best["matches"], best["accepted"]
+    ):
+        item = dict(peak)
+        item.update(match)
+        item.update(
+            {
+                "kind": "fitted_peak",
+                "folded_coordinate": float(coordinate),
+                "fitted_frequency_mhz": float(frequency),
+                "segment": scan_segment(int(peak["index"]), points),
+                "accepted": bool(accepted),
+                "label": (
+                    f"EOM {int(match['eom_order']):+d}, AOM {int(match['aom_order'])}"
+                    if accepted
+                    else "unassigned"
+                ),
+            }
+        )
+        labeled.append(item)
+    spacing_quality = max(0.0, 1.0 - best["spacing_error_samples"] / spacing_tolerance_samples)
+    validation_rms = best["validation_rms_mhz"]
+    residual_quality = (
+        0.0
+        if validation_rms is None
+        else max(0.0, 1.0 - float(validation_rms) / residual_tolerance_mhz)
+    )
+    coverage_quality = float(best["coverage"])
+    if len(pair_fits) == 1:
+        uniqueness_quality = 1.0
+    else:
+        score_gap = float(pair_fits[1]["score"]) - float(best["score"])
+        uniqueness_quality = max(0.0, min(1.0, score_gap / 0.75))
+    evidence_factor = 0.35 + 0.65 * min(
+        1.0, int(best["independent_match_count"]) / 3.0
+    )
+    confidence = float(
+        evidence_factor
+        * (
+            0.30 * spacing_quality
+            + 0.25 * residual_quality
+            + 0.20 * coverage_quality
+            + 0.15 * float(best["strength_quality"])
+            + 0.10 * uniqueness_quality
+        )
+    )
+    carrier = labeled[int(best["carrier_i"])]
+    aom_first = labeled[int(best["aom_i"])]
+    carrier["label"] = "EOM carrier"
+    carrier["kind"] = "carrier"
+    carrier["anchor"] = "carrier"
+    aom_first["label"] = "AOM first order"
+    aom_first["kind"] = "aom_first"
+    aom_first["anchor"] = "aom_first"
+    return {
+        "display_only": True,
+        "carrier": carrier,
+        "aom_first": aom_first,
+        "peaks": labeled,
+        "fit": {
+            "breakpoints": list(points),
+            "linear_mhz_per_sample": alpha,
+            "scan_amplitude_mhz": scan_amplitude,
+            "offset_mhz": best["offset_mhz"],
+            "curvature_mhz_per_sample": best["curvature_mhz_per_sample"],
+            "slope_start_mhz_per_sample": alpha - best["curvature_mhz_per_sample"],
+            "slope_end_mhz_per_sample": alpha + best["curvature_mhz_per_sample"],
+            "residual_rms_mhz": validation_rms,
+            "matched_peak_count": int(np.count_nonzero(best["accepted"])),
+            "detected_peak_count": len(peaks),
+            "independent_validation_count": int(best["independent_match_count"]),
+            "candidate_pair_count": len(pair_fits),
+            "same_branch_collisions": best["collisions"],
+        },
+        "calibration": {
+            "spacing_samples": float(spacing_samples),
+            "spacing_mhz": float(spacing_mhz),
+            "eom_frequency_mhz": float(eom_frequency_mhz),
+            "fsr_mhz": float(fsr_mhz),
+        },
+        "confidence": confidence,
+        "ambiguous": bool(
+            confidence < 0.7
+            or int(best["independent_match_count"]) < 2
+            or bool(best["collisions"])
+        ),
+    }
 
 
 @dataclass(frozen=True)

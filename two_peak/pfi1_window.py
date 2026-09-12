@@ -27,8 +27,13 @@ class Pfi1WindowResult:
     pulse_value: float | None
     pulse_start: int | None
     pulse_end: int | None
+    average_start: int
+    average_end: int
     pulse_detected: bool
     ema: float | None
+    samples: tuple[float, ...]
+    threshold: float
+    polarity: str
 
     @property
     def mean(self) -> float:
@@ -53,8 +58,13 @@ class Pfi1WindowResult:
             "pulse_mean": self.pulse_value,
             "pulse_start": self.pulse_start,
             "pulse_end": self.pulse_end,
+            "average_start": self.average_start,
+            "average_end": self.average_end,
             "pulse_detected": self.pulse_detected,
             "ema": self.ema,
+            "samples": list(self.samples),
+            "threshold": self.threshold,
+            "polarity": self.polarity,
         }
 
 
@@ -130,11 +140,15 @@ class Pfi1FollowupWindow:
             pulse_end = None
             measured = float(np.mean(values))
             detected = False
+            average_start = window_start
+            average_end = window_start + self.window_samples - 1
         else:
             pulse_start, pulse_end = pulse
             pulse_value = float(np.mean(values[pulse_start : pulse_end + 1]))
             measured = pulse_value
             detected = True
+            average_start = window_start + pulse_start
+            average_end = window_start + pulse_end
 
         self._ema = _update_ema(self._ema, measured, self.ema_alpha)
         return Pfi1WindowResult(
@@ -145,8 +159,13 @@ class Pfi1FollowupWindow:
             pulse_value=pulse_value,
             pulse_start=(None if pulse_start is None else window_start + pulse_start),
             pulse_end=(None if pulse_end is None else window_start + pulse_end),
+            average_start=average_start,
+            average_end=average_end,
             pulse_detected=detected,
             ema=self._ema,
+            samples=tuple(float(value) for value in values),
+            threshold=self.threshold,
+            polarity=self.polarity,
         )
 
     # Short alias for callers that prefer treating the object as a processor.
