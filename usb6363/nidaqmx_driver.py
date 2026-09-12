@@ -319,7 +319,7 @@ def verify_buffered_pfi_with_ai_clock(
         ):
             counter_task = nidaqmx_module.Task()
             channel = counter_task.ci_channels.add_ci_count_edges_chan(
-                f"/{device_name}/{counter_name}",
+                f"{device_name}/{counter_name}",
                 edge=_edge(edge_name),
                 initial_count=0,
             )
