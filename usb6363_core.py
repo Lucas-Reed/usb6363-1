@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 from usb6363 import nidaqmx_driver
+from usb6363.pfi_frames import PfiFrameAssembler
 
 
 # NI MAX / NI-DAQmx 里给 USB-6363 设置的设备名。
@@ -863,6 +864,7 @@ class DaqController:
                 "trigger_mode": "periodic_start" if resync_every_frames > 0 else ("start_only" if trigger_enabled else "off"),
                 "resync_every_frames": int(resync_every_frames),
                 "event_timeline_enabled": bool(event_timeline_enabled),
+                "frame_alignment": "pfi0" if event_timeline_enabled else "fixed",
                 "pfi0_counter": physical_pfi0_counter,
                 "pfi1_counter": physical_pfi1_counter,
                 "pfi0_edge": "RISING",
@@ -938,6 +940,8 @@ class DaqController:
                 "has_frame": self._unified_latest_frame is not None,
                 "last_update": self._unified_last_update,
                 "sample_counts": dict(self._unified_sample_counts),
+                "frame_alignment": settings.get("frame_alignment", "fixed"),
+                "pfi0_period_samples": (self._unified_latest_frame or {}).get("pfi0_period_samples"),
                 "frame_duration_seconds": settings.get("frame_duration_seconds"),
                 "frame_duration_ms": settings.get("frame_duration_ms"),
                 "frame_rate_hz": settings.get("frame_rate_hz"),
@@ -1491,8 +1495,8 @@ class DaqController:
     ) -> None:
         """统一 AI 数据流线程。
 
-        这个线程和旧 frame_stream 一样按固定点数读帧；
-        额外维护每通道 latest/buffer/sample_count，供慢漂、示波器等模块读取小 JSON。
+        固定点数读取原始块；启用硬件时间轴时，输出窗口逐个对齐 PFI0 边沿。
+        latest/buffer/sample_count 始终按原始采样更新，不按输出窗口累计。
         """
 
         channels = list(settings["channels"])
@@ -1507,6 +1511,7 @@ class DaqController:
                 segment_frame_id = 0
                 previous_pfi0_count: int | None = None
                 previous_pfi1_count: int | None = None
+                assembler = PfiFrameAssembler(samples_per_frame, len(channels)) if event_timeline_enabled else None
                 counter_tasks: list[Any] = []
                 if event_timeline_enabled:
                     task = nidaqmx_driver.create_continuous_ai_task(
@@ -1593,91 +1598,29 @@ class DaqController:
                                 pfi1_counts, previous_pfi1_count, sample_start
                             )
                         now = time.time()
-                        segment_frame_id += 1
-                        # 转换放在状态锁之外，避免大数组复制阻塞状态查询和批量读取。
-                        history_values = np.ascontiguousarray(
-                            channel_values,
-                            dtype=np.float32,
-                        )
                         with self._ai_lock:
                             if stop_event.is_set():
                                 break
-                            self._unified_frame_id += 1
-                            frame = {
-                                "device": self.device_name,
-                                "channels": channels,
-                                "channel_count": len(channels),
-                                "samples_per_channel": samples_this_frame,
-                                "rate_per_channel": float(settings["rate_per_channel"]),
-                                "aggregate_rate": float(settings["aggregate_rate"]),
-                                "terminal_config": str(settings["terminal_config"]),
-                                "min_val": float(settings["min_val"]),
-                                "max_val": float(settings["max_val"]),
-                                "trigger_enabled": bool(settings["trigger_enabled"]),
-                                "trigger_source": settings["trigger_source"],
-                                "trigger_edge": str(settings["trigger_edge"]),
-                                "trigger_mode": str(settings["trigger_mode"]),
-                                "resync_every_frames": resync_every_frames,
-                                "segment_id": segment_id,
-                                "segment_frame_id": segment_frame_id,
-                                "frame_duration_seconds": float(settings["frame_duration_seconds"]),
-                                "frame_duration_ms": float(settings["frame_duration_ms"]),
-                                "frame_rate_hz": float(settings["frame_rate_hz"]),
-                                "frame_id": self._unified_frame_id,
-                                "sample_start": sample_start,
-                                "sample_end": sample_end,
-                                "pfi0_events": pfi0_events,
-                                "pfi1_events": pfi1_events,
-                                "pfi1_triggered": bool(pfi1_events),
-                                "started_at": now,
-                                "finished_at": now,
-                                "values": channel_values,
-                            }
-                            self._unified_latest_frame = frame
-                            if (
-                                self._unified_frame_history.maxlen is not None
-                                and len(self._unified_frame_history)
-                                == self._unified_frame_history.maxlen
-                            ):
-                                self._unified_history_evicted_frames += 1
-                            self._unified_frame_history.append(
-                                {
-                                    "frame_id": self._unified_frame_id,
-                                    "segment_id": segment_id,
-                                    "segment_frame_id": segment_frame_id,
-                                    "sample_start": sample_start,
-                                    "sample_end": sample_end,
-                                    "pfi0_events": pfi0_events,
-                                    "pfi1_events": pfi1_events,
-                                    "pfi1_triggered": bool(pfi1_events),
-                                    "started_at": now,
-                                    "finished_at": now,
-                                    "values": history_values,
-                                }
-                            )
                             for channel, values in zip(channels, channel_values):
-                                if not values:
+                                if len(values) == 0:
                                     continue
                                 self._unified_latest[channel] = values[-1]
-                                self._unified_buffers.setdefault(
-                                    channel,
-                                    deque(maxlen=self._ai_buffer_size),
-                                ).extend(values)
-                                self._unified_range_buffers.setdefault(
-                                    channel,
-                                    deque(maxlen=self._ai_buffer_size),
-                                ).extend(values)
-                                self._unified_sample_counts[channel] = (
-                                    self._unified_sample_counts.get(channel, 0) + len(values)
-                                )
+                                self._unified_buffers[channel].extend(values)
+                                self._unified_range_buffers[channel].extend(values)
+                                self._unified_sample_counts[channel] += len(values)
+                            self._unified_sample_cursor = sample_end
                             self._unified_last_update = now
-                            self._unified_error = None
-
+                        windows = assembler.append(channel_values, sample_start, pfi0_events, pfi1_events) if assembler else [{
+                            "values": channel_values, "sample_start": sample_start,
+                            "sample_end": sample_end, "pfi0_events": pfi0_events,
+                            "pfi1_events": pfi1_events, "pfi1_triggered": bool(pfi1_events),
+                        }]
+                        for window in windows:
+                            segment_frame_id += 1
+                            history_values = np.ascontiguousarray(window["values"], dtype=np.float32)
+                            self._publish_unified_window(settings, window, history_values, segment_id, segment_frame_id, now)
                         sample_cursor = sample_end
-                        with self._ai_lock:
-                            self._unified_sample_cursor = sample_cursor
 
-                        # 周期重对齐：关闭当前 task，外层循环会新建 task 并重新等待 PFI 边沿。
                         if resync_every_frames > 0 and segment_frame_id >= resync_every_frames:
                             break
                 finally:
@@ -1694,6 +1637,71 @@ class DaqController:
             with self._ai_lock:
                 if self._unified_thread is threading.current_thread():
                     self._unified_running = False
+
+    def _publish_unified_window(self, settings, window, history_values, segment_id, segment_frame_id, now):
+        channels = list(settings["channels"])
+        samples_this_frame = history_values.shape[1]
+        resync_every_frames = int(settings.get("resync_every_frames", 0))
+        sample_start, sample_end = window["sample_start"], window["sample_end"]
+        pfi0_events, pfi1_events = window["pfi0_events"], window["pfi1_events"]
+        channel_values = np.asarray(window["values"]).tolist()
+        with self._ai_lock:
+            self._unified_frame_id += 1
+            frame = {
+                "device": self.device_name,
+                "channels": channels,
+                "channel_count": len(channels),
+                "samples_per_channel": samples_this_frame,
+                "rate_per_channel": float(settings["rate_per_channel"]),
+                "aggregate_rate": float(settings["aggregate_rate"]),
+                "terminal_config": str(settings["terminal_config"]),
+                "min_val": float(settings["min_val"]),
+                "max_val": float(settings["max_val"]),
+                "trigger_enabled": bool(settings["trigger_enabled"]),
+                "trigger_source": settings["trigger_source"],
+                "trigger_edge": str(settings["trigger_edge"]),
+                "trigger_mode": str(settings["trigger_mode"]),
+                "resync_every_frames": resync_every_frames,
+                "segment_id": segment_id,
+                "segment_frame_id": segment_frame_id,
+                "frame_duration_seconds": float(settings["frame_duration_seconds"]),
+                "frame_duration_ms": float(settings["frame_duration_ms"]),
+                "frame_rate_hz": float(settings["frame_rate_hz"]),
+                "frame_id": self._unified_frame_id,
+                "sample_start": sample_start,
+                "sample_end": sample_end,
+                "pfi0_events": pfi0_events,
+                "pfi1_events": pfi1_events,
+                "pfi1_triggered": bool(pfi1_events),
+                "pfi0_period_samples": window.get("pfi0_period_samples"),
+                "frame_alignment": settings.get("frame_alignment", "fixed"),
+                "started_at": now,
+                "finished_at": now,
+                "values": channel_values,
+            }
+            self._unified_latest_frame = frame
+            if (
+                self._unified_frame_history.maxlen is not None
+                and len(self._unified_frame_history)
+                == self._unified_frame_history.maxlen
+            ):
+                self._unified_history_evicted_frames += 1
+            self._unified_frame_history.append(
+                {
+                    "frame_id": self._unified_frame_id,
+                    "segment_id": segment_id,
+                    "segment_frame_id": segment_frame_id,
+                    "sample_start": sample_start,
+                    "sample_end": sample_end,
+                    "pfi0_events": pfi0_events,
+                    "pfi1_events": pfi1_events,
+                    "pfi1_triggered": bool(pfi1_events),
+                    "started_at": now,
+                    "finished_at": now,
+                    "values": history_values,
+                }
+            )
+            self._unified_error = None
 
     def _ai_frame_stream_worker(
         self,

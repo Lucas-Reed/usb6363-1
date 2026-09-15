@@ -237,7 +237,7 @@ HTML_PAGE = r"""<!doctype html>
 
       <div class="row">
         <input id="event_timeline_enabled" type="checkbox" />
-        <label for="event_timeline_enabled" style="margin:0;color:var(--text)">启用 buffered PFI 样本时间轴</label>
+        <label for="event_timeline_enabled" style="margin:0;color:var(--text)">每帧对齐 PFI0，记录 PFI1 事件</label>
       </div>
       <div class="grid2">
         <div>
