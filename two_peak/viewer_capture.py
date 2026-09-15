@@ -243,6 +243,8 @@ def get_frame_stream_latest(state: ViewerState, body: dict[str, Any] | None = No
     frame["viewer_received_at"] = time.time()
     state.latest_frame = frame
     state.latest_measurement = None
+    state.latest_eom_identification = None
+    state.scan_centering_proposal = None
     return frame
 
 
@@ -529,6 +531,8 @@ def load_saved_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, Any]
 
     state.latest_frame = frame
     state.latest_measurement = metadata.get("measurement")
+    state.latest_eom_identification = None
+    state.scan_centering_proposal = None
     return {
         "frame": frame,
         "measurement": state.latest_measurement,

@@ -13,6 +13,7 @@ from two_peak.eom_identification import CalibrationModel, identify_eom_aom_spect
 from two_peak.power_lock import PowerLockController
 from two_peak.pfi1_feedback import Pfi1FeedbackController
 from two_peak.sync_test import SyncTestCoordinator
+from two_peak.scan_source import RigolScanSource, plan_centering
 from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
 
@@ -33,10 +34,13 @@ class ViewerState:
         self.defaults_path = sample_dir.parent / "two_peak_defaults.json"
         self.calibration_path = sample_dir.parent / "eom_aom_calibration.json"
         self.user_defaults = self._load_user_defaults()
+        self.identification_settings: dict[str, Any] = {}
         self.calibration_model = self._load_calibration()
         self.latest_frame: dict[str, Any] | None = None
         self.latest_measurement: dict[str, Any] | None = None
         self.latest_eom_identification: dict[str, Any] | None = None
+        self.scan_source = RigolScanSource()
+        self.scan_centering_proposal: dict[str, Any] | None = None
         # 慢漂记录器会在后端线程里读取底层 frame_stream 最新帧并写 CSV。
         # 它不依赖浏览器是否一直打开。
         self.trend_logger = AreaTrendLogger(
@@ -152,6 +156,7 @@ class ViewerState:
         return {
             "configured": self.calibration_model is not None,
             "model": self.calibration_model.to_dict() if self.calibration_model else None,
+            "identification_settings": self.identification_settings,
             "file": str(self.calibration_path.resolve()),
         }
 
@@ -160,13 +165,17 @@ class ViewerState:
 
         model_payload = payload.get("model", payload)
         model_data = dict(model_payload)
+        if not model_data.get("breakpoints"):
+            count = _frame_sample_count(self.latest_frame) or 10000
+            model_data["breakpoints"] = [count // 4, 3 * count // 4]
         model_data["updated_at"] = time.time()
         model = CalibrationModel.from_dict(model_data)
         sample_count = _frame_sample_count(self.latest_frame)
         model.validate(sample_count=sample_count)
+        self.identification_settings = dict(payload.get("identification_settings") or {})
         self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
         self.calibration_path.write_text(
-            json.dumps(model.to_dict(), ensure_ascii=False, indent=2),
+            json.dumps(dict(model.to_dict(), identification_settings=self.identification_settings), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         self.calibration_model = model
@@ -174,6 +183,7 @@ class ViewerState:
 
     def reset_calibration(self) -> dict[str, Any]:
         self.calibration_model = None
+        self.identification_settings = {}
         if self.calibration_path.exists():
             self.calibration_path.unlink()
         return self.calibration_status()
@@ -229,25 +239,52 @@ class ViewerState:
         values = frame["values"]
         if channel_index < 0 or channel_index >= len(values):
             raise ValueError("analysis_channel_index is out of range")
-        raw_breakpoints = payload.get("breakpoints", (2500, 7500))
+        raw_breakpoints = payload.get("breakpoints")
         if isinstance(raw_breakpoints, str):
             raw_breakpoints = [item.strip() for item in raw_breakpoints.split(",") if item.strip()]
-        breakpoints = tuple(int(item) for item in raw_breakpoints)
+        breakpoints = tuple(int(item) for item in raw_breakpoints) if raw_breakpoints else None
         result = identify_eom_aom_spectrum(
             values[channel_index],
             spacing_samples=float(payload.get("spacing_samples", 400.0)),
             spacing_mhz=float(payload.get("spacing_mhz", 190.0)),
-            spacing_tolerance_samples=float(payload.get("spacing_tolerance_samples", 30.0)),
+            spacing_tolerance_samples=float(payload.get("spacing_tolerance_samples", 3.0)),
             eom_frequency_mhz=float(payload.get("eom_frequency_mhz", 6800.0)),
             fsr_mhz=float(payload.get("fsr_mhz", 2500.0)),
             breakpoints=breakpoints,  # type: ignore[arg-type]
             max_eom_order=int(payload.get("max_eom_order", 4)),
-            residual_tolerance_mhz=float(payload.get("residual_tolerance_mhz", 35.0)),
+            match_tolerance_samples=float(payload.get("match_tolerance_samples", 3.0)),
+            min_peak_width=int(payload["min_peak_width"]) if payload.get("min_peak_width") else None,
+            max_peak_width=int(payload["max_peak_width"]) if payload.get("max_peak_width") else None,
         )
         result["frame_id"] = frame.get("frame_id")
         result["analysis_channel_index"] = channel_index
         result["analysis_channel"] = frame.get("channels", [None] * len(values))[channel_index]
         self.latest_eom_identification = result
+        self.scan_centering_proposal = None
+        return result
+
+    def preview_scan_centering(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.scan_centering_proposal = None
+        if not self.latest_eom_identification:
+            raise ValueError("Identify the current waveform first")
+        current = self.scan_source.read()
+        proposal = plan_centering(
+            self.latest_eom_identification, current,
+            resize=bool(payload.get("resize", False)),
+            separation_fraction=float(payload.get("separation_fraction", 0.4)),
+            min_voltage=float(payload.get("min_voltage", 0.0)),
+            max_voltage=float(payload.get("max_voltage", 5.0)),
+        )
+        self.scan_centering_proposal = proposal
+        return {"current": current, "proposal": proposal}
+
+    def apply_scan_centering(self) -> dict[str, Any]:
+        proposal = self.scan_centering_proposal
+        if not proposal:
+            raise ValueError("Preview the centering settings first")
+        self.scan_centering_proposal = None
+        result = self.scan_source.apply(proposal)
+        self.latest_eom_identification = None
         return result
 
     def _load_calibration(self) -> CalibrationModel | None:
@@ -255,6 +292,7 @@ class ViewerState:
             return None
         try:
             payload = json.loads(self.calibration_path.read_text(encoding="utf-8"))
+            self.identification_settings = dict(payload.get("identification_settings") or {})
             return CalibrationModel.from_dict(payload)
         except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError):
             return None

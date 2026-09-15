@@ -112,6 +112,13 @@
   .status.error { color: var(--red); }
   .status.ok { color: var(--green); }
   .status.warn { color: var(--amber); }
+  .status { overflow-wrap: anywhere; }
+  .grid2 > div { min-width: 0; }
+  @media (max-width: 700px) {
+    body { height: auto; min-height: 100vh; grid-template-columns: 1fr; overflow: auto; }
+    aside { max-height: 55vh; }
+    main { height: 70vh; }
+  }
   .plots {
     display: grid;
     gap: 10px;
@@ -163,6 +170,11 @@
     gap: 8px;
   }
   .mono { font-family: Consolas, "SFMono-Regular", monospace; }
+  @media (max-width: 700px) {
+    main { grid-template-rows: auto minmax(220px, 1fr) auto; }
+    .footer { grid-template-columns: minmax(0, 1fr); }
+    #cursorInfo { overflow-wrap: anywhere; font-size: 12px; }
+  }
 </style>
 </head>
 <body>
@@ -292,7 +304,7 @@
     <option value="0">P1</option>
     <option value="1">P2</option>
     <option value="calibration_carrier">EOM 载波</option>
-    <option value="calibration_aom_zero">AOM 零级</option>
+    <option value="calibration_aom_zero">AOM 一级</option>
     <option value="area_left">面积左零点</option>
     <option value="area_right">面积右零点</option>
     <option value="area2_left">面积 B 左零点</option>
@@ -382,25 +394,47 @@
     </div>
   </div>
   <label>分段断点索引（逗号分隔）</label>
-  <input id="calibration_breakpoints" value="2500,7500">
+  <input id="calibration_breakpoints" value="" placeholder="自动：帧长的 25%、75%">
   <div class="grid2">
     <div><label>校准点间距 / 点</label><input id="eom_spacing_samples" type="number" value="400" min="1" step="1"></div>
-    <div><label>间距容差 / 点</label><input id="eom_spacing_tolerance" type="number" value="30" min="1" step="1"></div>
+    <div><label>间距容差 / 点</label><input id="eom_spacing_tolerance" type="number" value="3" min="0.1" step="0.1"></div>
   </div>
   <div class="grid2">
     <div><label>EOM 射频 / MHz</label><input id="eom_frequency_mhz" type="number" value="6800" min="1" step="1"></div>
-    <div><label>拟合残差容差 / MHz</label><input id="eom_residual_tolerance" type="number" value="35" min="1" step="1"></div>
+    <div><label>峰位置容差 / 点</label><input id="eom_match_tolerance" type="number" value="3" min="0.1" step="0.1"></div>
+  </div>
+  <div class="grid2">
+    <div><label>最小峰宽 / 点</label><input id="eom_min_width" type="number" min="1" placeholder="自动"></div>
+    <div><label>最大峰宽 / 点</label><input id="eom_max_width" type="number" min="1" placeholder="自动"></div>
   </div>
   <div class="actions">
     <button class="green" onclick="runAutomaticIdentification()">自动识别并拟合</button>
     <button class="secondary" onclick="saveCalibration()">保存校准模型</button>
-    <button class="secondary" onclick="generateCalibrationCandidates()">生成候选边带</button>
   </div>
   <div id="calibration_status" class="status">未加载校准模型。</div>
+  <label class="inline"><input id="freeze_waveform" type="checkbox"> 冻结显示波形</label>
+  <details><summary>载频候选比较</summary>
+    <table><thead><tr><th>载频</th><th>配对峰</th><th>拟合损失</th><th>匹配峰数</th></tr></thead>
+    <tbody id="hypothesisRows"><tr><td colspan="4">--</td></tr></tbody></table>
+  </details>
   <table>
     <thead><tr><th>标注</th><th>索引</th><th>频偏 / MHz</th><th>匹配</th></tr></thead>
     <tbody id="calibrationRows"><tr><td colspan="4">--</td></tr></tbody>
   </table>
+
+  <h2>Rigol DG4162 扫描居中</h2>
+  <label>VISA 资源地址</label><input id="scan_resource" placeholder="TCPIP0::192.168.1.100::INSTR">
+  <label>扫描输出通道</label><select id="scan_channel"><option value="1">CH1</option><option value="2">CH2</option></select>
+  <div class="actions"><button onclick="connectScanSource()">连接信号源</button><button class="secondary" onclick="readScanSource()">读取参数</button></div>
+  <div id="scan_source_status" class="status">未连接</div>
+  <label class="inline"><input id="scan_resize" type="checkbox"> 同时缩小扫描幅度</label>
+  <label>两峰间距 / 下降段长度</label><input id="scan_fraction" type="number" value="0.4" min="0.05" max="0.9" step="0.05">
+  <div class="grid2">
+    <div><label>扫描电压下限 / V</label><input id="scan_min" type="number" value="0" step="0.1"></div>
+    <div><label>扫描电压上限 / V</label><input id="scan_max" type="number" value="5" step="0.1"></div>
+  </div>
+  <div class="actions"><button onclick="previewScanCentering()">预览居中</button><button id="scanApplyBtn" class="green" onclick="applyScanCentering()" disabled>写入幅度与偏置</button></div>
+  <div id="scan_proposal_status" class="status">--</div>
 
   <h2>结果</h2>
   <table>
@@ -944,6 +978,71 @@ let xViewEnd = null;
 let manualAreaHistory = [];
 let manualArea2History = [];
 let calibrationCandidates = [];
+const spectralSettingIds = ['eom_spacing_samples', 'eom_spacing_tolerance', 'eom_frequency_mhz',
+  'eom_match_tolerance', 'eom_min_width', 'eom_max_width', 'calibration_breakpoints',
+  'calibration_frequency_difference_mhz', 'calibration_fsr_mhz', 'scan_resource', 'scan_channel',
+  'scan_resize', 'scan_fraction', 'scan_min', 'scan_max'];
+
+function invalidateSpectrumDisplay() {
+  calibrationCandidates = [];
+  document.getElementById('calibrationRows').innerHTML = '<tr><td colspan="4">--</td></tr>';
+  document.getElementById('scanApplyBtn').disabled = true;
+  document.getElementById('hypothesisRows').innerHTML = '<tr><td colspan="4">--</td></tr>';
+}
+
+function showScanSource(data) {
+  document.getElementById('scan_source_status').textContent =
+    `${data.identity} · CH${data.channel} · ${data.frequency_hz} Hz · ${data.amplitude_vpp} ${data.unit} · 偏置 ${data.offset_v} V`;
+}
+
+async function connectScanSource() {
+  document.getElementById('scanApplyBtn').disabled = true;
+  try {
+    showScanSource(await postJson('/api/scan_source/connect', {
+      resource: document.getElementById('scan_resource').value,
+      channel: Number(document.getElementById('scan_channel').value),
+    }));
+  } catch (err) { document.getElementById('scan_source_status').textContent = err.message; }
+}
+
+async function readScanSource() {
+  try {
+    const response = await fetch('/api/scan_source');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    showScanSource(data);
+  } catch (err) { document.getElementById('scan_source_status').textContent = err.message; }
+}
+
+async function previewScanCentering() {
+  document.getElementById('scanApplyBtn').disabled = true;
+  try {
+    const data = await postJson('/api/scan_source/preview', {
+      resize: document.getElementById('scan_resize').checked,
+      separation_fraction: Number(document.getElementById('scan_fraction').value),
+      min_voltage: Number(document.getElementById('scan_min').value),
+      max_voltage: Number(document.getElementById('scan_max').value),
+    });
+    const p = data.proposal;
+    showScanSource(data.current);
+    document.getElementById('scan_proposal_status').textContent =
+      `${p.ambiguous ? '峰级别仍有歧义；' : ''}${p.selected_indices.map((index, i) => `${p.selected_labels[i]} @ ${index}`).join('、')}；` +
+      `${p.original_amplitude_vpp.toFixed(4)} → ${p.amplitude_vpp.toFixed(4)} Vpp；` +
+      `偏置 ${p.original_offset_v.toFixed(4)} → ${p.offset_v.toFixed(4)} V；` +
+      `预测索引 ${p.predicted_indices.map(v => v.toFixed(1)).join('、')}，中点 ${p.target_index}；` +
+      `电压范围 ${p.minimum_v.toFixed(4)} 至 ${p.maximum_v.toFixed(4)} V`;
+    document.getElementById('scanApplyBtn').disabled = false;
+  } catch (err) { document.getElementById('scan_proposal_status').textContent = err.message; }
+}
+
+async function applyScanCentering() {
+  document.getElementById('scanApplyBtn').disabled = true;
+  try {
+    showScanSource(await postJson('/api/scan_source/apply', {}));
+    invalidateSpectrumDisplay();
+    document.getElementById('scan_proposal_status').textContent = '已写入并回读幅度、偏置。原波形为调整前的数据。';
+  } catch (err) { document.getElementById('scan_proposal_status').textContent = err.message; }
+}
 
 function getCaptureParams() {
   return {
@@ -987,6 +1086,8 @@ function getCalibrationParams() {
     frequency_difference_mhz: Number(document.getElementById('calibration_frequency_difference_mhz').value),
     fsr_mhz: Number(document.getElementById('calibration_fsr_mhz').value),
     breakpoints: document.getElementById('calibration_breakpoints').value,
+    identification_settings: Object.fromEntries(spectralSettingIds.filter(id => id.startsWith('eom_'))
+      .map(id => [id, document.getElementById(id).value])),
   };
 }
 
@@ -1083,6 +1184,10 @@ function getPowerLockParams() {
 
 function getAllUiParameters() {
   return {
+    ...Object.fromEntries(spectralSettingIds.map(id => {
+      const el = document.getElementById(id);
+      return [id, el.type === 'checkbox' ? el.checked : el.value];
+    })),
     ...getCaptureParams(),
     ...getMeasureParams(),
     ...getViewParams(),
@@ -1112,6 +1217,7 @@ function firstDefined(...values) {
 }
 
 function applyDefaultsToUi(defaults) {
+  spectralSettingIds.forEach(id => setInputValue(id, defaults[id]));
   setInputValue('channels', defaults.channels || defaults.ai_channels);
   setInputValue('rate', defaults.rate || defaults.sample_rate);
   setInputValue('samples', defaults.samples || defaults.samples_per_frame);
@@ -1246,26 +1352,6 @@ function applyCalibrationModel(model) {
   setInputValue('calibration_breakpoints', (model.breakpoints || [2500, 7500]).join(','));
 }
 
-function updateCalibrationRows(data) {
-  const rows = document.getElementById('calibrationRows');
-  const entries = [];
-  if (data && data.carrier) entries.push(data.carrier);
-  if (data && data.aom_zero) entries.push(data.aom_zero);
-  if (data && Array.isArray(data.candidates)) entries.push(...data.candidates);
-  calibrationCandidates = entries;
-  if (!entries.length) {
-    rows.innerHTML = '<tr><td colspan="4">暂无候选标注</td></tr>';
-    renderPlots();
-    return;
-  }
-  rows.innerHTML = entries.map(item => `
-    <tr><td>${item.label || item.kind}</td><td>${item.index}</td>
-      <td>${Number(item.frequency_offset_mhz).toFixed(3)}</td>
-      <td>${item.in_range === false ? '超出当前帧' : '当前帧'}</td></tr>
-  `).join('');
-  renderPlots();
-}
-
 async function loadCalibration() {
   try {
     const response = await fetch('/api/calibration');
@@ -1273,8 +1359,8 @@ async function loadCalibration() {
     if (!response.ok || data.ok === false) throw new Error(data.error || '读取校准模型失败');
     if (data.model) {
       applyCalibrationModel(data.model);
+      Object.entries(data.identification_settings || {}).forEach(([id, value]) => setInputValue(id, value));
       setCalibrationStatus('已加载校准模型。', 'ok');
-      await generateCalibrationCandidates(false);
     } else {
       setCalibrationStatus('未加载校准模型。');
     }
@@ -1285,29 +1371,22 @@ async function loadCalibration() {
 
 async function saveCalibration() {
   try {
+    if (!document.getElementById('calibration_carrier_index').value || !document.getElementById('calibration_aom_zero_index').value) {
+      throw new Error('请先选择两个校准点或完成自动识别。');
+    }
     const data = await postJson('/api/calibration/save', getCalibrationParams());
     applyCalibrationModel(data.model);
     setCalibrationStatus('校准模型已保存；候选标注仅用于显示。', 'ok');
-    await generateCalibrationCandidates(false);
   } catch (err) {
     setCalibrationStatus(String(err.message || err), 'error');
   }
 }
 
-async function generateCalibrationCandidates(showStatus = true) {
-  try {
-    const body = {sample_count: latestFrame && latestFrame.values ? latestFrame.values[0].length : null};
-    const data = await postJson('/api/calibration/candidates', body);
-    applyCalibrationModel(data.model);
-    updateCalibrationRows(data);
-    if (showStatus) setCalibrationStatus('已生成候选边带标注（仅显示，不驱动锁定）。', 'ok');
-  } catch (err) {
-    if (showStatus) setCalibrationStatus(String(err.message || err), 'error');
-  }
-}
-
 async function runAutomaticIdentification() {
   try {
+    document.getElementById('freeze_waveform').checked = true;
+    while (streamPollInFlight) await new Promise(resolve => setTimeout(resolve, 20));
+    document.getElementById('scanApplyBtn').disabled = true;
     if (!latestFrame || !latestFrame.values) throw new Error('请先抓取一帧波形。');
     const data = await postJson('/api/eom/identify', {
       analysis_channel_index: Number(document.getElementById('analysis_channel_index').value),
@@ -1317,19 +1396,23 @@ async function runAutomaticIdentification() {
       eom_frequency_mhz: Number(document.getElementById('eom_frequency_mhz').value),
       fsr_mhz: Number(document.getElementById('calibration_fsr_mhz').value),
       breakpoints: document.getElementById('calibration_breakpoints').value,
-      residual_tolerance_mhz: Number(document.getElementById('eom_residual_tolerance').value),
+      match_tolerance_samples: Number(document.getElementById('eom_match_tolerance').value),
+      min_peak_width: document.getElementById('eom_min_width').value,
+      max_peak_width: document.getElementById('eom_max_width').value,
     });
     document.getElementById('calibration_carrier_index').value = data.carrier.index;
-    document.getElementById('calibration_aom_zero_index').value = data.aom_first.index;
+    document.getElementById('calibration_aom_zero_index').value = data.aom_first ? data.aom_first.index : '';
     calibrationCandidates = (data.peaks || []).filter(item => item.accepted);
     const rows = document.getElementById('calibrationRows');
     rows.innerHTML = (data.peaks || []).map(item => `
       <tr><td>${item.label}</td><td>${item.index}</td>
       <td>${Number(item.frequency_offset_mhz).toFixed(3)}</td>
-      <td>${item.accepted ? `残差 ${Number(item.residual_mhz).toFixed(2)} MHz` : '未匹配'}</td></tr>
+      <td>${item.accepted ? `偏差 ${Number(item.residual_samples).toFixed(2)} 点` : '未匹配'}</td></tr>
     `).join('');
     const fit = data.fit || {};
-    const rms = fit.residual_rms_mhz == null ? '无独立峰验证' : `${Number(fit.residual_rms_mhz).toFixed(2)} MHz`;
+    document.getElementById('hypothesisRows').innerHTML = (data.hypotheses || []).map(item =>
+      `<tr><td>${item.carrier_index}</td><td>${item.partner_index}</td><td>${item.score.toFixed(3)}</td><td>${item.matched_peak_count}</td></tr>`).join('');
+    const rms = fit.residual_rms_samples == null ? '无独立峰验证' : `${Number(fit.residual_rms_samples).toFixed(2)} 点`;
     const certainty = data.ambiguous ? '候选仍有歧义' : '全谱匹配通过';
     setCalibrationStatus(
       `识别完成：置信度 ${Number(data.confidence * 100).toFixed(1)}%，${certainty}；` +
@@ -1437,6 +1520,7 @@ async function captureFrame() {
     const selectedChannels = encodeURIComponent(params.channels);
     const response = await fetch(`/api/stream/latest?stream_source=unified_stream&channels=${selectedChannels}`);
     latestFrame = await response.json();
+    invalidateSpectrumDisplay();
     if (!response.ok || latestFrame.ok === false) {
       throw new Error(latestFrame.error || '抓取统一 AI 流最新帧失败');
     }
@@ -2537,6 +2621,7 @@ async function stopPowerLock() {
 
 async function pollBackendStreamLatest() {
   if (!streamRunning) return;
+  if (document.getElementById('freeze_waveform').checked) return;
   if (streamPollInFlight) return;
   streamPollInFlight = true;
   try {
@@ -2555,6 +2640,7 @@ async function pollBackendStreamLatest() {
     streamConsecutiveErrors = 0;
     streamLastFrameId = frame.frame_id;
     latestFrame = frame;
+    invalidateSpectrumDisplay();
     latestMeasurement = null;
     document.getElementById('saveBtn').disabled = false;
     updateStreamStatus({
@@ -2653,6 +2739,7 @@ async function loadSavedSample() {
   try {
     const loaded = await postJson('/api/load', {metadata_file: metadataFile});
     latestFrame = loaded.frame;
+    invalidateSpectrumDisplay();
     latestMeasurement = loaded.measurement;
     document.getElementById('saveBtn').disabled = false;
     resetXView(false);
@@ -2866,6 +2953,7 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
     ctx.fillText(edge.label, x + 4 * devicePixelRatio, y0 + 32 * devicePixelRatio);
   });
 
+  const labelEnds = [];
   calibrationCandidates.forEach(item => {
     const idx = Number(item.index);
     if (!Number.isFinite(idx) || idx < range.start || idx > range.end) return;
@@ -2880,7 +2968,13 @@ function drawMarkers(ctx, data, channelIndex, x0, y0, plotW, plotH, min, span, r
     ctx.setLineDash([]);
     ctx.fillStyle = ctx.strokeStyle;
     ctx.font = `${11 * devicePixelRatio}px Segoe UI`;
-    ctx.fillText(item.label || item.kind, x + 3 * devicePixelRatio, y0 + 48 * devicePixelRatio);
+    const text = item.label || item.kind;
+    const width = ctx.measureText(text).width;
+    const labelX = Math.max(x0, Math.min(x + 3 * devicePixelRatio, x0 + plotW - width));
+    let lane = labelEnds.findIndex(end => end + 5 * devicePixelRatio < labelX);
+    if (lane < 0) lane = labelEnds.length;
+    labelEnds[lane] = labelX + width;
+    ctx.fillText(text, labelX, y0 + (48 + lane * 16) * devicePixelRatio);
   });
 
   if (latestMeasurement && latestMeasurement.measurements) {
@@ -2923,7 +3017,12 @@ function handlePlotClick(event, channelIndex) {
     document.getElementById(target === 'calibration_carrier'
       ? 'calibration_carrier_index'
       : 'calibration_aom_zero_index').value = idx;
-    setCalibrationStatus(`已从波形点击设置${target === 'calibration_carrier' ? '载波' : 'AOM 零级'}索引。`, 'ok');
+    const carrier = document.getElementById('calibration_carrier_index').value;
+    const aom = document.getElementById('calibration_aom_zero_index').value;
+    if (carrier !== '' && aom !== '' && Number(carrier) !== Number(aom)) {
+      document.getElementById('eom_spacing_samples').value = Math.abs(Number(carrier) - Number(aom));
+    }
+    setCalibrationStatus(`已从波形点击设置${target === 'calibration_carrier' ? '载波' : 'AOM 一级'}索引。`, 'ok');
   } else {
     document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
     document.getElementById('pick_target').value = target === '0' ? '1' : '0';
@@ -2941,9 +3040,12 @@ function updateCursor(event, channelIndex) {
 
 function eventToSampleIndex(event, canvas, length) {
   const rect = canvas.getBoundingClientRect();
-  const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+  const backingX = (event.clientX - rect.left) * canvas.width / Math.max(1, rect.width);
+  const pad = 44 * devicePixelRatio;
+  const plotWidth = Math.max(1, canvas.width - 2 * pad);
+  const x = Math.min(Math.max(backingX - pad, 0), plotWidth);
   const range = getVisibleRange(length);
-  return Math.round(range.start + (x / Math.max(1, rect.width)) * (range.end - range.start));
+  return Math.round(range.start + (x / plotWidth) * (range.end - range.start));
 }
 
 function updatePeakTable() {
@@ -3374,11 +3476,16 @@ function updateFrameInfo() {
   const resync = latestFrame.resync_every_frames
     ? `  resync=${latestFrame.resync_every_frames} frames seg=${latestFrame.segment_id || 0}:${latestFrame.segment_frame_id || 0}`
     : '';
+  const alignment = latestFrame.frame_alignment === 'pfi0'
+    ? `  PFI0起点=${latestFrame.sample_start} 周期=${latestFrame.pfi0_period_samples}点` : '';
   document.getElementById('frameInfo').textContent =
-    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${frameMs}${frameHz}${trig}${resync}`;
+    `channels=${latestFrame.channels.join(', ')}  rate=${latestFrame.rate_per_channel} Hz  samples=${latestFrame.samples_per_channel}${frameMs}${frameHz}${trig}${resync}${alignment}`;
 }
 
 window.addEventListener('resize', resizeAndDraw);
+spectralSettingIds.forEach(id => document.getElementById(id).addEventListener('input', () => {
+  document.getElementById('scanApplyBtn').disabled = true;
+}));
 for (const id of ['rate', 'samples']) {
   document.getElementById(id).addEventListener('input', () => {
     updateDerivedTimingFromInputs();

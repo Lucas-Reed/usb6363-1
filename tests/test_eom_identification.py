@@ -55,9 +55,36 @@ class EomIdentificationTests(unittest.TestCase):
             eom_frequency_mhz=6800,
             fsr_mhz=2500,
         )
-        self.assertEqual(result["carrier"]["index"], 1000)
-        self.assertEqual(result["aom_first"]["index"], 1400)
+        self.assertEqual({result["carrier"]["index"], result["aom_first"]["index"]}, {1000, 1400})
+        self.assertEqual({h["carrier_index"] for h in result["hypotheses"]}, {1000, 1400})
         self.assertAlmostEqual(result["fit"]["scan_amplitude_mhz"], 2375.0)
         self.assertIsNone(result["fit"]["residual_rms_mhz"])
         self.assertTrue(result["ambiguous"])
         self.assertLess(result["confidence"], 0.4)
+
+    def test_full_folded_comb_selects_carrier_in_both_frequency_directions(self) -> None:
+        x = np.arange(10000)
+        s = folded_scan_coordinate(x)
+        for direction in (1, -1):
+            with self.subTest(direction=direction):
+                carrier = 2000.0
+                partner = carrier + direction * 400
+                shape = lambda v: v * (v - 5000) / 5000
+                pair_slope = (shape(partner) - shape(carrier)) / (partner - carrier)
+                q = direction * (.475 * (s - carrier) + .025 * (
+                    shape(s) - shape(carrier) - pair_slope * (s - carrier)))
+                signal = np.zeros(10000)
+                for line in [n * 6800 for n in range(-3, 4)] + [190]:
+                    for cavity in range(-10, 11):
+                        target = line + cavity * 2500
+                        signal += np.exp(-0.5 * ((q - target) / 5) ** 2)
+                result = identify_eom_aom_spectrum(signal, spacing_samples=400,
+                    spacing_mhz=190, match_tolerance_samples=3)
+                self.assertAlmostEqual(result["carrier"]["folded_coordinate"], carrier, delta=1)
+                self.assertFalse(result["ambiguous"])
+                self.assertEqual(len(result["centering_peaks"]), 2)
+                self.assertTrue(all(p["segment"] == 1 for p in result["centering_peaks"]))
+                self.assertTrue(all(abs(p["residual_samples"]) <= 3 for p in result["peaks"] if p["accepted"]))
+                wrong = [h for h in result["hypotheses"] if abs(h["carrier_index"] - (7500-partner)) <= 1]
+                self.assertTrue(wrong)
+                self.assertGreater(wrong[0]["score"], result["hypotheses"][0]["score"] + .1)

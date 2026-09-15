@@ -108,6 +108,8 @@ def make_handler(state: ViewerState):
                     )
                 elif path == "/api/eom/identification":
                     self._send_json(state.latest_eom_identification or {"configured": False})
+                elif path == "/api/scan_source":
+                    self._send_json(state.scan_source.read())
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:
@@ -219,6 +221,15 @@ def make_handler(state: ViewerState):
                 elif self.path == "/api/eom/identify":
                     body = self._read_json()
                     self._send_json(state.identify_eom_aom(body))
+                elif self.path == "/api/scan_source/connect":
+                    body = self._read_json()
+                    state.scan_centering_proposal = None
+                    self._send_json(state.scan_source.connect(str(body.get("resource", "")), int(body.get("channel", 1))))
+                elif self.path == "/api/scan_source/preview":
+                    self._send_json(state.preview_scan_centering(self._read_json()))
+                elif self.path == "/api/scan_source/apply":
+                    self._read_json()
+                    self._send_json(state.apply_scan_centering())
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:
