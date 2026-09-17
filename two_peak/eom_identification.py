@@ -153,7 +153,10 @@ def identify_eom_aom_spectrum(
     candidates = []
     for left in range(len(peaks) - 1):
         for right in range(left + 1, len(peaks)):
-            if segments[left] != segments[right]:
+            # The calibration pair is defined on the descending branch.
+            # Other branches are still used by the full-spectrum fit after
+            # this pair has established the local frequency scale.
+            if segments[left] != 1 or segments[right] != 1:
                 continue
             spacing_error = abs(abs(coords[right] - coords[left]) - spacing_samples)
             if spacing_error > spacing_tolerance_samples:

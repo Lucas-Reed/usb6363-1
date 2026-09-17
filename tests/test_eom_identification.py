@@ -46,8 +46,8 @@ class EomIdentificationTests(unittest.TestCase):
     def test_automatic_identification_uses_spacing_pair(self) -> None:
         x = np.arange(10000, dtype=float)
         signal = np.zeros(10000, dtype=float)
-        signal += np.exp(-0.5 * ((x - 1000) / 12.0) ** 2)
-        signal += 0.8 * np.exp(-0.5 * ((x - 1400) / 12.0) ** 2)
+        signal += np.exp(-0.5 * ((x - 4000) / 12.0) ** 2)
+        signal += 0.8 * np.exp(-0.5 * ((x - 4400) / 12.0) ** 2)
         result = identify_eom_aom_spectrum(
             signal,
             spacing_samples=400,
@@ -55,8 +55,8 @@ class EomIdentificationTests(unittest.TestCase):
             eom_frequency_mhz=6800,
             fsr_mhz=2500,
         )
-        self.assertEqual({result["carrier"]["index"], result["aom_first"]["index"]}, {1000, 1400})
-        self.assertEqual({h["carrier_index"] for h in result["hypotheses"]}, {1000, 1400})
+        self.assertEqual({result["carrier"]["index"], result["aom_first"]["index"]}, {4000, 4400})
+        self.assertEqual({h["carrier_index"] for h in result["hypotheses"]}, {4000, 4400})
         self.assertAlmostEqual(result["fit"]["scan_amplitude_mhz"], 2375.0)
         self.assertIsNone(result["fit"]["residual_rms_mhz"])
         self.assertTrue(result["ambiguous"])
@@ -88,3 +88,10 @@ class EomIdentificationTests(unittest.TestCase):
                 wrong = [h for h in result["hypotheses"] if abs(h["carrier_index"] - (7500-partner)) <= 1]
                 self.assertTrue(wrong)
                 self.assertGreater(wrong[0]["score"], result["hypotheses"][0]["score"] + .1)
+
+    def test_calibration_pair_is_required_on_descending_branch(self) -> None:
+        x = np.arange(10000, dtype=float)
+        signal = np.exp(-0.5 * ((x - 1000) / 12.0) ** 2)
+        signal += 0.8 * np.exp(-0.5 * ((x - 1400) / 12.0) ** 2)
+        with self.assertRaisesRegex(ValueError, "no peak pair"):
+            identify_eom_aom_spectrum(signal, spacing_samples=400, spacing_mhz=190)

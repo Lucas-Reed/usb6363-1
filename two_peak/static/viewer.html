@@ -303,8 +303,6 @@
   <select id="pick_target">
     <option value="0">P1</option>
     <option value="1">P2</option>
-    <option value="calibration_carrier">EOM 载波</option>
-    <option value="calibration_aom_zero">AOM 一级</option>
     <option value="area_left">面积左零点</option>
     <option value="area_right">面积右零点</option>
     <option value="area2_left">面积 B 左零点</option>
@@ -375,12 +373,12 @@
   <h2>EOM/AOM 识别（仅标注）</h2>
   <div class="grid2">
     <div>
-      <label>载波索引</label>
-      <input id="calibration_carrier_index" type="number" step="1" placeholder="点击波形后填入">
+      <label>自动识别的载波索引</label>
+      <input id="calibration_carrier_index" type="number" step="1" readonly placeholder="自动识别">
     </div>
     <div>
-      <label>AOM 一级索引</label>
-      <input id="calibration_aom_zero_index" type="number" step="1" placeholder="点击波形后填入">
+      <label>自动识别的 AOM 一级索引</label>
+      <input id="calibration_aom_zero_index" type="number" step="1" readonly placeholder="自动识别">
     </div>
   </div>
   <div class="grid2">
@@ -959,6 +957,7 @@
 <script>
 let latestFrame = null;
 let latestMeasurement = null;
+let latestEomIdentification = null;
 let plotCanvases = [];
 let streamRunning = false;
 let pfi1FeedbackTimer = null;
@@ -985,6 +984,7 @@ const spectralSettingIds = ['eom_spacing_samples', 'eom_spacing_tolerance', 'eom
 
 function invalidateSpectrumDisplay() {
   calibrationCandidates = [];
+  latestEomIdentification = null;
   document.getElementById('calibrationRows').innerHTML = '<tr><td colspan="4">--</td></tr>';
   document.getElementById('scanApplyBtn').disabled = true;
   document.getElementById('hypothesisRows').innerHTML = '<tr><td colspan="4">--</td></tr>';
@@ -1080,9 +1080,14 @@ function getMeasureParams() {
 }
 
 function getCalibrationParams() {
+  const identification = latestEomIdentification || {};
+  const carrier = document.getElementById('calibration_carrier_index').value ||
+    (identification.carrier && identification.carrier.index);
+  const aom = document.getElementById('calibration_aom_zero_index').value ||
+    (identification.aom_first && identification.aom_first.index);
   return {
-    carrier_index: Number(document.getElementById('calibration_carrier_index').value),
-    aom_zero_index: Number(document.getElementById('calibration_aom_zero_index').value),
+    carrier_index: carrier === undefined || carrier === null || carrier === '' ? null : Number(carrier),
+    aom_zero_index: aom === undefined || aom === null || aom === '' ? null : Number(aom),
     frequency_difference_mhz: Number(document.getElementById('calibration_frequency_difference_mhz').value),
     fsr_mhz: Number(document.getElementById('calibration_fsr_mhz').value),
     breakpoints: document.getElementById('calibration_breakpoints').value,
@@ -1371,9 +1376,6 @@ async function loadCalibration() {
 
 async function saveCalibration() {
   try {
-    if (!document.getElementById('calibration_carrier_index').value || !document.getElementById('calibration_aom_zero_index').value) {
-      throw new Error('请先选择两个校准点或完成自动识别。');
-    }
     const data = await postJson('/api/calibration/save', getCalibrationParams());
     applyCalibrationModel(data.model);
     setCalibrationStatus('校准模型已保存；候选标注仅用于显示。', 'ok');
@@ -1400,8 +1402,16 @@ async function runAutomaticIdentification() {
       min_peak_width: document.getElementById('eom_min_width').value,
       max_peak_width: document.getElementById('eom_max_width').value,
     });
+    if (!data.carrier || data.carrier.index === undefined || data.carrier.index === null) {
+      throw new Error('下降支 2500–7500 内没有找到符合频差的载频/AOM 峰对，请检查频差、点数差和峰宽参数。');
+    }
     document.getElementById('calibration_carrier_index').value = data.carrier.index;
-    document.getElementById('calibration_aom_zero_index').value = data.aom_first ? data.aom_first.index : '';
+    document.getElementById('calibration_aom_zero_index').value = data.aom_first && data.aom_first.index !== undefined
+      ? data.aom_first.index : '';
+    if (!data.aom_first || data.aom_first.index === undefined || data.aom_first.index === null) {
+      throw new Error('找到了候选峰，但没有确认 AOM 一级；请收紧峰位置容差或检查当前波形。');
+    }
+    latestEomIdentification = data;
     calibrationCandidates = (data.peaks || []).filter(item => item.accepted);
     const rows = document.getElementById('calibrationRows');
     rows.innerHTML = (data.peaks || []).map(item => `
@@ -2832,7 +2842,7 @@ function renderPlots() {
 
 function resizeAndDraw() {
   for (const item of plotCanvases) {
-    const rect = item.canvas.parentElement.getBoundingClientRect();
+    const rect = item.canvas.getBoundingClientRect();
     item.canvas.width = Math.max(300, Math.floor(rect.width * devicePixelRatio));
     item.canvas.height = Math.max(180, Math.floor(rect.height * devicePixelRatio));
     drawWaveform(item.canvas, item.data, item.index);
@@ -3013,16 +3023,6 @@ function handlePlotClick(event, channelIndex) {
     document.getElementById('manual_area2_right').value = idx;
     document.getElementById('pick_target').value = 'area2_left';
     manualArea2History = [];
-  } else if (target === 'calibration_carrier' || target === 'calibration_aom_zero') {
-    document.getElementById(target === 'calibration_carrier'
-      ? 'calibration_carrier_index'
-      : 'calibration_aom_zero_index').value = idx;
-    const carrier = document.getElementById('calibration_carrier_index').value;
-    const aom = document.getElementById('calibration_aom_zero_index').value;
-    if (carrier !== '' && aom !== '' && Number(carrier) !== Number(aom)) {
-      document.getElementById('eom_spacing_samples').value = Math.abs(Number(carrier) - Number(aom));
-    }
-    setCalibrationStatus(`已从波形点击设置${target === 'calibration_carrier' ? '载波' : 'AOM 一级'}索引。`, 'ok');
   } else {
     document.getElementById(target === '0' ? 'peak0' : 'peak1').value = idx;
     document.getElementById('pick_target').value = target === '0' ? '1' : '0';
@@ -3040,10 +3040,11 @@ function updateCursor(event, channelIndex) {
 
 function eventToSampleIndex(event, canvas, length) {
   const rect = canvas.getBoundingClientRect();
-  const backingX = (event.clientX - rect.left) * canvas.width / Math.max(1, rect.width);
-  const pad = 44 * devicePixelRatio;
-  const plotWidth = Math.max(1, canvas.width - 2 * pad);
-  const x = Math.min(Math.max(backingX - pad, 0), plotWidth);
+  const padBacking = 44 * devicePixelRatio;
+  const backingScale = canvas.width / Math.max(1, rect.width);
+  const plotLeft = rect.left + padBacking / backingScale;
+  const plotWidth = Math.max(1, (canvas.width - 2 * padBacking) / backingScale);
+  const x = Math.min(Math.max(event.clientX - plotLeft, 0), plotWidth);
   const range = getVisibleRange(length);
   return Math.round(range.start + (x / plotWidth) * (range.end - range.start));
 }

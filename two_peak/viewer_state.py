@@ -165,6 +165,15 @@ class ViewerState:
 
         model_payload = payload.get("model", payload)
         model_data = dict(model_payload)
+        if (model_data.get("carrier_index") in (None, "") or
+                model_data.get("aom_zero_index") in (None, "")):
+            identification = self.latest_eom_identification or {}
+            carrier = identification.get("carrier") or {}
+            aom = identification.get("aom_first") or {}
+            model_data.setdefault("carrier_index", carrier.get("index"))
+            model_data.setdefault("aom_zero_index", aom.get("index"))
+        if model_data.get("carrier_index") in (None, "") or model_data.get("aom_zero_index") in (None, ""):
+            raise ValueError("Automatic identification did not find a carrier/AOM pair on the descending branch")
         if not model_data.get("breakpoints"):
             count = _frame_sample_count(self.latest_frame) or 10000
             model_data["breakpoints"] = [count // 4, 3 * count // 4]
