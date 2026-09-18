@@ -57,6 +57,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopping viewer.")
     finally:
+        state.scan_centering.stop()
         server.server_close()
     return 0
 

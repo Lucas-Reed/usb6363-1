@@ -11,6 +11,7 @@ from two_peak.config import TwoPeakSettings
 from two_peak.power_lock import PowerLockController
 from two_peak.sync_test import SyncTestCoordinator
 from two_peak.scan_source import RigolScanSource, plan_centering
+from two_peak.scan_centering import ScanCenteringController
 from two_peak.trend_logger import AreaTrendLogger
 from usb6363_client import Usb6363Client
 
@@ -33,6 +34,7 @@ class ViewerState:
         self.latest_frame: dict[str, Any] | None = None
         self.latest_measurement: dict[str, Any] | None = None
         self.scan_source = RigolScanSource()
+        self.scan_centering = ScanCenteringController(self.daq, self.scan_source)
         self.scan_centering_proposal: dict[str, Any] | None = None
         # 慢漂记录器会在后端线程里读取底层 frame_stream 最新帧并写 CSV。
         # 它不依赖浏览器是否一直打开。
@@ -142,6 +144,8 @@ class ViewerState:
         return data
 
     def preview_scan_centering(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.scan_centering.status()["running"]:
+            raise ValueError("请先停止自动居中再进行单次调整")
         self.scan_centering_proposal = None
         indices = [int(value) for value in payload.get("peak_indices", [])]
         count = int(payload.get("sample_count") or _frame_sample_count(self.latest_frame) or 0)
@@ -158,15 +162,15 @@ class ViewerState:
         current = self.scan_source.read()
         proposal = plan_centering(
             selection, current,
-            resize=bool(payload.get("resize", False)),
-            separation_fraction=float(payload.get("separation_fraction", 0.4)),
-            min_voltage=float(payload.get("min_voltage", 0.0)),
+            min_voltage=float(payload.get("min_voltage", 0.01)),
             max_voltage=float(payload.get("max_voltage", 5.0)),
         )
         self.scan_centering_proposal = proposal
         return {"current": current, "proposal": proposal}
 
     def apply_scan_centering(self) -> dict[str, Any]:
+        if self.scan_centering.status()["running"]:
+            raise ValueError("请先停止自动居中再进行单次调整")
         proposal = self.scan_centering_proposal
         if not proposal:
             raise ValueError("Preview the centering settings first")

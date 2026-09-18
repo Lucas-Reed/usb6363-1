@@ -95,6 +95,8 @@ def make_handler(state: ViewerState):
                     self._send_json(list_saved_frames(state))
                 elif path == "/api/scan_source":
                     self._send_json(state.scan_source.read())
+                elif path == "/api/scan_centering/status":
+                    self._send_json(state.scan_centering.status())
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:
@@ -192,6 +194,7 @@ def make_handler(state: ViewerState):
                     self._send_json(defaults)
                 elif self.path == "/api/scan_source/connect":
                     body = self._read_json()
+                    state.scan_centering.stop()
                     state.scan_centering_proposal = None
                     self._send_json(state.scan_source.connect(str(body.get("resource", "")), int(body.get("channel", 1))))
                 elif self.path == "/api/scan_source/preview":
@@ -199,6 +202,12 @@ def make_handler(state: ViewerState):
                 elif self.path == "/api/scan_source/apply":
                     self._read_json()
                     self._send_json(state.apply_scan_centering())
+                elif self.path == "/api/scan_centering/start":
+                    state.scan_centering_proposal = None
+                    self._send_json(state.scan_centering.start(self._read_json()))
+                elif self.path == "/api/scan_centering/stop":
+                    self._read_json()
+                    self._send_json(state.scan_centering.stop())
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Unknown route")
             except Exception as exc:

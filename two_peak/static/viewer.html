@@ -377,19 +377,25 @@
   <label class="inline"><input id="freeze_waveform" type="checkbox"> 冻结显示波形（采集继续）</label>
 
   <h2>Rigol DG4162 扫描居中</h2>
-  <p>使用手选 P1/P2 的中点居中；预览时冻结显示，确认后再写入。</p>
+  <p>先手动调好并固定 Vpp，再选择 P1/P2。自动居中只微调偏置，使中点趋近下降段中心（默认 5000 点）。关闭页面后仍在后台运行，停止按钮保持最后偏置。</p>
   <label>下降段左右拐点 / 点</label><input id="scan_breakpoints" value="2500,7500">
   <label>VISA 资源地址</label><input id="scan_resource" placeholder="TCPIP0::192.168.1.100::INSTR">
   <label>扫描输出通道</label><select id="scan_channel"><option value="1">CH1</option><option value="2">CH2</option></select>
   <div class="actions"><button onclick="connectScanSource()">连接信号源</button><button class="secondary" onclick="readScanSource()">读取参数</button></div>
   <div id="scan_source_status" class="status">未连接</div>
-  <label class="inline"><input id="scan_resize" type="checkbox"> 同时缩小扫描幅度</label>
-  <label>两峰间距 / 下降段长度</label><input id="scan_fraction" type="number" value="0.4" min="0.05" max="0.9" step="0.05">
   <div class="grid2">
-    <div><label>扫描电压下限 / V</label><input id="scan_min" type="number" value="0" step="0.1"></div>
+    <div><label>扫描电压下限 / V（须大于零）</label><input id="scan_min" type="number" value="0.01" min="0.001" step="0.01"></div>
     <div><label>扫描电压上限 / V</label><input id="scan_max" type="number" value="5" step="0.1"></div>
   </div>
-  <div class="actions"><button onclick="previewScanCentering()">预览居中</button><button id="scanApplyBtn" class="green" onclick="applyScanCentering()" disabled>写入幅度与偏置</button></div>
+  <div class="grid2">
+    <div><label>调整周期 / 秒</label><input id="scan_interval" type="number" value="1" min="0.2" step="0.1"></div>
+    <div><label>修正比例</label><input id="scan_gain" type="number" value="0.3" min="0.01" max="1" step="0.05"></div>
+    <div><label>每次最大偏置调整 / V</label><input id="scan_step" type="number" value="0.01" min="0.001" step="0.001"></div>
+    <div><label>中心容差 / 点</label><input id="scan_deadband" type="number" value="2" min="0" step="1"></div>
+  </div>
+  <div class="actions"><button onclick="startScanCentering()">启动自动居中</button><button class="secondary" onclick="stopScanCentering()">停止居中</button></div>
+  <div id="scan_centering_status" class="status">自动居中未启动</div>
+  <div class="actions"><button onclick="previewScanCentering()">预览单次居中</button><button id="scanApplyBtn" class="green" onclick="applyScanCentering()" disabled>只写入偏置</button></div>
   <div id="scan_proposal_status" class="status">--</div>
 
   <h2>结果</h2>
@@ -890,7 +896,57 @@ let xViewEnd = null;
 let manualAreaHistory = [];
 let manualArea2History = [];
 let manualSelectionPending = false;
-const spectralSettingIds = ['scan_resource', 'scan_channel', 'scan_resize', 'scan_fraction', 'scan_min', 'scan_max', 'scan_breakpoints'];
+const spectralSettingIds = ['scan_resource', 'scan_channel', 'scan_min', 'scan_max', 'scan_breakpoints', 'scan_interval', 'scan_gain', 'scan_step', 'scan_deadband'];
+let selectedPeakTracking = [false, false];
+let peakSelectionRevision = 0;
+let scanStatusInFlight = false;
+let scanCenteringRunning = false;
+let scanPreview = null;
+function scanCenteringParameters() {
+  if (!latestFrame || !selectedPeakTracking.every(Boolean)) throw new Error('请在当前波形上分别点击选择 P1 和 P2');
+  return {...getMeasureParams(),
+    channel: latestFrame.channels[Number(document.getElementById('analysis_channel_index').value)],
+    breakpoints: document.getElementById('scan_breakpoints').value,
+    sample_count: latestFrame.values[0].length,
+    min_voltage: Number(document.getElementById('scan_min').value),
+    max_voltage: Number(document.getElementById('scan_max').value),
+    interval: Number(document.getElementById('scan_interval').value),
+    gain: Number(document.getElementById('scan_gain').value),
+    max_step_v: Number(document.getElementById('scan_step').value),
+    deadband_samples: Number(document.getElementById('scan_deadband').value)};
+}
+function showScanCentering(status) {
+  scanCenteringRunning = status.running;
+  if (status.running && status.peak_indices && !selectedPeakTracking.some(Boolean)) {
+    status.peak_indices.forEach((index, i) => { document.getElementById('peak' + i).value = Math.round(index); });
+    selectedPeakTracking = [true, true];
+  }
+  document.getElementById('scan_centering_status').textContent =
+    `${status.running ? '运行中' : '已停止'}：${status.error || status.message || '保持偏置'}；` +
+    `两峰 ${status.peak_indices?.map(x => Number(x).toFixed(1)).join('、') || '--'}；中心误差 ${status.error_samples?.toFixed(1) ?? '--'} 点；调整 ${status.updates || 0} 次`;
+  if (status.source) showScanSource(status.source);
+}
+async function refreshScanCentering() {
+  if (scanStatusInFlight) return;
+  scanStatusInFlight = true;
+  try {
+    const response = await fetch('/api/scan_centering/status');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    showScanCentering(data);
+  } catch (err) { document.getElementById('scan_centering_status').textContent = `居中状态查询失败：${err.message}`; }
+  finally { scanStatusInFlight = false; }
+}
+async function startScanCentering() {
+  try {
+    if (document.getElementById('freeze_waveform').checked) throw new Error('请先解除波形冻结，确认两峰仍被正确跟踪');
+    showScanCentering(await postJson('/api/scan_centering/start', scanCenteringParameters()));
+  } catch (err) { document.getElementById('scan_centering_status').textContent = err.message; }
+}
+async function stopScanCentering() {
+  try { showScanCentering(await postJson('/api/scan_centering/stop', {})); }
+  catch (err) { document.getElementById('scan_centering_status').textContent = err.message; }
+}
 function invalidateSpectrumDisplay() {
   document.getElementById('scanApplyBtn').disabled = true;
 }
@@ -922,6 +978,7 @@ async function readScanSource() {
 async function previewScanCentering() {
   document.getElementById('scanApplyBtn').disabled = true;
   try {
+    if (scanCenteringRunning) throw new Error('请先停止自动居中');
     if (!latestFrame) throw new Error('请先显示波形并选择 P1/P2');
     document.getElementById('freeze_waveform').checked = true;
     while (streamPollInFlight) await new Promise(resolve => setTimeout(resolve, 20));
@@ -929,12 +986,11 @@ async function previewScanCentering() {
       peak_indices: getMeasureParams().peak_indices,
       breakpoints: document.getElementById('scan_breakpoints').value,
       sample_count: latestFrame?.values?.[0]?.length,
-      resize: document.getElementById('scan_resize').checked,
-      separation_fraction: Number(document.getElementById('scan_fraction').value),
       min_voltage: Number(document.getElementById('scan_min').value),
       max_voltage: Number(document.getElementById('scan_max').value),
     });
     const p = data.proposal;
+    scanPreview = p;
     showScanSource(data.current);
     document.getElementById('scan_proposal_status').textContent =
       `${p.ambiguous ? '峰级别仍有歧义；' : ''}${p.selected_indices.map((index, i) => `${p.selected_labels[i]} @ ${index}`).join('、')}；` +
@@ -950,8 +1006,11 @@ async function applyScanCentering() {
   document.getElementById('scanApplyBtn').disabled = true;
   try {
     showScanSource(await postJson('/api/scan_source/apply', {}));
+    if (scanPreview) scanPreview.predicted_indices.forEach((index, i) => {
+      document.getElementById('peak' + i).value = Math.round(index);
+    });
     invalidateSpectrumDisplay();
-    document.getElementById('scan_proposal_status').textContent = '已写入并回读幅度、偏置。原波形为调整前的数据。';
+    document.getElementById('scan_proposal_status').textContent = '已写入偏置，Vpp 保持不变。原波形为调整前的数据，请解除冻结检查。';
   } catch (err) { document.getElementById('scan_proposal_status').textContent = err.message; }
 }
 
@@ -974,6 +1033,7 @@ function getCaptureParams() {
 
 function getMeasureParams() {
   return {
+    track_peaks: selectedPeakTracking.slice(),
     peak_indices: [
       Number(document.getElementById('peak0').value),
       Number(document.getElementById('peak1').value),
@@ -2511,7 +2571,15 @@ async function measurePeaks(redraw = true) {
     return;
   }
   try {
-    latestMeasurement = await postJson('/api/measure', getMeasureParams());
+    const revision = peakSelectionRevision;
+    const measured = await postJson('/api/measure', getMeasureParams());
+    if (revision !== peakSelectionRevision || (measured.frame_id != null && measured.frame_id !== latestFrame.frame_id)) return;
+    latestMeasurement = measured;
+    if (!measured.excluded && measured.tracked_indices) {
+      measured.tracked_indices.forEach((index, i) => {
+        if (selectedPeakTracking[i]) document.getElementById('peak' + i).value = index;
+      });
+    }
     updateDualAreaHistory();
     updatePeakTable();
     updateManualAreaTable();
@@ -2519,6 +2587,8 @@ async function measurePeaks(redraw = true) {
     if (redraw) renderPlots();
     setStatus('测峰完成。', 'ok');
   } catch (err) {
+    document.getElementById('pick_status').textContent = `峰测量/跟踪失败：${err.message}。请检查峰位与搜索半宽。`;
+    document.getElementById('pick_status').className = 'status error';
     setStatus(String(err.message || err), 'error');
   }
 }
@@ -2870,6 +2940,7 @@ function locateClickedPeak(data, clicked, searchHalf) {
 function handlePlotClick(event, channelIndex) {
   const status = document.getElementById('pick_status');
   try {
+    if (scanCenteringRunning) throw new Error('请先停止自动居中再更换选峰');
     const item = plotCanvases[channelIndex];
     if (!item) throw new Error('尚未显示波形');
     const idx = eventToSampleIndex(event, item.canvas, item.data.length);
@@ -2888,6 +2959,7 @@ function handlePlotClick(event, channelIndex) {
         Math.max(clickTolerance, Number(document.getElementById('search_window_half').value)));
       const prefix = target === '0' ? 'manual_area' : 'manual_area2';
       document.getElementById('peak' + target).value = selected.index;
+      selectedPeakTracking[Number(target)] = true;
       document.getElementById(prefix + '_left').value = selected.left;
       document.getElementById(prefix + '_right').value = selected.right;
       message = `P${Number(target)+1}：左 ${selected.left} / 中 ${selected.index} / 右 ${selected.right}，宽 ${selected.right-selected.left} 点`;
@@ -2900,6 +2972,7 @@ function handlePlotClick(event, channelIndex) {
       message = `边界已设置为 ${idx}`;
     }
     // Stay on the chosen peak: repeated clicks refine it, never silently switch P1/P2.
+    peakSelectionRevision++;
     manualAreaHistory = []; manualArea2History = [];
     manualSelectionPending = trendRunning;
     latestMeasurement = null;
@@ -3248,6 +3321,7 @@ function updateFrameInfo() {
 
 window.addEventListener('resize', resizeAndDraw);
 [...spectralSettingIds, 'peak0', 'peak1'].forEach(id => document.getElementById(id).addEventListener('input', () => {
+  peakSelectionRevision++;
   document.getElementById('scanApplyBtn').disabled = true;
 }));
 for (const id of ['rate', 'samples']) {
@@ -3283,6 +3357,8 @@ updateDualAreaTable();
 loadDefaults();
 refreshSavedSamples();
 syncBackendStreamStatus(true);
+refreshScanCentering();
+setInterval(refreshScanCentering, 1000);
 refreshTrendStatus(true);
 refreshSyncTestStatus(false);
 syncTestTimer = setInterval(() => refreshSyncTestStatus(false), 1000);

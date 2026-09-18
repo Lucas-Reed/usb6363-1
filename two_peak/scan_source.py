@@ -4,8 +4,9 @@ import math
 import threading
 
 
-def plan_centering(identification: dict, source: dict, *, resize=False,
-                   separation_fraction=0.4, min_voltage=0.0, max_voltage=5.0) -> dict:
+def plan_centering(identification: dict, source: dict, *,
+                   min_voltage=0.01, max_voltage=5.0,
+                   gain=1.0, max_step_v=None, deadband_samples=0.0) -> dict:
     pair = identification.get("centering_peaks") or []
     if len(pair) != 2:
         raise ValueError("Select P1 and P2 on the descending scan branch first")
@@ -18,19 +19,27 @@ def plan_centering(identification: dict, source: dict, *, resize=False,
         raise ValueError("The calibrated triangular scan requires RAMP with 50% symmetry")
     if span <= 0 or any(not first <= p["index"] < second for p in pair):
         raise ValueError("Both selected peaks must be on the descending scan branch")
-    if not all(math.isfinite(v) for v in (amplitude, offset, min_voltage, max_voltage, separation_fraction)):
+    if not all(math.isfinite(v) for v in (amplitude, offset, min_voltage, max_voltage, gain, deadband_samples)):
         raise ValueError("Scan settings must be finite")
-    if amplitude <= 0 or max_voltage <= min_voltage or not 0 < separation_fraction < 1:
-        raise ValueError("Invalid scan amplitude, voltage limits or separation fraction")
+    if amplitude <= 0 or min_voltage <= 0 or max_voltage <= min_voltage or not 0 < gain <= 1 or deadband_samples < 0:
+        raise ValueError("最低电压必须大于零；请检查电压范围、增益和中心容差")
     voltages = [offset + amplitude * ((second - p["index"]) / span - 0.5) for p in pair]
-    center = sum(voltages) / 2
+    error_samples = sum(p["index"] for p in pair) / 2 - (first + second) / 2
+    correction = -amplitude * error_samples / span * gain
+    if abs(error_samples) <= deadband_samples:
+        correction = 0.0
+    if max_step_v is not None:
+        if not math.isfinite(max_step_v) or max_step_v <= 0:
+            raise ValueError("最大单次偏置调整量必须大于零")
+        correction = max(-max_step_v, min(max_step_v, correction))
+    center = offset + correction
     separation_v = abs(voltages[0] - voltages[1])
-    new_amplitude = min(amplitude, separation_v / separation_fraction) if resize else amplitude
+    new_amplitude = amplitude
     if new_amplitude <= separation_v:
         raise ValueError("Scan amplitude must span both selected peaks")
     low, high = center - new_amplitude / 2, center + new_amplitude / 2
-    if low < min_voltage - 1e-9 or high > max_voltage + 1e-9:
-        raise ValueError(f"Centered scan would span {low:.4f}..{high:.4f} V; adjust amplitude or voltage limits")
+    if low <= 0 or low < min_voltage - 1e-9 or high > max_voltage + 1e-9:
+        raise ValueError(f"调整后电压范围 {low:.4f}..{high:.4f} V 超出限制；请手动减小 Vpp 或调整初始偏置")
     predicted = [second - span * ((v - center) / new_amplitude + 0.5) for v in voltages]
     return dict(amplitude_vpp=new_amplitude, offset_v=center, minimum_v=low, maximum_v=high,
                 original_amplitude_vpp=amplitude, original_offset_v=offset,
@@ -38,6 +47,7 @@ def plan_centering(identification: dict, source: dict, *, resize=False,
                 selected_indices=[p["index"] for p in pair], predicted_indices=predicted,
                 selected_labels=[p.get("label", "peak") for p in pair],
                 target_index=(first + second) / 2, voltage_separation_v=separation_v,
+                error_samples=error_samples, correction_v=correction,
                 ambiguous=bool(identification.get("ambiguous")))
 
 
@@ -117,13 +127,9 @@ class RigolScanSource:
                     raise ValueError("Source settings changed; calculate a new centering proposal")
             amplitude, offset = plan["amplitude_vpp"], plan["offset_v"]
             prefix = f":SOUR{self.channel}"
-            # Narrow the span first so the offset change cannot widen the
-            # intermediate voltage excursion. Output enable is never changed.
-            if amplitude < current["amplitude_vpp"]:
-                self._instrument.write(f"{prefix}:VOLT:AMPL {amplitude:.9g}")
+            if abs(amplitude - current["amplitude_vpp"]) > 1e-9:
+                raise ValueError("居中只允许调整偏置；请手动设置 Vpp")
             self._instrument.write(f"{prefix}:VOLT:OFFS {offset:.9g}")
-            if amplitude > current["amplitude_vpp"]:
-                self._instrument.write(f"{prefix}:VOLT:AMPL {amplitude:.9g}")
             self._instrument.query("*OPC?")
             error = self._instrument.query(":SYST:ERR?").strip()
             if int(error.split(",", 1)[0]) != 0:

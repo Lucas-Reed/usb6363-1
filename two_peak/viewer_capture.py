@@ -13,6 +13,7 @@ import numpy as np
 
 from two_peak.signal import locate_and_measure_two_peaks
 from two_peak.signal import measure_manual_area
+from two_peak.scan_centering import track_selected_peaks
 from two_peak.viewer_state import ViewerState
 
 
@@ -380,9 +381,18 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
         raise ValueError("analysis_channel_index is out of range")
 
     analysis_signal = values[analysis_channel_index]
+    tracked = list(peak_indices)
+    tracking = body.get("track_peaks", [False, False])
+    if isinstance(tracking, list) and len(tracking) == 2:
+        active = [i for i in range(2) if tracking[i]]
+        if active:
+            located = track_selected_peaks(analysis_signal, [peak_indices[i] for i in active],
+                                           search_window_half, smooth_window)
+            for i, index in zip(active, located):
+                tracked[i] = index
     _, measurements = locate_and_measure_two_peaks(
         ai0=analysis_signal,
-        peak_indices=[int(peak_indices[0]), int(peak_indices[1])],
+        peak_indices=[int(tracked[0]), int(tracked[1])],
         smooth_window=smooth_window,
         search_window_half=search_window_half,
         measure_half=measure_half,
@@ -419,6 +429,8 @@ def measure_latest_frame(state: ViewerState, body: dict[str, Any]) -> dict[str, 
         manual_areas.append(area_b)
 
     return {
+        "frame_id": frame.get("frame_id"),
+        "tracked_indices": tracked,
         "analysis_channel_index": analysis_channel_index,
         "analysis_channel": frame["channels"][analysis_channel_index],
         "peak_indices_input": [int(peak_indices[0]), int(peak_indices[1])],

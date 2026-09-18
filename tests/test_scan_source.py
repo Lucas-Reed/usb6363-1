@@ -20,12 +20,15 @@ class ScanCenteringTests(unittest.TestCase):
         self.assertEqual(plan["offset_v"], 3)
         self.assertEqual(plan["predicted_indices"], [4500, 5500])
 
-    def test_optional_narrowing_fits_pair_in_original_voltage_range(self):
-        plan = plan_centering(self.identification, self.source, resize=True)
-        self.assertEqual(plan["amplitude_vpp"], 2.5)
-        self.assertEqual(plan["predicted_indices"], [4000, 6000])
-        self.assertEqual(plan["minimum_v"], 1.75)
-        self.assertEqual(plan["maximum_v"], 4.25)
+    def test_offset_step_is_limited_and_amplitude_is_fixed(self):
+        plan = plan_centering(self.identification, dict(self.source, amplitude_vpp=4),
+                              gain=.3, max_step_v=.01)
+        self.assertEqual(plan["amplitude_vpp"], 4)
+        self.assertAlmostEqual(plan["offset_v"], 2.51)
+        with self.assertRaises(ValueError):
+            plan_centering(self.identification, self.source)
+        with self.assertRaises(ValueError):
+            plan_centering(self.identification, self.source, min_voltage=0)
 
     def test_preview_uses_manual_peaks_without_identification(self):
         with TemporaryDirectory() as folder:
@@ -34,15 +37,15 @@ class ScanCenteringTests(unittest.TestCase):
             state.scan_source.read.return_value = self.source
             result = state.preview_scan_centering(dict(
                 peak_indices=[4000, 5000], sample_count=10000,
-                breakpoints='2500,7500', resize=True))
+                breakpoints='2500,7500', max_voltage=6))
             self.assertEqual(result['proposal']['selected_labels'], ['P1', 'P2'])
             self.assertEqual(result['proposal']['offset_v'], 3)
             state.scan_source.apply.assert_not_called()
             with self.assertRaises(ValueError):
                 state.preview_scan_centering(dict(peak_indices=[100, 5000], sample_count=10000))
 
-    def test_apply_changes_amplitude_before_offset_and_reads_back(self):
-        plan = plan_centering(self.identification, self.source, resize=True)
+    def test_apply_only_writes_offset_and_reads_back(self):
+        plan = plan_centering(self.identification, self.source, max_voltage=6)
         instrument = RigolScanSource()
         writes = []
         class FakeVisa:
@@ -51,8 +54,8 @@ class ScanCenteringTests(unittest.TestCase):
             def query(_self, command):
                 return {":SOUR1:FUNC:RAMP:SYMM?": "50", "*OPC?": "1", ":SYST:ERR?": '0,"No error"'}[command]
         instrument._instrument = FakeVisa()
-        snapshots = iter([self.source, dict(self.source, amplitude_vpp=2.5, offset_v=3)])
+        snapshots = iter([self.source, dict(self.source, offset_v=3)])
         instrument._read = lambda: next(snapshots)
         actual = instrument.apply(plan)
-        self.assertEqual(writes, [":SOUR1:VOLT:AMPL 2.5", ":SOUR1:VOLT:OFFS 3"])
+        self.assertEqual(writes, [":SOUR1:VOLT:OFFS 3"])
         self.assertEqual(actual["offset_v"], 3)
