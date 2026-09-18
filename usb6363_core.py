@@ -27,6 +27,7 @@ import numpy as np
 
 from usb6363 import nidaqmx_driver
 from usb6363.pfi_frames import PfiFrameAssembler
+from usb6363.acquisition_diagnostics import AcquisitionDiagnostics
 
 
 # NI MAX / NI-DAQmx 里给 USB-6363 设置的设备名。
@@ -162,6 +163,8 @@ class DaqController:
         # existing latest/buffer fields remain unchanged for legacy callers.
         self._unified_range_buffers: dict[str, deque[float]] = {}
         self._unified_sample_cursor = 0
+        self._unified_diagnostic_file = None
+        self._unified_diagnostic_error = None
 
     # ---------------------------------------------------------------------
     # 设备信息
@@ -887,6 +890,8 @@ class DaqController:
             self._unified_stop_event = stop_event
             self._unified_thread = thread
             self._unified_settings = dict(settings)
+            self._unified_diagnostic_file = None
+            self._unified_diagnostic_error = None
             self._unified_frame_id = 0
             self._unified_error = None
             self._unified_latest_frame = None
@@ -936,6 +941,8 @@ class DaqController:
             return {
                 "running": self._unified_running,
                 "error": self._unified_error,
+                "diagnostic_file": self._unified_diagnostic_file,
+                "diagnostic_save_error": self._unified_diagnostic_error,
                 "frame_id": self._unified_frame_id,
                 "has_frame": self._unified_latest_frame is not None,
                 "last_update": self._unified_last_update,
@@ -1505,6 +1512,7 @@ class DaqController:
         event_timeline_enabled = bool(settings.get("event_timeline_enabled", False))
         sample_cursor = 0
         segment_id = 0
+        diagnostics = AcquisitionDiagnostics()
         try:
             while not stop_event.is_set():
                 segment_id += 1
@@ -1513,6 +1521,7 @@ class DaqController:
                 previous_pfi1_count: int | None = None
                 assembler = PfiFrameAssembler(samples_per_frame, len(channels)) if event_timeline_enabled else None
                 counter_tasks: list[Any] = []
+                diagnostics.mark("AI setup")
                 if event_timeline_enabled:
                     task = nidaqmx_driver.create_continuous_ai_task(
                         channels=channels,
@@ -1527,7 +1536,8 @@ class DaqController:
                     )
                     try:
                         sample_clock_source = f"/{self.device_name}/ai/SampleClock"
-                        counter_tasks = [
+                        diagnostics.mark("PFI0 setup")
+                        counter_tasks.append(
                             nidaqmx_driver.create_buffered_pfi_counter_task(
                                 device_name=self.device_name,
                                 physical_counter=str(settings.get("pfi0_counter", f"{self.device_name}/ctr0")),
@@ -1536,7 +1546,10 @@ class DaqController:
                                 sample_clock_source=sample_clock_source,
                                 rate=float(settings["rate_per_channel"]),
                                 samples_per_read=samples_per_frame,
-                            ),
+                            )
+                        )
+                        diagnostics.mark("PFI1 setup")
+                        counter_tasks.append(
                             nidaqmx_driver.create_buffered_pfi_counter_task(
                                 device_name=self.device_name,
                                 physical_counter=str(settings.get("pfi1_counter", f"{self.device_name}/ctr1")),
@@ -1545,12 +1558,14 @@ class DaqController:
                                 sample_clock_source=sample_clock_source,
                                 rate=float(settings["rate_per_channel"]),
                                 samples_per_read=samples_per_frame,
-                            ),
-                        ]
+                            )
+                        )
                         # Counter tasks must already be armed when AI starts so
                         # their first samples share the AI clock timeline.
+                        diagnostics.mark("AI start")
                         task.start()
                     except Exception:
+                        diagnostics.freeze_failure()
                         for counter_task in counter_tasks:
                             try:
                                 counter_task.close()
@@ -1570,13 +1585,16 @@ class DaqController:
                         start_trigger_edge_name=str(settings["trigger_edge"]),
                     )
                 try:
+                    diagnostics.previous_read = None
                     while not stop_event.is_set():
+                        diagnostics.begin_read()
                         channel_values = nidaqmx_driver.read_continuous_ai_chunk(
                             task=task,
                             samples_per_read=samples_per_frame,
                             channel_count=len(channels),
                             timeout=float(settings["timeout"]),
                         )
+                        diagnostics.mark("block metadata")
                         samples_this_frame = (
                             len(channel_values[0]) if channel_values else samples_per_frame
                         )
@@ -1585,12 +1603,15 @@ class DaqController:
                         pfi0_events: list[dict[str, int]] = []
                         pfi1_events: list[dict[str, int]] = []
                         if event_timeline_enabled:
+                            diagnostics.mark("PFI0 read")
                             pfi0_counts = nidaqmx_driver.read_buffered_pfi_counts(
                                 counter_tasks[0], samples_this_frame, float(settings["timeout"])
                             )
+                            diagnostics.mark("PFI1 read")
                             pfi1_counts = nidaqmx_driver.read_buffered_pfi_counts(
                                 counter_tasks[1], samples_this_frame, float(settings["timeout"])
                             )
+                            diagnostics.mark("edge detection")
                             pfi0_events, previous_pfi0_count = _counter_transition_samples(
                                 pfi0_counts, previous_pfi0_count, sample_start
                             )
@@ -1598,7 +1619,9 @@ class DaqController:
                                 pfi1_counts, previous_pfi1_count, sample_start
                             )
                         now = time.time()
+                        diagnostics.mark("raw cache lock wait")
                         with self._ai_lock:
+                            diagnostics.mark("raw cache lock held")
                             if stop_event.is_set():
                                 break
                             for channel, values in zip(channels, channel_values):
@@ -1610,19 +1633,29 @@ class DaqController:
                                 self._unified_sample_counts[channel] += len(values)
                             self._unified_sample_cursor = sample_end
                             self._unified_last_update = now
+                        diagnostics.mark("frame assembly")
                         windows = assembler.append(channel_values, sample_start, pfi0_events, pfi1_events) if assembler else [{
                             "values": channel_values, "sample_start": sample_start,
                             "sample_end": sample_end, "pfi0_events": pfi0_events,
                             "pfi1_events": pfi1_events, "pfi1_triggered": bool(pfi1_events),
                         }]
+                        diagnostics.mark("frame conversion")
                         for window in windows:
                             segment_frame_id += 1
                             history_values = np.ascontiguousarray(window["values"], dtype=np.float32)
-                            self._publish_unified_window(settings, window, history_values, segment_id, segment_frame_id, now)
+                            self._publish_unified_window(settings, window, history_values, segment_id, segment_frame_id, now, diagnostics)
+                            diagnostics.mark("frame conversion")
                         sample_cursor = sample_end
+                        diagnostics.mark("diagnostic sampling")
+                        diagnostics.snapshot([("AI", task)] + list(zip(("PFI0", "PFI1"), counter_tasks)),
+                                             sample_cursor, self._unified_frame_id)
+                        diagnostics.mark("loop bookkeeping")
 
                         if resync_every_frames > 0 and segment_frame_id >= resync_every_frames:
                             break
+                except Exception:
+                    diagnostics.freeze_failure()
+                    raise
                 finally:
                     task.close()
                     for counter_task in counter_tasks:
@@ -1631,21 +1664,30 @@ class DaqController:
                         except Exception:
                             pass
         except Exception as exc:
+            failed_stage = diagnostics.failed_stage or diagnostics.stage
+            try:
+                self._unified_diagnostic_file = diagnostics.save_failure(settings, exc)
+            except Exception as save_exc:
+                self._unified_diagnostic_error = str(save_exc)
             with self._ai_lock:
-                self._unified_error = str(exc)
+                self._unified_error = f"{failed_stage}: {exc}"
         finally:
             with self._ai_lock:
                 if self._unified_thread is threading.current_thread():
                     self._unified_running = False
 
-    def _publish_unified_window(self, settings, window, history_values, segment_id, segment_frame_id, now):
+    def _publish_unified_window(self, settings, window, history_values, segment_id, segment_frame_id, now, diagnostics=None):
         channels = list(settings["channels"])
         samples_this_frame = history_values.shape[1]
         resync_every_frames = int(settings.get("resync_every_frames", 0))
         sample_start, sample_end = window["sample_start"], window["sample_end"]
         pfi0_events, pfi1_events = window["pfi0_events"], window["pfi1_events"]
         channel_values = np.asarray(window["values"]).tolist()
+        if diagnostics:
+            diagnostics.mark("frame publication lock wait")
         with self._ai_lock:
+            if diagnostics:
+                diagnostics.mark("frame publication lock held")
             self._unified_frame_id += 1
             frame = {
                 "device": self.device_name,
