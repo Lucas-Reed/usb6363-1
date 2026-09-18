@@ -256,6 +256,8 @@
   </div>
 
   <h2>连续采集</h2>
+  <div id="display_timing" class="hint">显示耗时：等待刷新</div>
+  <button class="secondary" onclick="downloadDisplayTiming()">下载页面卡顿记录</button>
   <input id="stream_source" type="hidden" value="unified_stream">
   <div class="grid2">
     <div>
@@ -2428,15 +2430,34 @@ async function stopPowerLock() {
   }
 }
 
+const displayTimingRows = [];
+let lastDisplayPollStart = null;
+function downloadDisplayTiming() {
+  const blob = new Blob([JSON.stringify(displayTimingRows, null, 2)], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `viewer_timing_${Date.now()}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 async function pollBackendStreamLatest() {
   if (!streamRunning) return;
   if (document.getElementById('freeze_waveform').checked) return;
   if (streamPollInFlight) return;
   streamPollInFlight = true;
+  const started = performance.now();
+  const timing = {time: new Date().toISOString(),
+    poll_gap_ms: lastDisplayPollStart === null ? null : started - lastDisplayPollStart,
+    hidden: document.hidden};
+  lastDisplayPollStart = started;
   try {
     const selectedChannels = encodeURIComponent(document.getElementById('channels').value);
     const response = await fetch(`/api/stream/latest?stream_source=unified_stream&channels=${selectedChannels}`);
     const frame = await response.json();
+    timing.fetch_ms = performance.now() - started;
+    timing.frame_id = frame.frame_id;
     if (!response.ok || frame.ok === false) {
       const statusResponse = await fetch('/api/stream/status');
       const status = await statusResponse.json();
@@ -2458,23 +2479,33 @@ async function pollBackendStreamLatest() {
       frame_duration_ms: frame.frame_duration_ms,
       frame_rate_hz: frame.frame_rate_hz,
     });
-    renderPlots();
     updateFrameInfo();
-    await measurePeaks();
+    const measureStarted = performance.now();
+    await measurePeaks(false);
+    timing.measure_ms = performance.now() - measureStarted;
+    const drawStarted = performance.now();
+    renderPlots();
+    timing.draw_ms = performance.now() - drawStarted;
     setStatus(`连续采集中，最新帧 #${streamLastFrameId}。`, 'ok');
   } catch (err) {
     streamConsecutiveErrors += 1;
     const message = String(err.message || err);
+    timing.error = message;
     setStatus(`显示轮询暂时失败 ${streamConsecutiveErrors}/50：${message}`, 'error');
     if (streamConsecutiveErrors >= 50) {
       stopBackendStreamUiOnly();
     }
   } finally {
+    timing.total_ms = performance.now() - started;
+    displayTimingRows.push(timing);
+    if (displayTimingRows.length > 3000) displayTimingRows.shift();
+    document.getElementById('display_timing').textContent =
+      `显示耗时：取帧 ${(timing.fetch_ms || 0).toFixed(0)} / 测量 ${(timing.measure_ms || 0).toFixed(0)} / 绘图 ${(timing.draw_ms || 0).toFixed(0)} ms；刷新间隔 ${(timing.poll_gap_ms || 0).toFixed(0)} ms`;
     streamPollInFlight = false;
   }
 }
 
-async function measurePeaks() {
+async function measurePeaks(redraw = true) {
   if (!latestFrame) {
     setStatus('还没有采集波形。', 'error');
     return;
@@ -2485,7 +2516,7 @@ async function measurePeaks() {
     updatePeakTable();
     updateManualAreaTable();
     updateDualAreaTable();
-    renderPlots();
+    if (redraw) renderPlots();
     setStatus('测峰完成。', 'ok');
   } catch (err) {
     setStatus(String(err.message || err), 'error');
@@ -2648,8 +2679,10 @@ function renderPlots() {
 function resizeAndDraw() {
   for (const item of plotCanvases) {
     const rect = item.canvas.getBoundingClientRect();
-    item.canvas.width = Math.max(300, Math.floor(rect.width * devicePixelRatio));
-    item.canvas.height = Math.max(180, Math.floor(rect.height * devicePixelRatio));
+    const width = Math.max(300, Math.floor(rect.width * devicePixelRatio));
+    const height = Math.max(180, Math.floor(rect.height * devicePixelRatio));
+    if (item.canvas.width !== width) item.canvas.width = width;
+    if (item.canvas.height !== height) item.canvas.height = height;
     drawWaveform(item.canvas, item.data, item.index);
   }
 }

@@ -222,7 +222,7 @@ def get_frame_stream_latest(state: ViewerState, body: dict[str, Any] | None = No
     requested_source = stream_source_from_body(body) if body and body.get("stream_source") else None
     status = get_frame_stream_status(state, requested_source or "unified_stream")
     if requested_source == "unified_stream":
-        unified_status = state.daq.get_unified_ai_stream_status()
+        unified_status = status
         if not unified_status.get("running") and not unified_status.get("has_frame"):
             raise RuntimeError("统一 AI 流未运行。请先在统一 AI 控制台启动统一流。")
         frame = state.daq.get_unified_ai_stream_latest_frame()
