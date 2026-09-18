@@ -338,12 +338,19 @@ def create_buffered_pfi_counter_task(
             initial_count=0,
         )
         channel.ci_count_edges_term = terminal
+        # Counter samples arrive on every AI clock tick, not only on PFI edges.
+        # Match AI's host-buffer margin without changing the read block size.
+        input_buffer_samples = max(
+            samples_per_read * CONTINUOUS_AI_INPUT_BUFFER_MIN_CHUNKS,
+            int(math.ceil(rate * CONTINUOUS_AI_INPUT_BUFFER_SECONDS)),
+        )
         task.timing.cfg_samp_clk_timing(
             rate=rate,
             source=sample_clock_source,
             sample_mode=acquisition_type.CONTINUOUS,
-            samps_per_chan=samples_per_read,
+            samps_per_chan=input_buffer_samples,
         )
+        task.in_stream.input_buf_size = input_buffer_samples
         task.start()
         return task
     except Exception:
