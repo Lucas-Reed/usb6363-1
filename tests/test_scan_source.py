@@ -1,6 +1,10 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 from two_peak.scan_source import RigolScanSource, plan_centering
+from two_peak.viewer_state import ViewerState
 
 
 class ScanCenteringTests(unittest.TestCase):
@@ -22,6 +26,20 @@ class ScanCenteringTests(unittest.TestCase):
         self.assertEqual(plan["predicted_indices"], [4000, 6000])
         self.assertEqual(plan["minimum_v"], 1.75)
         self.assertEqual(plan["maximum_v"], 4.25)
+
+    def test_preview_uses_manual_peaks_without_identification(self):
+        with TemporaryDirectory() as folder:
+            state = ViewerState('http://127.0.0.1:1', Path(folder) / 'samples')
+            state.scan_source = Mock()
+            state.scan_source.read.return_value = self.source
+            result = state.preview_scan_centering(dict(
+                peak_indices=[4000, 5000], sample_count=10000,
+                breakpoints='2500,7500', resize=True))
+            self.assertEqual(result['proposal']['selected_labels'], ['P1', 'P2'])
+            self.assertEqual(result['proposal']['offset_v'], 3)
+            state.scan_source.apply.assert_not_called()
+            with self.assertRaises(ValueError):
+                state.preview_scan_centering(dict(peak_indices=[100, 5000], sample_count=10000))
 
     def test_apply_changes_amplitude_before_offset_and_reads_back(self):
         plan = plan_centering(self.identification, self.source, resize=True)

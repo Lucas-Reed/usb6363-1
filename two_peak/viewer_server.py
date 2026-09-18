@@ -91,23 +91,8 @@ def make_handler(state: ViewerState):
                     self._send_json(state.ao_scan_calibrator.status())
                 elif path == "/api/power_lock/status":
                     self._send_json(state.power_lock.status())
-                elif path == "/api/pfi1_feedback/status":
-                    self._send_json(state.pfi1_feedback.status())
                 elif path == "/api/samples":
                     self._send_json(list_saved_frames(state))
-                elif path == "/api/calibration":
-                    self._send_json(state.calibration_status())
-                elif path == "/api/calibration/candidates":
-                    self._send_json(
-                        state.calibration_candidates(
-                            {
-                                "sample_count": query.get("sample_count", [None])[0],
-                                "orders": query.get("orders", [None])[0],
-                            }
-                        )
-                    )
-                elif path == "/api/eom/identification":
-                    self._send_json(state.latest_eom_identification or {"configured": False})
                 elif path == "/api/scan_source":
                     self._send_json(state.scan_source.read())
                 else:
@@ -185,11 +170,6 @@ def make_handler(state: ViewerState):
                     )
                 elif self.path == "/api/power_lock/stop":
                     self._send_json(state.power_lock.stop())
-                elif self.path == "/api/pfi1_feedback/start":
-                    body = self._read_json()
-                    self._send_json(state.pfi1_feedback.start(body))
-                elif self.path == "/api/pfi1_feedback/stop":
-                    self._send_json(state.pfi1_feedback.stop())
                 elif self.path == "/api/measure":
                     body = self._read_json()
                     measurement = measure_latest_frame(state, body)
@@ -210,17 +190,6 @@ def make_handler(state: ViewerState):
                 elif self.path == "/api/defaults/reset":
                     defaults = state.reset_user_defaults()
                     self._send_json(defaults)
-                elif self.path == "/api/calibration/save":
-                    body = self._read_json()
-                    self._send_json(state.save_calibration(body))
-                elif self.path == "/api/calibration/reset":
-                    self._send_json(state.reset_calibration())
-                elif self.path == "/api/calibration/candidates":
-                    body = self._read_json()
-                    self._send_json(state.calibration_candidates(body))
-                elif self.path == "/api/eom/identify":
-                    body = self._read_json()
-                    self._send_json(state.identify_eom_aom(body))
                 elif self.path == "/api/scan_source/connect":
                     body = self._read_json()
                     state.scan_centering_proposal = None

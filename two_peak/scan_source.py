@@ -8,7 +8,7 @@ def plan_centering(identification: dict, source: dict, *, resize=False,
                    separation_fraction=0.4, min_voltage=0.0, max_voltage=5.0) -> dict:
     pair = identification.get("centering_peaks") or []
     if len(pair) != 2:
-        raise ValueError("No matched EOM first-order / AOM first-order pair on the descending branch")
+        raise ValueError("Select P1 and P2 on the descending scan branch first")
     first, second = identification["fit"]["breakpoints"]
     span = second - first
     amplitude, offset = float(source["amplitude_vpp"]), float(source["offset_v"])
