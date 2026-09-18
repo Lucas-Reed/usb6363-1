@@ -213,6 +213,47 @@ def read_continuous_ai_chunk(
     return split_ai_read_values(raw_values, channel_count)
 
 
+def create_numpy_ai_reader(task: Any, channel_count: int, samples_per_read: int):
+    """Return a reader reusing one channels-by-samples array until task close.
+
+    The caller must consume/copy returned data before the next read.
+    """
+    import numpy as np
+    from nidaqmx.stream_readers import AnalogSingleChannelReader, AnalogMultiChannelReader
+
+    data = np.empty((channel_count, samples_per_read), dtype=np.float64)
+    reader = (AnalogSingleChannelReader(task.in_stream) if channel_count == 1
+              else AnalogMultiChannelReader(task.in_stream))
+    target = data[0] if channel_count == 1 else data
+
+    def read(timeout: float):
+        count = reader.read_many_sample(target, number_of_samples_per_channel=samples_per_read,
+                                        timeout=timeout)
+        if count != samples_per_read:
+            raise RuntimeError(f"AI short read: {count}/{samples_per_read}")
+        return data
+
+    return read
+
+
+def create_numpy_counter_reader(task: Any, samples_per_read: int):
+    """Return a buffered counter reader with a reusable uint32 array."""
+    import numpy as np
+    from nidaqmx.stream_readers import CounterReader
+
+    data = np.empty(samples_per_read, dtype=np.uint32)
+    reader = CounterReader(task.in_stream)
+
+    def read(timeout: float):
+        count = reader.read_many_sample_uint32(data, number_of_samples_per_channel=samples_per_read,
+                                               timeout=timeout)
+        if count != samples_per_read:
+            raise RuntimeError(f"Counter short read: {count}/{samples_per_read}")
+        return data
+
+    return read
+
+
 def create_continuous_ai_task(
     channels: list[str],
     rate: float,

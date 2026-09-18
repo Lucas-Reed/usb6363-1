@@ -5,10 +5,18 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from usb6363.pfi_frames import PfiFrameAssembler
-from usb6363_core import DaqController
+from usb6363_core import DaqController, _counter_transition_samples
 
 
 class PfiFrameTests(unittest.TestCase):
+    def test_counter_events_across_blocks_and_uint32_wrap(self):
+        events, previous = _counter_transition_samples(
+            np.array([4294967295, 4294967295, 0, 0, 2], dtype=np.uint32), None, 100)
+        self.assertEqual(events, [dict(sample_index=102, count=0), dict(sample_index=104, count=2)])
+        events, previous = _counter_transition_samples(np.array([3, 3], dtype=np.uint32), previous, 105)
+        self.assertEqual(events, [dict(sample_index=105, count=3)])
+        self.assertEqual(_counter_transition_samples([], previous, 107), ([], 3))
+
     def test_two_megasamples_windows_follow_drifting_hardware_edges(self):
         assembler = PfiFrameAssembler(10000, 1)
         edges = [10003, 20006, 30005, 40008, 50009]
@@ -47,11 +55,13 @@ class PfiFrameTests(unittest.TestCase):
             controller._unified_thread.join()
         stop = threading.Event()
         raw_cursor = 0
+        read_buffer = np.empty((1, 10000), dtype=np.float64)
         counters = [object(), object()]
         def read_ai(**_kwargs):
             nonlocal raw_cursor
             raw_cursor += 10000
-            return [list(range(raw_cursor - 10000, raw_cursor))]
+            read_buffer[0] = np.arange(raw_cursor - 10000, raw_cursor)
+            return read_buffer
         def read_counter(task, samples, _timeout):
             indices = np.arange(raw_cursor - samples, raw_cursor)
             edges = [10003, 20006, 30009] if task is counters[0] else [25000]
@@ -65,8 +75,8 @@ class PfiFrameTests(unittest.TestCase):
         counters = [MagicMock(), MagicMock()]
         with patch("usb6363_core.nidaqmx_driver.create_continuous_ai_task", return_value=MagicMock()) as create_ai, \
              patch("usb6363_core.nidaqmx_driver.create_buffered_pfi_counter_task", side_effect=counters), \
-             patch("usb6363_core.nidaqmx_driver.read_continuous_ai_chunk", side_effect=read_ai), \
-             patch("usb6363_core.nidaqmx_driver.read_buffered_pfi_counts", side_effect=read_counter), \
+             patch("usb6363_core.nidaqmx_driver.create_numpy_ai_reader", return_value=lambda timeout: np.asarray(read_ai())), \
+             patch("usb6363_core.nidaqmx_driver.create_numpy_counter_reader", side_effect=lambda task, samples: lambda timeout: np.asarray(read_counter(task, samples, timeout), dtype=np.uint32)), \
              patch.object(controller, "_publish_unified_window", side_effect=publish_and_stop):
             worker(controller._unified_settings, stop)
         self.assertEqual(create_ai.call_count, 1)
@@ -76,4 +86,8 @@ class PfiFrameTests(unittest.TestCase):
         frames = list(controller._unified_frame_history)
         self.assertEqual([f["sample_start"] for f in frames], [10003, 20006])
         self.assertEqual([f["pfi1_triggered"] for f in frames], [False, True])
+        read_buffer.fill(-999)
+        for frame in frames:
+            np.testing.assert_array_equal(frame["values"][0],
+                np.arange(frame["sample_start"], frame["sample_start"] + 10000))
         controller.stop_unified_ai_stream()

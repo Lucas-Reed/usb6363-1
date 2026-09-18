@@ -57,15 +57,16 @@ def _counter_transition_samples(
     counts: list[int], previous: int | None, absolute_start: int
 ) -> tuple[list[dict[str, int]], int | None]:
     """Convert a cumulative buffered counter block to absolute sample events."""
-    if not counts:
+    if len(counts) == 0:
         return [], previous
-    events: list[dict[str, int]] = []
-    last = previous
-    for offset, value in enumerate(counts):
-        if last is not None and value != last:
-            events.append({"sample_index": absolute_start + offset, "count": value})
-        last = value
-    return events, last
+    values = np.asarray(counts)
+    offsets = np.flatnonzero(values[1:] != values[:-1]) + 1
+    events = []
+    if previous is not None and int(values[0]) != previous:
+        events.append({"sample_index": absolute_start, "count": int(values[0])})
+    events.extend({"sample_index": absolute_start + int(offset), "count": int(values[offset])}
+                  for offset in offsets)
+    return events, int(values[-1])
 
 # unified stream 的“最新帧”适合实时显示，却无法补回上层程序卡顿期间错过的帧。
 # 因此额外保留一段 float32 历史。128 MiB 是整个历史缓冲的总上限，
@@ -1585,32 +1586,25 @@ class DaqController:
                         start_trigger_edge_name=str(settings["trigger_edge"]),
                     )
                 try:
+                    diagnostics.mark("NumPy reader setup")
+                    read_ai = nidaqmx_driver.create_numpy_ai_reader(task, len(channels), samples_per_frame)
+                    read_counters = [nidaqmx_driver.create_numpy_counter_reader(counter, samples_per_frame)
+                                     for counter in counter_tasks]
                     diagnostics.previous_read = None
                     while not stop_event.is_set():
                         diagnostics.begin_read()
-                        channel_values = nidaqmx_driver.read_continuous_ai_chunk(
-                            task=task,
-                            samples_per_read=samples_per_frame,
-                            channel_count=len(channels),
-                            timeout=float(settings["timeout"]),
-                        )
+                        channel_values = read_ai(float(settings["timeout"]))
                         diagnostics.mark("block metadata")
-                        samples_this_frame = (
-                            len(channel_values[0]) if channel_values else samples_per_frame
-                        )
+                        samples_this_frame = channel_values.shape[1]
                         sample_start = sample_cursor
                         sample_end = sample_start + samples_this_frame
                         pfi0_events: list[dict[str, int]] = []
                         pfi1_events: list[dict[str, int]] = []
                         if event_timeline_enabled:
                             diagnostics.mark("PFI0 read")
-                            pfi0_counts = nidaqmx_driver.read_buffered_pfi_counts(
-                                counter_tasks[0], samples_this_frame, float(settings["timeout"])
-                            )
+                            pfi0_counts = read_counters[0](float(settings["timeout"]))
                             diagnostics.mark("PFI1 read")
-                            pfi1_counts = nidaqmx_driver.read_buffered_pfi_counts(
-                                counter_tasks[1], samples_this_frame, float(settings["timeout"])
-                            )
+                            pfi1_counts = read_counters[1](float(settings["timeout"]))
                             diagnostics.mark("edge detection")
                             pfi0_events, previous_pfi0_count = _counter_transition_samples(
                                 pfi0_counts, previous_pfi0_count, sample_start
@@ -1619,12 +1613,16 @@ class DaqController:
                                 pfi1_counts, previous_pfi1_count, sample_start
                             )
                         now = time.time()
+                        diagnostics.mark("raw cache conversion")
+                        # Preserve Python-float caches/API; convert in NumPy once,
+                        # without Python per-sample float() calls or numpy scalars.
+                        cache_values = channel_values.tolist()
                         diagnostics.mark("raw cache lock wait")
                         with self._ai_lock:
                             diagnostics.mark("raw cache lock held")
                             if stop_event.is_set():
                                 break
-                            for channel, values in zip(channels, channel_values):
+                            for channel, values in zip(channels, cache_values):
                                 if len(values) == 0:
                                     continue
                                 self._unified_latest[channel] = values[-1]
